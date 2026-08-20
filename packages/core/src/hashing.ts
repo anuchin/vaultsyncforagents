@@ -1,7 +1,7 @@
 /**
  * Content hashing and compression — Web APIs only.
  *
- * `globalThis.crypto.subtle` is available in Node 18+, Cloudflare Workers,
+ * `crypto.subtle` is available in Node 18+, Cloudflare Workers,
  * and Obsidian (Electron). `CompressionStream` likewise. No Node imports:
  * this module must run unchanged in every client (ARCHITECTURE.md §8).
  */
@@ -9,7 +9,11 @@
 /** Hash of `bytes` as lowercase sha256 hex. Matches R2 blob keys `blobs/{sha256}`. */
 export async function sha256Hex(bytes: Uint8Array | string): Promise<string> {
   const data = typeof bytes === 'string' ? new TextEncoder().encode(bytes) : bytes;
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', data as BufferSource);
+  // `crypto` (not `globalThis.crypto`): the bare identifier resolves in every
+  // target's types (DOM lib, Cloudflare workerd types, Node) — the qualified
+  // form does not, because workers types declare it `const`, which never
+  // merges into `typeof globalThis`.
+  const digest = await crypto.subtle.digest('SHA-256', data as BufferSource);
   return toHex(new Uint8Array(digest));
 }
 
@@ -19,8 +23,8 @@ export async function sha256Hex(bytes: Uint8Array | string): Promise<string> {
  */
 export function supportsCompression(): boolean {
   return (
-    typeof globalThis.CompressionStream !== 'undefined' &&
-    typeof globalThis.DecompressionStream !== 'undefined'
+    typeof CompressionStream !== 'undefined' &&
+    typeof DecompressionStream !== 'undefined'
   );
 }
 
@@ -31,9 +35,11 @@ export function supportsCompression(): boolean {
  */
 export async function compress(data: Uint8Array): Promise<Uint8Array> {
   if (!supportsCompression()) return data;
-  const stream = new Blob([data as BlobPart])
+  // `as BufferSource` (not `as BlobPart`): the name `BufferSource` resolves in
+  // both DOM lib and workerd runtime types, and is a valid BlobPart in each.
+  const stream = new Blob([data as BufferSource])
     .stream()
-    .pipeThrough(new globalThis.CompressionStream('gzip'));
+    .pipeThrough(new CompressionStream('gzip'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
@@ -43,9 +49,9 @@ export async function compress(data: Uint8Array): Promise<Uint8Array> {
  */
 export async function decompress(data: Uint8Array): Promise<Uint8Array> {
   if (!supportsCompression()) return data;
-  const stream = new Blob([data as BlobPart])
+  const stream = new Blob([data as BufferSource])
     .stream()
-    .pipeThrough(new globalThis.DecompressionStream('gzip'));
+    .pipeThrough(new DecompressionStream('gzip'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 

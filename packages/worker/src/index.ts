@@ -1,0 +1,285 @@
+/**
+ * VaultSync for Agents — the Worker (ARCHITECTURE.md §1, §5).
+ *
+ * One worker per vault. This module is the thin outer shell: routing, blob
+ * streaming to/from R2, auth gating, and the weekly GC cron. ALL state and
+ * arbitration live in the `VaultRoom` Durable Object (`room.ts`), which
+ * imports the shared sync brain from `@vsa/core`.
+ *
+ * Claim lifecycle: until claimed, everything except `GET /health` and
+ * `POST /claim` answers `421 unclaimed` (§3, §14) so uptime checks and
+ * `vsa doctor` keep working against a fresh deployment.
+ *
+ * CORS: none — same-origin by design; the dashboard is served by this same
+ * worker (a later phase), so no cross-origin headers are ever emitted.
+ */
+
+import { ADMIN_COOKIE_NAME, blobKey, type VaultRoom } from './room.js';
+
+/** Hard cap on blob uploads (§5: ~100 MB, enforced while streaming). */
+const BLOB_MAX_BYTES = 100 * 1024 * 1024;
+const SESSION_COOKIE_MAX_AGE = 12 * 60 * 60; // seconds — matches the DO's 12 h TTL
+
+export { VaultRoom } from './room.js';
+
+// --- plumbing ---------------------------------------------------------------------------
+
+function json(status: number, body: Record<string, unknown>): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+function roomStub(env: Env): DurableObjectStub<VaultRoom> {
+  return env.ROOM.get(env.ROOM.idFromName('vault'));
+}
+
+/** Send a request to the room DO's internal surface. */
+function roomFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  return roomStub(env).fetch(new Request(`https://room${path}`, init));
+}
+
+function roomPost(
+  env: Env,
+  path: string,
+  body: Record<string, unknown>,
+  headers?: Record<string, string>,
+): Promise<Response> {
+  return roomFetch(env, path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(headers ?? {}) },
+    body: JSON.stringify(body),
+  });
+}
+
+async function isClaimed(env: Env): Promise<boolean> {
+  const res = await roomFetch(env, '/internal/health');
+  const body = (await res.json().catch(() => ({ claimed: false }))) as { claimed?: boolean };
+  return body.claimed === true;
+}
+
+// --- router ------------------------------------------------------------------------------
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // The two endpoints that work on an unclaimed worker (§3).
+    if (request.method === 'GET' && path === '/health') {
+      return json(200, { ok: true, claimed: await isClaimed(env) });
+    }
+    if (path === '/claim') {
+      if (request.method !== 'POST') return json(405, { error: 'POST required' });
+      return roomFetch(env, '/claim', { method: 'POST', body: request.body, headers: request.headers });
+    }
+    if (!(await isClaimed(env))) {
+      return json(421, { error: 'unclaimed', hint: 'POST /claim first' });
+    }
+
+    if (request.method === 'POST' && path === '/pair') {
+      return roomPost(env, '/pair', await readJsonBody(request));
+    }
+    if (request.method === 'POST' && path === '/admin/login') {
+      return handleAdminLogin(request, env);
+    }
+    if (request.method === 'POST' && path === '/admin/pair') {
+      return roomPost(env, '/admin/pair', await readJsonBody(request), cookieHeader(request));
+    }
+    if (request.method === 'POST' && path === '/admin/revoke') {
+      return roomPost(env, '/admin/revoke', await readJsonBody(request), cookieHeader(request));
+    }
+    if (request.method === 'GET' && path === '/api/status') {
+      return roomFetch(env, '/api/status', { headers: authForwardHeaders(request) });
+    }
+    if ((path === '/ws' || path === '/sync') && request.method === 'GET') {
+      return handleWebSocket(request, env);
+    }
+    if (path.startsWith('/blob/')) {
+      const hash = path.slice('/blob/'.length);
+      if (request.method === 'PUT') return handleBlobPut(request, env, hash);
+      if (request.method === 'GET') return handleBlobGet(request, env, hash);
+      return json(405, { error: 'GET or PUT required' });
+    }
+    return json(404, { error: 'not found' });
+  },
+
+  // --- weekly orphan-blob GC (§7) ---------------------------------------------------------
+  //
+  // Asks the DO for unreferenced hashes (refcount 0, older than the grace
+  // window), deletes them from R2, then tells the DO to drop the bookkeeping
+  // rows. Referenced blobs are never enumerated, so they always survive.
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        const list = await roomFetch(env, '/internal/gc');
+        const { orphans } = (await list.json()) as { orphans: string[] };
+        if (orphans.length === 0) return;
+        await Promise.all(orphans.map((hash) => env.BUCKET.delete(blobKey(hash))));
+        await roomPost(env, '/internal/gc-purge', { hashes: orphans });
+      })().catch((error: unknown) => {
+        // Cron failures must never propagate; Cloudflare retries the trigger.
+        console.error('gc failed', error);
+      }),
+    );
+  },
+};
+
+// --- handlers --------------------------------------------------------------------------------
+
+async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+  return (await request.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+function cookieHeader(request: Request): Record<string, string> {
+  const cookie = request.headers.get('cookie');
+  return cookie === null ? {} : { cookie };
+}
+
+function authForwardHeaders(request: Request): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const authorization = request.headers.get('authorization');
+  if (authorization !== null) headers.authorization = authorization;
+  const cookie = request.headers.get('cookie');
+  if (cookie !== null) headers.cookie = cookie;
+  return headers;
+}
+
+/** `POST /admin/login` → verify in the DO, then set the signed session cookie. */
+async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
+  const body = await readJsonBody(request);
+  const res = await roomPost(env, '/admin/login', { passphrase: body.passphrase });
+  if (!res.ok) return res;
+  const { cookie, expiresAt } = (await res.json()) as { cookie: string; expiresAt: number };
+  const response = json(200, { ok: true, expiresAt });
+  response.headers.append(
+    'set-cookie',
+    `${ADMIN_COOKIE_NAME}=${cookie}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE}`,
+  );
+  return response;
+}
+
+/** `GET /ws` (or `/sync`) → upgrade and hand the socket to the DO. */
+async function handleWebSocket(request: Request, env: Env): Promise<Response> {
+  if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+    return json(426, { error: 'websocket upgrade required' });
+  }
+  return roomStub(env).fetch(request);
+}
+
+/** Auth for blob routes: device token (Bearer) or admin session cookie. */
+async function blobAuth(request: Request, env: Env): Promise<boolean> {
+  const res = await roomPost(env, '/internal/auth', {}, authForwardHeaders(request));
+  return res.ok;
+}
+
+/**
+ * `PUT /blob/:hash` — stream the body to R2 while hashing it
+ * (`crypto.DigestStream`); on mismatch the stored object is deleted and the
+ * client gets 422. Oversize bodies are rejected with 413 mid-stream.
+ */
+async function handleBlobPut(request: Request, env: Env, hash: string): Promise<Response> {
+  if (!/^[0-9a-f]{64}$/.test(hash)) {
+    return json(400, { error: 'hash must be lowercase sha256 hex' });
+  }
+  if (!(await blobAuth(request, env))) {
+    return json(401, { error: 'device token or admin session required' });
+  }
+  if (request.body === null) {
+    return json(400, { error: 'body required' });
+  }
+  const declared = Number(request.headers.get('content-length') ?? '0');
+  if (declared > BLOB_MAX_BYTES) {
+    return json(413, { error: `blob exceeds the ${BLOB_MAX_BYTES} byte cap` });
+  }
+
+  const key = blobKey(hash);
+  const [toR2, toHash] = request.body.tee();
+  const digestStream = new crypto.DigestStream('SHA-256');
+  let total = 0;
+  let oversize = false;
+  const sizeGuard = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      total += chunk.byteLength;
+      if (total > BLOB_MAX_BYTES) {
+        oversize = true;
+        throw new Error('blob exceeds cap');
+      }
+      controller.enqueue(chunk);
+    },
+  });
+  const digestPromise = toHash
+    .pipeThrough(sizeGuard)
+    .pipeTo(digestStream)
+    .then(() => digestStream.digest)
+    .then((ab) => hexOf(ab))
+    .catch((error: unknown) => Promise.reject(error instanceof Error ? error : new Error(String(error))));
+
+  const putPromise = env.BUCKET.put(key, toR2, {
+    httpMetadata: { contentType: 'application/octet-stream' },
+  });
+
+  let digest: string;
+  try {
+    digest = await digestPromise;
+  } catch {
+    await putPromise.catch(() => {});
+    // Nothing may remain stored after a rejected upload (CAS contract): the
+    // mid-stream oversize path completes the R2 put before we can bail, so
+    // evict it exactly like a hash mismatch.
+    if (oversize) {
+      await env.BUCKET.delete(key);
+      return json(413, { error: `blob exceeds the ${BLOB_MAX_BYTES} byte cap` });
+    }
+    return json(400, { error: 'failed to hash request body' });
+  }
+  if (digest !== hash) {
+    // Same hash ⇒ same content is the CAS contract; evict the impostor.
+    await putPromise.catch(() => {});
+    await env.BUCKET.delete(key);
+    return json(422, { error: 'content does not hash to the claimed hash' });
+  }
+  try {
+    await putPromise;
+  } catch (error) {
+    // A race with an identical (already verified) object is fine; else 500.
+    const head = await env.BUCKET.head(key);
+    if (head === null) {
+      console.error('blob put failed', error);
+      return json(500, { error: 'failed to store blob' });
+    }
+  }
+  await roomPost(env, '/internal/blob-uploaded', { hash, size: total });
+  return json(201, { ok: true, hash, size: total });
+}
+
+/** `GET /blob/:hash` — stream back, immutable (content is addressable). */
+async function handleBlobGet(request: Request, env: Env, hash: string): Promise<Response> {
+  if (!/^[0-9a-f]{64}$/.test(hash)) {
+    return json(400, { error: 'hash must be lowercase sha256 hex' });
+  }
+  if (!(await blobAuth(request, env))) {
+    return json(401, { error: 'device token or admin session required' });
+  }
+  const obj = await env.BUCKET.get(blobKey(hash));
+  if (obj === null) {
+    return json(404, { error: 'no such blob' });
+  }
+  return new Response(obj.body, {
+    status: 200,
+    headers: {
+      'content-type': 'application/octet-stream',
+      'cache-control': 'public, max-age=31536000, immutable',
+      etag: obj.httpEtag,
+    },
+  });
+}
+
+/** ArrayBuffer → lowercase hex. */
+function hexOf(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let out = '';
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+  return out;
+}

@@ -1,0 +1,40 @@
+{
+  // VaultSync for Agents — one worker per vault (ARCHITECTURE.md §1, FR-20).
+  //
+  // NOTE ON R2 PROVISIONING: `bucket_name` below is a placeholder. This
+  // repository's worker is normally deployed through the
+  // `vaultsyncforagents-template` deploy-button repo, whose CI provisions the
+  // bucket and rewrites this value; for a manual `wrangler deploy`, first run
+  // `wrangler r2 bucket create vaultsyncforagents` (or edit bucket_name to an
+  // existing bucket in YOUR account).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vaultsyncforagents",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOM",
+        "class_name": "VaultRoom"
+      }
+    ]
+  },
+  // SQLite-backed class registration lives under `migrations` (the wrangler
+  // schema has no top-level new_sqlite_classes key).
+  "migrations": [
+    {
+      "tag": "0001_initial",
+      "new_sqlite_classes": ["VaultRoom"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "vaultsyncforagents"
+    }
+  ],
+  "triggers": {
+    // Weekly orphan-blob GC, Mondays 03:00 UTC (ARCHITECTURE.md §7).
+    "crons": ["0 3 * * 1"]
+  }
+}
