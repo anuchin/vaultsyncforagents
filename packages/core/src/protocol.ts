@@ -7,7 +7,7 @@
  * only via content hashes.
  */
 
-import type { LogicalClock, Version, VaultSettings } from './types.js';
+import type { LogicalClock, Version, VersionKind, VaultSettings } from './types.js';
 import { ProtocolError } from './errors.js';
 
 /** Wire protocol version. Bump on breaking message-shape changes. */
@@ -16,16 +16,27 @@ export const ProtocolVersion = 1 as const;
 /** Commits at or below this size may inline content (base64) on the WS. */
 export const INLINE_CONTENT_MAX_BYTES = 256 * 1024;
 
-/** One entry of the manifest map (`{path → ManifestEntry}`). */
+/**
+ * One entry of the manifest map (`{path → ManifestEntry}`). The entry is
+ * self-describing: it carries its own `path` and the head's `clock` so the
+ * client-side reconciliation (`resolve.ts`) can order remote state against
+ * local state without any extra round-trips.
+ */
 export interface ManifestEntry {
+  /** Normalized vault path this entry describes (mirrors the map key). */
+  path: string;
   /** Version id of the entry's head. */
   version: string;
-  /** sha256 hex of current content. */
+  /** sha256 hex of current content (`''` for folder placeholders). */
   hash: string;
-  /** Content size in bytes. */
+  /** Content size in bytes (`0` for folder placeholders). */
   size: number;
   /** Tombstone flag. */
   deleted: boolean;
+  /** Logical clock of the head — the ordering authority (§4). */
+  clock: LogicalClock;
+  /** True for empty-folder placeholder entries (FR-10). */
+  isFolder?: boolean;
   /** Epoch ms of last update, display-only. */
   mtime: number;
 }
@@ -50,7 +61,8 @@ export interface GetManifestMessage {
 /**
  * Commit a new version. If `inline` is set it carries the full content
  * base64-encoded (only allowed when `size <= INLINE_CONTENT_MAX_BYTES`);
- * otherwise the blob must already be uploaded via `PUT /blob/:hash`.
+ * otherwise the blob must already be uploaded (`putBlob` on this channel,
+ * `PUT /blob/:hash` on the real worker).
  */
 export interface CommitMessage {
   type: 'commit';
@@ -59,7 +71,13 @@ export interface CommitMessage {
   parentVersion: string | null;
   hash: string;
   size: number;
+  /** What kind of version this commits (mirrors `Version.kind`). */
+  kind: VersionKind;
   inline?: string;
+  /** Source path — required for `kind: 'rename'` (chain migration, FR-9). */
+  fromPath?: string;
+  /** True for empty-folder placeholder commits (FR-10; hash `''`, size 0). */
+  isFolder?: boolean;
 }
 
 /** Keepalive. */
@@ -67,6 +85,24 @@ export interface PingMessage {
   type: 'ping';
   /** Client epoch ms; echoed back on `pong` for RTT / skew measurement. */
   ts?: number;
+}
+
+/**
+ * Upload a content blob over the sync channel. Test doubles and small vaults
+ * can use this directly; the real worker exposes the same operation as
+ * `PUT /blob/:hash` (streamed). Idempotent: same hash ⇒ same content.
+ */
+export interface PutBlobMessage {
+  type: 'putBlob';
+  hash: string;
+  /** Full content, base64-encoded. */
+  content: string;
+}
+
+/** Fetch a content blob (the WS-inline path of §8 "fetch blob"). */
+export interface GetBlobMessage {
+  type: 'getBlob';
+  hash: string;
 }
 
 // --- Server → Client -------------------------------------------------------
@@ -83,6 +119,8 @@ export interface HelloAckMessage {
 export interface ManifestMessage {
   type: 'manifest';
   entries: Readonly<Record<string, ManifestEntry>>;
+  /** Global sequence number this manifest reflects (cursor catch-up). */
+  cursor: number;
 }
 
 /** Commit accepted as the new head. */
@@ -92,6 +130,8 @@ export interface CommitAckMessage {
   version: string;
   /** Logical clock of the accepted version. */
   clock: LogicalClock;
+  /** Global sequence number of the accepted head (cursor tracking). */
+  seq: number;
 }
 
 /** What happened to the losing side of a concurrent edit (see disposition). */
@@ -104,11 +144,15 @@ export interface ConflictMessage {
   winner: Version;
   /** What the server did with the loser's content — never deleted. */
   loserDisposition: ConflictLoserDisposition;
+  /** Global sequence number of the winning head, when it has one. */
+  seq?: number;
 }
 
-/** Fan-out broadcast to all *other* connected clients. */
-export interface ChangeMessage {
-  type: 'change';
+/**
+ * Fan-out payload shared by the change broadcast and the arbitration result.
+ * Everything a client needs to materialize one head transition.
+ */
+export interface ChangePayload {
   path: string;
   /** Version id of the new head. */
   version: string;
@@ -117,6 +161,45 @@ export interface ChangeMessage {
   deleted: boolean;
   /** Id of the device that committed. */
   device: string;
+  /** Logical clock of the new head — clients use it to skip stale replays. */
+  clock: LogicalClock;
+  /** What kind of change this is (mirrors `Version.kind`). */
+  kind: VersionKind;
+  /** Source path — present when `kind: 'rename'`. */
+  fromPath?: string;
+  /** True for folder placeholder changes (FR-10). */
+  isFolder?: boolean;
+}
+
+/** Fan-out broadcast to all *other* connected clients. */
+export interface ChangeMessage extends ChangePayload {
+  type: 'change';
+  /** Global sequence number of this change (cursor tracking). */
+  seq: number;
+}
+
+/** Reply to `putBlob`. */
+export interface BlobAckMessage {
+  type: 'blobAck';
+  hash: string;
+}
+
+/** Reply to `getBlob`: the requested content. */
+export interface BlobMessage {
+  type: 'blob';
+  hash: string;
+  /** Full content, base64-encoded. */
+  content: string;
+}
+
+/** Machine-readable codes carried by `error` messages (HTTP-equivalent). */
+export type ServerErrorCode = 'UNAUTHORIZED' | 'REVOKED' | 'NOT_FOUND' | 'PROTOCOL';
+
+/** Negative reply (auth failure, unknown blob, protocol violation, …). */
+export interface ErrorMessage {
+  type: 'error';
+  code: ServerErrorCode;
+  message: string;
 }
 
 /** Presence update for dashboards / `vsa status`. */
@@ -139,6 +222,8 @@ export type ClientMessage =
   | HelloMessage
   | GetManifestMessage
   | CommitMessage
+  | PutBlobMessage
+  | GetBlobMessage
   | PingMessage;
 
 export type ServerMessage =
@@ -148,11 +233,21 @@ export type ServerMessage =
   | ConflictMessage
   | ChangeMessage
   | DeviceSeenMessage
+  | BlobAckMessage
+  | BlobMessage
+  | ErrorMessage
   | PongMessage;
 
 export type Message = ClientMessage | ServerMessage;
 
-const CLIENT_TYPES: ReadonlySet<string> = new Set(['hello', 'getManifest', 'commit', 'ping']);
+const CLIENT_TYPES: ReadonlySet<string> = new Set([
+  'hello',
+  'getManifest',
+  'commit',
+  'putBlob',
+  'getBlob',
+  'ping',
+]);
 const SERVER_TYPES: ReadonlySet<string> = new Set([
   'helloAck',
   'manifest',
@@ -160,6 +255,9 @@ const SERVER_TYPES: ReadonlySet<string> = new Set([
   'conflict',
   'change',
   'deviceSeen',
+  'blobAck',
+  'blob',
+  'error',
   'pong',
 ]);
 
@@ -212,4 +310,33 @@ export function parseMessage(data: string): Message {
     );
   }
   return parsed;
+}
+
+// --- wire encoding ------------------------------------------------------------
+//
+// `inline`/`content` fields carry raw bytes as base64. `btoa`/`atob` exist in
+// every target runtime (Workers, Node 16+, Electron); chunking avoids
+// exceeding argument-length limits on large attachments.
+
+/** Encode bytes as base64. */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/** Decode base64 to bytes. Throws `ProtocolError` on invalid input. */
+export function base64ToBytes(encoded: string): Uint8Array {
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch (cause) {
+    throw new ProtocolError('Base64 payload is not valid', { cause });
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }

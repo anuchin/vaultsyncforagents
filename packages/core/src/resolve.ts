@@ -36,15 +36,12 @@ import type { DeletedCandidate, LocalChanges, RenameCandidate, ScanCandidate } f
 import type { LogicalClock } from './types.js';
 
 /**
- * A manifest entry annotated with the two things reconciliation needs that
- * `ManifestEntry` itself does not carry: the path and the head's logical
- * clock. The network phase must supply both (the manifest maps to a
- * `{path → entry}` and clocks ride the change feed / commit acks).
+ * A manifest entry as reconciliation consumes it. Since `ManifestEntry` grew
+ * `path`, `clock`, and `isFolder` (protocol v1, pre-release), this is now the
+ * manifest entry itself — kept as a named alias so `computeSyncPlan`'s input
+ * contract stays self-documenting.
  */
-export interface RemoteFile extends ManifestEntry {
-  path: string;
-  clock: LogicalClock;
-}
+export type RemoteFile = ManifestEntry;
 
 /** Input to `computeSyncPlan`. */
 export interface SyncPlanInput {
@@ -104,6 +101,8 @@ export interface PullFileOp {
   clock: LogicalClock;
   /** True for tombstones (kind `'delete'`). */
   deleted: boolean;
+  /** True for empty-folder placeholder pulls (FR-10) — materialize with `ensureDir`. */
+  isFolder?: boolean;
 }
 
 /** A remote rename to follow locally (detected by hash correlation). */
@@ -543,8 +542,14 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
     }
   }
 
-  /** Push the losing local content to a conflict-copy path; returns the path. */
-  function pushConflictCopy(path: string, local: LocalCandidate, remote: RemoteFile): string {
+  /**
+   * Push the losing local content to a conflict-copy path; returns the path,
+   * or `undefined` when the losing content is byte-identical to the winner's
+   * (a same-content race — nothing distinct to preserve; matches the server's
+   * arbitration, which likewise synthesizes no copy for identical content).
+   */
+  function pushConflictCopy(path: string, local: LocalCandidate, remote: RemoteFile): string | undefined {
+    if (local.hash === remote.hash) return undefined;
     const copyPath = conflictCopyPath(path, thisDeviceName, now, pathExists);
     pushes.push({
       kind: 'conflictCopy',
@@ -563,7 +568,9 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
 function pullFile(
   kind: PullFileOp['kind'],
   path: string,
-  remote: Pick<RemoteFile, 'hash' | 'size' | 'version' | 'clock'> & { deleted?: boolean },
+  remote: Pick<RemoteFile, 'hash' | 'size' | 'version' | 'clock' | 'isFolder'> & {
+    deleted?: boolean;
+  },
 ): PullFileOp {
   return {
     kind,
@@ -573,6 +580,7 @@ function pullFile(
     version: remote.version,
     clock: remote.clock,
     deleted: remote.deleted ?? kind === 'delete',
+    ...(remote.isFolder ? { isFolder: true } : {}),
   };
 }
 

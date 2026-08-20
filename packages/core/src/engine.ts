@@ -101,6 +101,23 @@ async function applyOnePull(
     });
   }
 
+  if (pull.isFolder) {
+    // Folder placeholders (FR-10): create the directory, record the entry.
+    // Tombstoned placeholders record only — deleting a directory from storage
+    // (and cascading to any files placed inside it) is a platform concern.
+    if (!pull.deleted) await storage.ensureDir(pull.path);
+    return applyCommit(index, {
+      path: pull.path,
+      versionId: pull.version,
+      hash: pull.hash,
+      size: pull.size,
+      clock: pull.clock,
+      deleted: pull.deleted,
+      deletedAt: pull.deleted ? now : undefined,
+      isFolder: true,
+    });
+  }
+
   if (pull.deleted) {
     // Idempotent per the adapter contract; a local .trash copy is a
     // platform-layer concern (daemon/plugin), not engine logic.
@@ -117,9 +134,16 @@ async function applyOnePull(
   }
 
   const current = index[pull.path];
-  if (current !== undefined && current.deletedAt === undefined && current.hash === pull.hash) {
+  if (
+    current !== undefined &&
+    current.deletedAt === undefined &&
+    current.hash === pull.hash &&
+    (await storage.exists(pull.path))
+  ) {
     // Content already correct locally (e.g. version-id catch-up after a
     // rename elsewhere): record the authoritative head, skip fetch+write.
+    // The existence check matters when the file was deleted locally since the
+    // index was last written — recreating it is what the pull demands.
     return applyCommit(index, {
       path: pull.path,
       versionId: pull.version,
