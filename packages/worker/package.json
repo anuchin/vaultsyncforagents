@@ -6,7 +6,9 @@
   "license": "UNLICENSED",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "npm run build:dashboard && wrangler dev",
+    "deploy": "npm run build:dashboard && wrangler deploy",
+    "build:dashboard": "npm run build --workspace @vsa/dashboard",
     "test": "vitest run --config vitest.workers.config.ts",
     "typecheck": "tsc --noEmit"
   },

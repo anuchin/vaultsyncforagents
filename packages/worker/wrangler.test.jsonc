@@ -1,0 +1,42 @@
+{
+  // TEST-ONLY variant of wrangler.jsonc: identical surface, but the assets
+  // binding points at a committed fixture directory instead of the built
+  // dashboard (tests must not depend on `npm run build:dashboard` having run,
+  // and the real dist/ is build output). Used by vitest.workers.config.ts.
+  //
+  // Keep this file in sync with wrangler.jsonc (minus the asset directory,
+  // bucket name is irrelevant under Miniflare, and test assets live here).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vaultsyncforagents-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOM",
+        "class_name": "VaultRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "0001_initial",
+      "new_sqlite_classes": ["VaultRoom"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "vaultsyncforagents-test"
+    }
+  ],
+  "assets": {
+    "directory": "./test/fixtures/dashboard",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "triggers": {
+    "crons": ["0 3 * * 1"]
+  }
+}

@@ -3,8 +3,10 @@
  * workerd/Miniflare runtime: Durable Object + R2 + WebSockets), completely
  * separate from the root node-pool config that runs `@vsa/core`'s suites.
  *
- * Bindings (ROOM, BUCKET) come from wrangler.jsonc via `wrangler.configPath`;
- * `main` registers this package's worker as the test isolate's main module so
+ * Bindings (ROOM, BUCKET, ASSETS) come from wrangler.test.jsonc (the test
+ * variant of wrangler.jsonc whose assets directory points at a committed
+ * fixture instead of the built dashboard) via `wrangler.configPath`; `main`
+ * registers this package's worker as the test isolate's main module so
  * `SELF` fetches and DO classes resolve against the real routing code.
  *
  * `isolatedStorage` is DISABLED on purpose: its per-test snapshot pop unlinks
@@ -23,7 +25,7 @@ export default defineWorkersConfig({
     poolOptions: {
       workers: {
         main: 'src/index.ts',
-        wrangler: { configPath: './wrangler.jsonc' },
+        wrangler: { configPath: './wrangler.test.jsonc' },
         miniflare: {
           compatibilityFlags: ['nodejs_compat'],
         },

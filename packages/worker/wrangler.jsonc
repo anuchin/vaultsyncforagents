@@ -33,6 +33,21 @@
       "bucket_name": "vaultsyncforagents"
     }
   ],
+  // Dashboard SPA (ARCHITECTURE.md §10, FR-30): built by @vsa/dashboard into
+  // ../dashboard/dist and served by this worker — no second deployment.
+  // `run_worker_first: true` keeps the fetch router below as the single
+  // decision point (asset serving only happens where it delegates to ASSETS),
+  // so the 421 unclaimed gate keeps covering /api/*, /blob/*, /ws and friends
+  // while GET / serves the SPA in BOTH claim states (the SPA branches on
+  // GET /health). `single-page-application` maps unknown GETs to index.html.
+  // PIPELINE: always build the dashboard before dev/deploy — the `dev` and
+  // `deploy` scripts below chain `npm run build:dashboard` for exactly that.
+  "assets": {
+    "directory": "../dashboard/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
   "triggers": {
     // Weekly orphan-blob GC, Mondays 03:00 UTC (ARCHITECTURE.md §7).
     "crons": ["0 3 * * 1"]

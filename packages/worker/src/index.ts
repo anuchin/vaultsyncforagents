@@ -6,12 +6,18 @@
  * arbitration live in the `VaultRoom` Durable Object (`room.ts`), which
  * imports the shared sync brain from `@vsa/core`.
  *
- * Claim lifecycle: until claimed, everything except `GET /health` and
- * `POST /claim` answers `421 unclaimed` (§3, §14) so uptime checks and
- * `vsa doctor` keep working against a fresh deployment.
+ * Claim lifecycle: until claimed, the API/sync/blob/pairing surface answers
+ * `421 unclaimed` (§3, §14) so uptime checks and `vsa doctor` keep working
+ * against a fresh deployment. The dashboard SPA itself is served in BOTH
+ * claim states (the SPA branches on `GET /health`), which is what makes the
+ * claim page reachable from a fresh deploy.
+ *
+ * Static assets ride the `ASSETS` binding (§10, FR-30) with
+ * `run_worker_first: true`: this router stays the single decision point, and
+ * only explicitly delegates non-API GET/HEAD requests to asset serving.
  *
  * CORS: none — same-origin by design; the dashboard is served by this same
- * worker (a later phase), so no cross-origin headers are ever emitted.
+ * worker, so no cross-origin headers are ever emitted.
  */
 
 import { ADMIN_COOKIE_NAME, blobKey, type VaultRoom } from './room.js';
@@ -19,6 +25,17 @@ import { ADMIN_COOKIE_NAME, blobKey, type VaultRoom } from './room.js';
 /** Hard cap on blob uploads (§5: ~100 MB, enforced while streaming). */
 const BLOB_MAX_BYTES = 100 * 1024 * 1024;
 const SESSION_COOKIE_MAX_AGE = 12 * 60 * 60; // seconds — matches the DO's 12 h TTL
+
+/**
+ * Paths that belong to the API/sync surface and therefore stay behind the
+ * 421 unclaimed gate (and never fall through to SPA asset serving).
+ */
+const API_PATH_PREFIXES = ['/api/', '/blob/', '/admin/'];
+const API_PATH_EXACT = new Set(['/ws', '/sync', '/pair']);
+
+function isApiPath(path: string): boolean {
+  return API_PATH_EXACT.has(path) || API_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
 
 export { VaultRoom } from './room.js';
 
@@ -74,7 +91,7 @@ export default {
       if (request.method !== 'POST') return json(405, { error: 'POST required' });
       return roomFetch(env, '/claim', { method: 'POST', body: request.body, headers: request.headers });
     }
-    if (!(await isClaimed(env))) {
+    if (!(await isClaimed(env)) && isApiPath(path)) {
       return json(421, { error: 'unclaimed', hint: 'POST /claim first' });
     }
 
@@ -106,6 +123,13 @@ export default {
       if (request.method === 'PUT') return handleBlobPut(request, env, hash);
       if (request.method === 'GET') return handleBlobGet(request, env, hash);
       return json(405, { error: 'GET or PUT required' });
+    }
+    // Everything else is dashboard surface (§10): delegate to the static
+    // assets binding in BOTH claim states. With `not_found_handling:
+    // single-page-application`, unknown GET paths land on index.html (SPA
+    // deep links); API-looking methods/paths never reach here.
+    if (request.method === 'GET' || request.method === 'HEAD') {
+      return env.ASSETS.fetch(request);
     }
     return json(404, { error: 'not found' });
   },

@@ -25,19 +25,22 @@ describe('unclaimed worker', () => {
     expect(await res.json()).toEqual({ ok: true, claimed: false });
   });
 
-  it('everything except /health and /claim answers 421', async () => {
+  it('API/sync/blob/pairing routes answer 421 (GET / serves the claim SPA)', async () => {
     for (const [method, path] of [
       ['GET', '/api/status'],
       ['POST', '/pair'],
       ['POST', '/admin/login'],
       ['GET', '/ws'],
       ['PUT', '/blob/' + 'a'.repeat(64)],
-      ['GET', '/'],
     ] as const) {
       const res = await request(method, path);
       expect(res.status, `${method} ${path}`).toBe(421);
       expect(await res.json()).toHaveProperty('error', 'unclaimed');
     }
+    // The SPA itself is served while unclaimed (the claim page must be
+    // reachable) — covered in detail by assets.test.ts.
+    const spa = await get('/');
+    expect(spa.status).toBe(200);
   });
 });
 
