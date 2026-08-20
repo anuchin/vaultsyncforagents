@@ -1,0 +1,26 @@
+/* VaultSync for Agents — minimal styling.
+   The status indicator relies on Obsidian's own status-bar styles; these
+   classes only add spacing cues and a conflict/offline tint. */
+
+.status-bar-item.vsa-status {
+  cursor: default;
+  user-select: none;
+}
+
+.status-bar-item.vsa-status.vsa-warn {
+  color: var(--text-warning, #e0ac00);
+}
+
+.status-bar-item.vsa-status.vsa-error {
+  color: var(--text-error, var(--text-muted));
+}
+
+/* Settings tab: the live status readout block. */
+.vsa-status-readout {
+  white-space: pre-line;
+}
+
+.vsa-settings-hint {
+  white-space: pre-line;
+  color: var(--text-muted);
+}
