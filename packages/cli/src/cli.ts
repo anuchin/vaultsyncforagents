@@ -3,8 +3,8 @@
  *
  * Thin commander layer: global flags (--vault, --json, --config), one
  * subcommand each, all logic delegated to `commands/*` over an injectable
- * `VsRuntime`. `setup` and `daemon` are later phases (REQUIREMENTS FR-50/55)
- * and intentionally absent.
+ * `VsRuntime`. `vsa daemon …` (FR-55) delegates to `@vsa/daemon`; `setup` is
+ * a later phase (FR-50) and intentionally absent.
  */
 
 import { Command } from 'commander';
@@ -17,6 +17,7 @@ import { runDevices, renderDevices, runRevoke } from './commands/devices.js';
 import { runLogs, renderLogs } from './commands/logs.js';
 import { runHistory, renderHistory, runRestore } from './commands/history.js';
 import { runDoctor, renderDoctor } from './commands/doctor.js';
+import { renderDaemonResult, runDaemonCommand, type DaemonAction } from './commands/daemon.js';
 import {
   ClackPromptUi,
   CommandError,
@@ -215,6 +216,69 @@ export function buildProgram(runtime: VsRuntime): Command {
       if (reports.some((report) => !report.healthy)) {
         process.exitCode = 1;
       }
+    });
+
+  // --- daemon (FR-55) ----------------------------------------------------------------------
+
+  const daemonAction = async (action: DaemonAction, extra: Record<string, unknown> = {}): Promise<void> => {
+    const options = globals();
+    const merged: Record<string, unknown> = { vault: options.vault, ...extra };
+    const result = await runDaemonCommand(runtime, action, {
+      vault: merged['vault'] as string | undefined,
+      tail: merged['tail'] as number | undefined,
+    });
+    if (options.json === true) {
+      runtime.output.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    renderDaemonResult(result, runtime);
+  };
+
+  const daemon = program
+    .command('daemon')
+    .description('background sync service (FR-55): run, install, start/stop, status, logs');
+  daemon
+    .command('run')
+    .description('run the daemon in the foreground (all linked vaults, or --vault)')
+    .action(async () => {
+      await daemonAction('run');
+    });
+  daemon
+    .command('install')
+    .description('install a user-level service (systemd on Linux, launchd on macOS; no root)')
+    .action(async () => {
+      await daemonAction('install');
+    });
+  daemon
+    .command('uninstall')
+    .description('stop and remove the user-level service')
+    .action(async () => {
+      await daemonAction('uninstall');
+    });
+  daemon
+    .command('start')
+    .description('start the installed daemon service')
+    .action(async () => {
+      await daemonAction('start');
+    });
+  daemon
+    .command('stop')
+    .description('stop the daemon service (in-flight sync cycles are flushed)')
+    .action(async () => {
+      await daemonAction('stop');
+    });
+  daemon
+    .command('status')
+    .description('service state + per-vault sync status of the running daemon')
+    .action(async () => {
+      await daemonAction('status');
+    });
+  daemon
+    .command('logs')
+    .description('tail daemon logs (journald on Linux, launchd log on macOS)')
+    .option('-n, --tail <n>', 'number of lines to show', '100')
+    .action(async (options: Record<string, unknown>) => {
+      await daemonAction('logs', { tail: Number(options['tail']) });
     });
 
   return program;

@@ -48,6 +48,11 @@ export interface VsRuntime {
   output: OutputWriter;
   /** `null` in non-interactive contexts — commands must degrade gracefully. */
   prompts: PromptUi | null;
+  /**
+   * Overrides the daemon module surface (`vsa daemon …` tests install fakes;
+   * production delegates to `@vsa/daemon`). Type-only import: no runtime cycle.
+   */
+  daemonControl?: import('./commands/daemon.js').DaemonControl;
 }
 
 // --- clack-backed prompt UI --------------------------------------------------------------

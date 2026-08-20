@@ -1,29 +1,26 @@
 {
-  "name": "@vsa/cli",
+  "name": "@vsa/daemon",
   "version": "0.1.0",
   "private": true,
-  "description": "VaultSync for Agents CLI (`vsa`): link, status, devices, history/restore, logs, doctor",
+  "description": "VaultSync for Agents headless daemon: multi-vault file sync for VPS agents (chokidar watcher, systemd/launchd service installers)",
   "license": "UNLICENSED",
   "type": "module",
   "bin": {
-    "vsa": "./bin/vsa.js"
+    "vsa-daemon": "./bin/vsa-daemon.js"
   },
-  "main": "./src/cli.ts",
-  "types": "./src/cli.ts",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "exports": {
-    ".": "./src/cli.ts"
+    ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
-    "@clack/prompts": "^0.11.0",
     "@vsa/core": "^0.1.0",
-    "@vsa/daemon": "^0.1.0",
     "@vsa/node-runtime": "^0.1.0",
-    "commander": "^14.0.0",
-    "picocolors": "^1.1.1"
+    "chokidar": "^4.0.3"
   },
   "devDependencies": {
     "@types/node": "^24.3.0"
