@@ -78,6 +78,10 @@ export class InMemoryStorageAdapter implements StorageAdapter {
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
 
+  async listDirs(): Promise<readonly string[]> {
+    return [...this.dirs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
   async ensureDir(path: string): Promise<void> {
     this.recordDir(normalizeVaultPath(path));
   }

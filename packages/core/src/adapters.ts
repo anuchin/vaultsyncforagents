@@ -46,6 +46,13 @@ export interface StorageAdapter {
   renameFile(from: string, to: string): Promise<void>;
   /** Recursive listing of every file under the vault root, sorted by path. */
   listFiles(): Promise<readonly FileStat[]>;
+  /**
+   * Recursive listing of every directory currently present under the vault
+   * root — including the root itself and empty folders — sorted by path.
+   * This is how scans discover empty-folder placeholder candidates (FR-10);
+   * `listFiles` cannot see them since it lists files only.
+   */
+  listDirs(): Promise<readonly string[]>;
   /** Create a directory (and ancestors); idempotent. */
   ensureDir(path: string): Promise<void>;
   /** Whether a file or directory exists at `path`. */
