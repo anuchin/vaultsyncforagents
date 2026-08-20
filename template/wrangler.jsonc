@@ -1,0 +1,60 @@
+{
+  // VaultSync for Agents — worker template (one worker per vault, FR-20).
+  //
+  // This repo is meant to be deployed via the Deploy to Cloudflare button in
+  // README.md (or `vsa setup`, which generates the same file). The workflow
+  // in .github/workflows/deploy.yml resolves the two placeholders below
+  // before deploying:
+  //
+  //   __WORKER_NAME__  → your worker's name (defaults to this repo's name;
+  //                      override with the WORKER_NAME repo variable)
+  //   __R2_BUCKET__    → the R2 bucket for this vault's blobs (defaults to
+  //                      "vaultsync-<worker name>"; created if missing)
+  //
+  // Bindings mirror packages/worker/wrangler.jsonc in the monorepo:
+  // ROOM (VaultRoom SQLite Durable Object), BUCKET (R2), ASSETS (dashboard),
+  // and the weekly orphan-blob GC cron.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "__WORKER_NAME__",
+  "main": "dist/worker.js",
+  "compatibility_date": "2026-08-01",
+  // Dashboard SPA (ARCHITECTURE.md §10, FR-30) shipped inside the release
+  // bundle (dist/dashboard) and served by this worker — no second deployment.
+  // `run_worker_first: true` keeps the worker's fetch router as the single
+  // decision point (asset serving only happens where it delegates to ASSETS),
+  // so the 421 unclaimed gate keeps covering /api/*, /blob/*, /sync and
+  // friends while GET / serves the SPA in BOTH claim states.
+  // `single-page-application` maps unknown GETs to index.html.
+  "assets": {
+    "directory": "./dist/dashboard",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOM",
+        "class_name": "VaultRoom"
+      }
+    ]
+  },
+  // SQLite-backed Durable Object class registration (wrangler schema has no
+  // top-level new_sqlite_classes key — it lives under migrations).
+  "migrations": [
+    {
+      "tag": "0001_initial",
+      "new_sqlite_classes": ["VaultRoom"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "__R2_BUCKET__"
+    }
+  ],
+  "triggers": {
+    // Weekly orphan-blob GC, Mondays 03:00 UTC (ARCHITECTURE.md §7).
+    "crons": ["0 3 * * 1"]
+  }
+}

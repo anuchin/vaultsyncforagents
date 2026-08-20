@@ -1,0 +1,7 @@
+# Release-bundle + resolved-config artifacts (created by CI, never committed)
+dist/
+worker-bundle.zip
+wrangler.resolved.jsonc
+
+# Node (only relevant if you install wrangler locally instead of via npx)
+node_modules/

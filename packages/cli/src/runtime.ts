@@ -21,11 +21,19 @@ export interface OutputWriter {
   error(text?: string): void;
 }
 
+/** One choice in a `select` prompt. */
+export interface PromptChoice<V extends string = string> {
+  value: V;
+  label: string;
+  hint?: string;
+}
+
 /** Interactive prompt seam; `null` means non-interactive (no TTY). */
 export interface PromptUi {
   text(message: string, options?: { placeholder?: string; defaultValue?: string }): Promise<string>;
   password(message: string): Promise<string>;
   confirm(message: string): Promise<boolean>;
+  select<V extends string>(message: string, choices: readonly PromptChoice<V>[]): Promise<V>;
 }
 
 /** Thrown by command logic for expected, user-facing failures. */
@@ -53,6 +61,12 @@ export interface VsRuntime {
    * production delegates to `@vsa/daemon`). Type-only import: no runtime cycle.
    */
   daemonControl?: import('./commands/daemon.js').DaemonControl;
+  /**
+   * Overrides the Cloudflare surface for `vsa setup` (wrangler runs, REST
+   * account probe, browser open). Tests install fakes; production shells out.
+   * Type-only import: no runtime cycle.
+   */
+  cloudflare?: import('./cloudflare.js').CloudflareControl;
 }
 
 // --- clack-backed prompt UI --------------------------------------------------------------
@@ -91,6 +105,25 @@ export class ClackPromptUi implements PromptUi {
 
   async confirm(message: string): Promise<boolean> {
     return unwrap(await p.confirm({ message }));
+  }
+
+  async select<V extends string>(
+    message: string,
+    choices: readonly PromptChoice<V>[],
+  ): Promise<V> {
+    // Concrete <string> instantiation: clack's Option<Value> is a conditional
+    // type over Value, which does not play well with open generics.
+    const answer = unwrap(
+      await p.select({
+        message,
+        options: choices.map((choice) => ({
+          value: choice.value as string,
+          label: choice.label,
+          ...(choice.hint !== undefined ? { hint: choice.hint } : {}),
+        })),
+      }),
+    );
+    return answer as V;
   }
 }
 

@@ -67,6 +67,16 @@ export class ScriptedPrompts implements PromptUi {
   async confirm(message: string): Promise<boolean> {
     return Boolean(this.next(message));
   }
+  async select<V extends string>(
+    message: string,
+    choices: readonly { value: V }[],
+  ): Promise<V> {
+    const answer = String(this.next(message));
+    if (!choices.some((choice) => choice.value === answer)) {
+      throw new Error(`scripted select answer ${JSON.stringify(answer)} is not one of the choices for: ${message}`);
+    }
+    return answer as V;
+  }
 }
 
 export interface FakeWorkerState {

@@ -1,0 +1,92 @@
+# VaultSync for Agents — per-vault worker deployment (FR-20, FR-21).
+#
+# On every push to main (and manual dispatch) this workflow:
+#   1. resolves the worker + R2 bucket names (repo variables, or defaults
+#      derived from this repo's name) into wrangler.resolved.jsonc,
+#   2. downloads the pinned VaultSyncforAgents release bundle
+#      (`worker-bundle.zip` = dist/worker.js + dist/dashboard/) from the
+#      monorepo's GitHub Releases,
+#   3. creates the R2 bucket if it does not exist yet,
+#   4. deploys with wrangler (Durable Object migration + cron included).
+#
+# Required repo secrets (README.md → "API token permissions"):
+#   CLOUDFLARE_API_TOKEN   token with Workers Scripts:Edit + R2:Edit (+ Account Settings:Read)
+#   CLOUDFLARE_ACCOUNT_ID  the account that owns the worker
+#
+# Optional repo variables:
+#   WORKER_NAME     default: this repository's name
+#   R2_BUCKET_NAME  default: vaultsync-<WORKER_NAME>
+#
+# Follows Cloudflare's documented Workers GitHub Actions pattern:
+# https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/
+name: Deploy vault worker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "VaultSyncforAgents release tag to deploy (blank = the pinned VERSION)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve the release to deploy
+        run: |
+          PINNED="$(tr -d '[:space:]' < VERSION)"
+          REQUESTED="${{ github.event.inputs.release }}"
+          echo "VSA_RELEASE=${REQUESTED:-$PINNED}" >> "$GITHUB_ENV"
+          echo "Deploying VaultSyncforAgents release: ${REQUESTED:-$PINNED}"
+
+      - name: Resolve worker and bucket names
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          WORKER_NAME: ${{ vars.WORKER_NAME }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+        run: node scripts/resolve-config.mjs
+
+      - name: Download the worker bundle
+        run: |
+          curl -fL --retry 3 --retry-delay 5 \
+            "https://github.com/vaultsyncforagents/vaultsyncforagents/releases/download/${VSA_RELEASE}/worker-bundle.zip" \
+            -o worker-bundle.zip
+          mkdir -p dist
+          # Bundle layout (artifact convention): worker.js + dashboard/**
+          unzip -o worker-bundle.zip -d dist
+          test -f dist/worker.js || { echo "bundle is missing dist/worker.js"; exit 1; }
+          test -d dist/dashboard || { echo "bundle is missing dist/dashboard/"; exit 1; }
+
+      - name: Create the R2 bucket if it does not exist yet
+        run: npx --yes wrangler@4 r2 bucket create "$R2_BUCKET_NAME" || echo "bucket already exists — continuing"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4"
+          command: deploy --config wrangler.resolved.jsonc
+
+      - name: Next steps
+        run: |
+          URL="${{ steps.deploy.outputs.deployment-url }}"
+          echo "::notice::Deployed ${{ env.WORKER_NAME }} — ${URL:-check the Cloudflare dashboard for the URL}"
+          echo ""
+          echo "1. Open the worker URL above."
+          echo "2. Set the admin passphrase and name the vault — that claims the worker."
+          echo "3. Pair devices from the dashboard (Devices → Pair new device) or \`vsa link\`."

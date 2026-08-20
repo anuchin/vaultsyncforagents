@@ -3,8 +3,8 @@
  *
  * Thin commander layer: global flags (--vault, --json, --config), one
  * subcommand each, all logic delegated to `commands/*` over an injectable
- * `VsRuntime`. `vsa daemon …` (FR-55) delegates to `@vsa/daemon`; `setup` is
- * a later phase (FR-50) and intentionally absent.
+ * `VsRuntime`. `vsa daemon …` (FR-55) delegates to `@vsa/daemon`; `vsa setup`
+ * (FR-50) drives wrangler/Cloudflare over the injectable seam in cloudflare.ts.
  */
 
 import { Command } from 'commander';
@@ -18,6 +18,7 @@ import { runLogs, renderLogs } from './commands/logs.js';
 import { runHistory, renderHistory, runRestore } from './commands/history.js';
 import { runDoctor, renderDoctor } from './commands/doctor.js';
 import { renderDaemonResult, runDaemonCommand, type DaemonAction } from './commands/daemon.js';
+import { runSetup } from './commands/setup.js';
 import {
   ClackPromptUi,
   CommandError,
@@ -215,6 +216,39 @@ export function buildProgram(runtime: VsRuntime): Command {
       }
       if (reports.some((report) => !report.healthy)) {
         process.exitCode = 1;
+      }
+    });
+
+  // --- setup (FR-50) ------------------------------------------------------------------------
+
+  program
+    .command('setup')
+    .description('deploy a new worker + R2 bucket for a vault into your Cloudflare account, print the claim URL')
+    .option('--name <vault>', 'vault name (shown in the dashboard; the worker name is derived from it)')
+    .option('--worker-name <name>', 'override the derived worker name (default vaultsync-<slug>-<suffix>)')
+    .option('--bucket <name>', 'override the R2 bucket name (default: the worker name)')
+    .option('--api-token <token>', 'Cloudflare API token (non-interactive auth; skips wrangler login)')
+    .option('--account-id <id>', 'Cloudflare account id (required early when the token sees multiple accounts)')
+    .option('--dir <path>', 'deploy directory to prepare (default: ./<worker-name>)')
+    .option('--bundle <path>', 'local worker-bundle.zip instead of the pinned release download')
+    .option('--yes', 'skip prompts (everything needed must arrive as flags)')
+    .option('--open', 'open the worker URL in the browser after deploy (default: ask)')
+    .option('--no-open', 'never open the browser')
+    .action(async (options: Record<string, unknown>) => {
+      const merged: Record<string, unknown> = { ...globals(), ...options };
+      const result = await runSetup(runtime, {
+        vaultName: merged['name'] as string | undefined,
+        workerName: merged['workerName'] as string | undefined,
+        bucketName: merged['bucket'] as string | undefined,
+        apiToken: merged['apiToken'] as string | undefined,
+        accountId: merged['accountId'] as string | undefined,
+        dir: merged['dir'] as string | undefined,
+        bundlePath: merged['bundle'] as string | undefined,
+        yes: merged['yes'] === true,
+        open: merged['open'] === undefined ? undefined : merged['open'] === true,
+      });
+      if (merged['json'] === true) {
+        runtime.output.log(JSON.stringify(result, null, 2));
       }
     });
 
