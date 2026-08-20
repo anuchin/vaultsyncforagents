@@ -1,0 +1,19 @@
+{
+  "name": "vaultsyncforagents",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted Obsidian vault sync engine (monorepo root)",
+  "license": "UNLICENSED",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
