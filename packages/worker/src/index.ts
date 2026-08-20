@@ -93,6 +93,11 @@ export default {
     if (request.method === 'GET' && path === '/api/status') {
       return roomFetch(env, '/api/status', { headers: authForwardHeaders(request) });
     }
+    if (request.method === 'GET' && path === '/api/history') {
+      // Read-only version-chain lookup for `vsa history` / `vsa restore`
+      // (FR-54). Query string (`?path=…`) is forwarded verbatim.
+      return roomFetch(env, `/api/history${url.search}`, { headers: authForwardHeaders(request) });
+    }
     if ((path === '/ws' || path === '/sync') && request.method === 'GET') {
       return handleWebSocket(request, env);
     }

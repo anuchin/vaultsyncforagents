@@ -529,7 +529,6 @@ export class VaultRoom extends DurableObject<Env> {
   // --- HTTP surface (called by the worker's router) -------------------------------------------
 
   private async handleHttp(request: Request, url: URL, path: string): Promise<Response> {
-    void url;
     if (request.method === 'GET' && path === '/internal/health') {
       const claimed = await this.isClaimed();
       return json(200, { claimed, vaultName: claimed ? await this.getMeta('vault_name') : null });
@@ -540,6 +539,7 @@ export class VaultRoom extends DurableObject<Env> {
     if (request.method === 'POST' && path === '/admin/revoke') return this.httpAdminRevoke(request);
     if (request.method === 'POST' && path === '/pair') return this.httpPair(request);
     if (request.method === 'GET' && path === '/api/status') return this.httpStatus(request);
+    if (request.method === 'GET' && path === '/api/history') return this.httpHistory(request, url);
     if (request.method === 'POST' && path === '/internal/auth') return this.httpInternalAuth(request);
     if (request.method === 'POST' && path === '/internal/blob-uploaded') return this.httpBlobUploaded(request);
     if (request.method === 'GET' && path === '/internal/gc') return this.httpGcList();
@@ -740,6 +740,46 @@ export class VaultRoom extends DurableObject<Env> {
       storageBytes: storageRow?.bytes ?? 0,
       recentEvents,
     });
+  }
+
+  /**
+   * Version chain for one path (FR-54: `vsa history` / `vsa restore`).
+   * Read-only, newest-first, with the current head flagged. Device token or
+   * admin session; restore is CLIENT-side (fetch the old blob, write, commit).
+   */
+  private async httpHistory(request: Request, url: URL): Promise<Response> {
+    const auth = await this.authenticateHttpRequest(request);
+    if (!auth.ok) return json(401, { error: 'device token or admin session required' });
+    const path = url.searchParams.get('path');
+    if (path === null || path.trim() === '' || !path.startsWith('/')) {
+      return json(400, { error: 'query parameter path (absolute vault path) is required' });
+    }
+
+    const headRow = this.sql(
+      'SELECT current_version, deleted FROM files WHERE path = ?',
+      path,
+    ).toArray()[0];
+    const head =
+      headRow === undefined
+        ? null
+        : { versionId: headRow.current_version as string, deleted: (headRow.deleted as number) === 1 };
+
+    const versions = this.sql(
+      `SELECT id, hash, size, device_id, clock_counter, clock_device, ts, kind
+         FROM versions WHERE path = ? ORDER BY ts DESC, clock_counter DESC, id DESC`,
+      path,
+    ).toArray().map((row) => ({
+      id: row.id as string,
+      hash: row.hash as string,
+      size: row.size as number,
+      deviceId: row.device_id as string,
+      clock: { counter: row.clock_counter as number, deviceId: row.clock_device as string },
+      ts: row.ts as number,
+      kind: row.kind as string,
+      current: head !== null && head.versionId === (row.id as string),
+    }));
+
+    return json(200, { path, head, versions });
   }
 
   /** Bearer/cookie check used by the worker for /blob and /api/status. */

@@ -9,10 +9,13 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "npm run test:core && npm run test:worker",
+    "test": "npm run test:core && npm run test:node-runtime && npm run test:cli && npm run test:worker",
     "test:core": "vitest run",
+    "test:node-runtime": "npm run test --workspace @vsa/node-runtime",
+    "test:cli": "npm run test --workspace @vsa/cli",
     "test:worker": "npm run test --workspace @vsa/worker",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "vsa": "node packages/cli/bin/vsa.js"
   },
   "devDependencies": {
     "typescript": "^5.9.3",
