@@ -134,7 +134,11 @@ export interface SyncClientStatus {
   lastSyncAt: number | null;
   /** Watcher/reconcile events queued behind the debounce window. */
   pending: number;
-  /** Conflicts observed by plan cycles (informational; resolution is in the data). */
+  /**
+   * Conflicts observed by the most recent plan cycle (informational;
+   * resolution is in the data). Replaced every cycle — a later cycle that
+   * plans clean clears it, so a synced-quiet client reports 0.
+   */
   conflicts: ConflictOp[];
   /**
    * Server release version as reported by helloAck (null before the first
@@ -703,7 +707,11 @@ export class SyncClient {
         thisDeviceName: this.options.deviceName,
         now: this.now(),
       });
-      this.conflicts = [...this.conflicts, ...plan.conflicts];
+      // Conflicts reflect the latest plan: entries for paths no longer
+      // contested are dropped (a cycle that plans clean clears the list), so
+      // a synced-quiet client reports 0 while still-contested paths stay
+      // visible until a cycle actually resolves them.
+      this.conflicts = [...plan.conflicts];
 
       // Stage push contents BEFORE pulls overwrite the working tree (a
       // conflict-copy push reads the loser content from the original path).

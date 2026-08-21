@@ -177,6 +177,12 @@ describe('SyncClient — the local-modification guard', () => {
     expect(text(await a.storage.readFile(copies[0]!))).toBe('alpha edit');
     expect(text(await b.storage.readFile(copies[0]!))).toBe('alpha edit');
     expect(b.client.status().conflicts.length).toBeGreaterThan(0);
+
+    // Lifecycle: the record reflects the LATEST cycle — once a clean pass
+    // completes over the converged state, the counter returns to 0.
+    await b.client.triggerSync();
+    await settle(a, b);
+    expect(b.client.status().conflicts).toEqual([]);
   });
 
   it('applies a remote change immediately when the target is clean', async () => {
@@ -192,6 +198,34 @@ describe('SyncClient — the local-modification guard', () => {
     await settle(a, b);
     expect(text(await b.storage.readFile('/notes/clean.md'))).toBe('v1');
     expect(b.scheduler.entries.length).toBe(0); // no deferred reconcile
+  });
+});
+
+describe('SyncClient — second device pairs over byte-identical local files', () => {
+  it('fresh index + identical content → silent convergence: no conflicts, no copies, no commits', async () => {
+    // The documented second-machine setup flow: the vault already exists on
+    // disk, the local index is fresh (e.g. after unlink) — every file is an
+    // add-vs-add race with byte-identical content that must resolve quietly.
+    const { make } = rig();
+    const a = make('dev-a', 'Alpha');
+    await a.storage.writeFile('/notes/one.md', enc('shared note'));
+    await a.storage.writeFile('/notes/two.md', enc('another note'));
+    await a.client.connect();
+
+    const b = make('dev-b', 'Beta');
+    await b.storage.writeFile('/notes/one.md', enc('shared note')); // identical bytes
+    await b.storage.writeFile('/notes/two.md', enc('another note'));
+    await b.client.connect();
+    await settle(a, b);
+
+    expect(b.client.status().conflicts).toEqual([]);
+    expect(b.sent.filter((m) => m.type === 'commit')).toEqual([]); // no add-vs-add churn
+    for (const r of [a, b]) {
+      expect((await r.storage.listFiles()).filter((f) => / \(conflict /.test(f.path))).toEqual([]);
+    }
+    expect(b.client.currentIndex()['/notes/one.md']).toMatchObject({
+      hash: await sha256Hex('shared note'),
+    });
   });
 });
 

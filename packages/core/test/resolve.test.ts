@@ -343,6 +343,60 @@ describe('computeSyncPlan — two devices edit the same note offline (FR-6)', ()
     });
     expect(plan.conflicts[0]).toMatchObject({ reason: 'add-vs-add', winner: 'remote', loserContent: 'local' });
   });
+
+  it('both-add race with byte-identical content — remote wins → silent convergence, no conflict, no copy', async () => {
+    // The documented second-machine setup flow: a fresh local index (after
+    // unlink) over files that already exist locally with identical bytes.
+    const hash = await h('same on both');
+    const plan = computeSyncPlan(
+      makeInput({
+        manifest: [remote('/new.md', { hash, version: 'v1', size: 4, clock: clock(9, 'dev-Z') })],
+        localChanges: { ...noChanges(), added: [{ path: '/new.md', hash, size: 4 }] },
+        thisDeviceId: 'dev-A',
+      }),
+    );
+    expect(plan.pulls).toEqual([
+      { kind: 'add', path: '/new.md', hash, size: 4, version: 'v1', clock: clock(9, 'dev-Z'), deleted: false },
+    ]);
+    expect(plan.pushes).toEqual([]);
+    expect(plan.conflicts).toEqual([]);
+  });
+
+  it('both-add race with byte-identical content — local wins the clock → still silent convergence on the remote head', async () => {
+    const hash = await h('same on both');
+    const plan = computeSyncPlan(
+      makeInput({
+        manifest: [remote('/new.md', { hash, version: 'v1', size: 4, clock: clock(2, 'dev-A') })],
+        localChanges: { ...noChanges(), added: [{ path: '/new.md', hash, size: 4 }] },
+        thisDeviceId: 'dev-Z', // wins the counter-2 tie — content identical either way
+      }),
+    );
+    expect(plan.pulls).toEqual([
+      { kind: 'add', path: '/new.md', hash, size: 4, version: 'v1', clock: clock(2, 'dev-A'), deleted: false },
+    ]);
+    expect(plan.pushes).toEqual([]);
+    expect(plan.conflicts).toEqual([]);
+  });
+
+  it('both sides edit to byte-identical content → silent convergence (no conflict record)', async () => {
+    const baseHash = await h('base');
+    const sameHash = await h('same edit');
+    const plan = computeSyncPlan(
+      makeInput({
+        index: { '/notes/todo.md': entry(baseHash, 'v1', 4, clock(1, 'dev-A')) },
+        manifest: [remote('/notes/todo.md', { hash: sameHash, version: 'v2', size: 9, clock: clock(5, 'dev-B') })],
+        localChanges: {
+          ...noChanges(),
+          modified: [{ path: '/notes/todo.md', hash: sameHash, size: 9 }],
+        },
+      }),
+    );
+    expect(plan.pulls).toEqual([
+      { kind: 'edit', path: '/notes/todo.md', hash: sameHash, size: 9, version: 'v2', clock: clock(5, 'dev-B'), deleted: false },
+    ]);
+    expect(plan.pushes).toEqual([]);
+    expect(plan.conflicts).toEqual([]);
+  });
 });
 
 describe('computeSyncPlan — delete-vs-edit', () => {

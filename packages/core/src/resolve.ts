@@ -536,6 +536,17 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
     }
 
     // Concurrent content (edit-vs-edit or add-vs-add).
+    if (local.hash === remote.hash) {
+      // Byte-identical content on both sides (a second device pairing over
+      // files it already has, or both sides making the same edit): nothing
+      // distinct to preserve, so no conflict record and no copy — converge
+      // silently on the remote head regardless of clock order (mirrors the
+      // server's arbitration, which synthesizes no copy for identical content).
+      pulls.push(
+        pullFile(entry?.deletedAt !== undefined ? 'restore' : entry === undefined ? 'add' : 'edit', path, remote),
+      );
+      return;
+    }
     if (remoteWins) {
       pulls.push(
         pullFile(entry?.deletedAt !== undefined ? 'restore' : entry === undefined ? 'add' : 'edit', path, remote),
