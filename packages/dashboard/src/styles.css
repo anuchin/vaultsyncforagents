@@ -443,6 +443,17 @@ select.input {
   display: none;
 }
 
+/* Success notice (passphrase-change confirmation) — the quiet twin of .form-error. */
+.form-notice {
+  color: var(--ok);
+  font-size: 13.5px;
+  margin: 10px 0 0;
+}
+
+.form-notice:empty {
+  display: none;
+}
+
 /* --- pairing panel ----------------------------------------------------------------------- */
 
 .pair-panel {

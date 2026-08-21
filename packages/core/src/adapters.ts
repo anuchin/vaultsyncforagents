@@ -55,6 +55,20 @@ export interface StorageAdapter {
   listDirs(): Promise<readonly string[]>;
   /** Create a directory (and ancestors); idempotent. */
   ensureDir(path: string): Promise<void>;
+  /**
+   * Remove an EMPTY directory at `path` (folder-tombstone application and
+   * prune-on-delete, `engine.ts`). OPTIONAL on purpose: adapters that predate
+   * this hook keep working — core falls back to record-only semantics (the
+   * directory stays on disk; sync state still converges).
+   *
+   * Contract: idempotent (removing a missing directory is not an error, like
+   * `deleteFile`); MUST NOT delete a non-empty directory — refuse (throw)
+   * rather than cascade. Core always pre-checks emptiness through
+   * `listFiles`/`listDirs`/`exists` before calling, so a conforming adapter
+   * never receives a non-empty path; a throw is treated by core as
+   * record-only, never as data loss. Never touches files.
+   */
+  removeDir?(path: string): Promise<void>;
   /** Whether a file or directory exists at `path`. */
   exists(path: string): Promise<boolean>;
 }

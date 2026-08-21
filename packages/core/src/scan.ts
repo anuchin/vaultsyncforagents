@@ -19,7 +19,17 @@
  *                  is the documented, correct v1 behavior;
  *   - `emptyFolders` — directories existing in storage but represented
  *                  neither by a live folder placeholder in the index nor by
- *                  any file beneath them (FR-10).
+ *                  any file beneath them (FR-10);
+ *   - `folderDeletions` — live folder placeholder entries whose directory
+ *                  no longer exists in storage: the user deleted an empty
+ *                  folder (or prune-on-delete removed it, `engine.ts`), and
+ *                  the deletion must propagate as a folder tombstone. The
+ *                  bucket is SEPARATE from `deleted` on purpose: folder
+ *                  placeholders carry no content hash, must never enter
+ *                  rename correlation, and resolve as placeholders
+ *                  (`isFolder`) downstream. A placeholder that merely became
+ *                  ignored (settings change) is NOT a deletion — it is
+ *                  skipped, exactly like ignored files.
  *
  * ## The mtime+size pre-filter (fast mode, the default)
  *
@@ -88,6 +98,19 @@ export interface RenameCandidate {
 }
 
 /**
+ * A live folder placeholder whose directory vanished from storage: the
+ * deletion must propagate as a folder tombstone (kind `'delete'`,
+ * `isFolder: true`). Carries the placeholder's version id so the tombstone
+ * commit names its parent; hash/size are the placeholder constants
+ * (`''`/`0`) and are re-derived downstream rather than carried.
+ */
+export interface FolderDeletionCandidate {
+  path: string;
+  /** Version id of the placeholder head the tombstone commit builds on. */
+  versionId: string;
+}
+
+/**
  * A file this scan actually read and hashed, with the stat observed at hash
  * time. Feeds `recordHashedFiles` so the NEXT fast scan can skip these files
  * (the mtime cache on the index entry). Files skipped by the pre-filter are,
@@ -111,6 +134,11 @@ export interface LocalChanges {
   renamed: RenameCandidate[];
   /** Empty-folder paths to push as placeholder entries (FR-10). */
   emptyFolders: string[];
+  /**
+   * Live folder placeholders whose directory no longer exists in storage —
+   * folder deletions to push as tombstones (kind `'delete'`, `isFolder`).
+   */
+  folderDeletions: FolderDeletionCandidate[];
   /** Every file the scan hashed (fast mode's skipped files are absent), sorted by path. */
   hashed: HashedFile[];
 }
@@ -181,7 +209,9 @@ export async function scanVault(
   }
 
   const { renamed, deleted: unmatchedDeleted, added: unmatchedAdded } = detectRenames(deleted, added);
-  const emptyFolders = await detectEmptyFolders(storage, index, settings, files);
+  const dirs = await storage.listDirs();
+  const emptyFolders = detectEmptyFolders(index, settings, files, dirs);
+  const folderDeletions = detectFolderDeletions(index, settings, dirs);
 
   return {
     scannedAt: now,
@@ -190,6 +220,7 @@ export async function scanVault(
     deleted: [...unmatchedDeleted].sort(byPath),
     renamed: [...renamed].sort((a, b) => byPath(a, b)),
     emptyFolders,
+    folderDeletions,
     hashed: [...hashed].sort(byPath),
   };
 }
@@ -299,12 +330,12 @@ function detectRenames(
  * them. A directory containing only ignored files is therefore *not* empty —
  * it is represented by those files as far as the local machine is concerned.
  */
-async function detectEmptyFolders(
-  storage: StorageAdapter,
+function detectEmptyFolders(
   index: LocalIndex,
   settings: IgnoreSettings,
   files: readonly FileStat[],
-): Promise<string[]> {
+  dirs: readonly string[],
+): string[] {
   const representedDirs = new Set<string>();
   for (const file of files) {
     for (let dir = parentPath(file.path); dir !== '/'; dir = parentPath(dir)) {
@@ -313,7 +344,7 @@ async function detectEmptyFolders(
   }
 
   const emptyFolders: string[] = [];
-  for (const dir of await storage.listDirs()) {
+  for (const dir of dirs) {
     if (dir === '/') continue;
     if (representedDirs.has(dir)) continue;
     if (isIgnored(dir, settings)) continue;
@@ -322,6 +353,30 @@ async function detectEmptyFolders(
     emptyFolders.push(dir);
   }
   return emptyFolders.sort();
+}
+
+/**
+ * Live folder placeholder entries whose directory no longer exists in
+ * storage — the folder was deleted locally (directly, or by prune-on-delete
+ * emptying it). Emits one `FolderDeletionCandidate` per placeholder so the
+ * resolve/commit path pushes a folder tombstone; already-tombstoned
+ * placeholders and placeholders that merely became ignored are skipped.
+ */
+function detectFolderDeletions(
+  index: LocalIndex,
+  settings: IgnoreSettings,
+  dirs: readonly string[],
+): FolderDeletionCandidate[] {
+  const present = new Set(dirs);
+  const folderDeletions: FolderDeletionCandidate[] = [];
+  for (const [path, entry] of Object.entries(index)) {
+    if (!entry.isFolder) continue; // files are handled by the `deleted` bucket
+    if (entry.deletedAt !== undefined) continue; // already tombstoned
+    if (present.has(path)) continue; // directory still exists — no deletion
+    if (isIgnored(path, settings)) continue; // settings change, not a deletion
+    folderDeletions.push({ path, versionId: entry.versionId });
+  }
+  return folderDeletions.sort(byPath);
 }
 
 function sortCandidates(candidates: ScanCandidate[]): ScanCandidate[] {

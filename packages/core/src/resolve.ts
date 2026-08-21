@@ -76,6 +76,8 @@ export interface PushFileOp {
   /** Content hash; delete ops reuse the deleted content's hash. */
   hash: string;
   size: number;
+  /** True for folder-tombstone deletes (`hash ''`, size 0) — FR-10 lifecycle. */
+  isFolder?: boolean;
 }
 
 /** A local rename to commit as one chain migration (FR-9). */
@@ -159,6 +161,8 @@ interface LocalCandidate {
   kind: 'add' | 'edit' | 'restore' | 'delete';
   hash: string;
   size: number;
+  /** Folder-placeholder deletions (`scan.folderDeletions`) resolve as tombstones. */
+  isFolder?: boolean;
 }
 
 const ZERO_CLOCK: LogicalClock = { counter: 0, deviceId: '' };
@@ -186,6 +190,7 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
     localPaths.add(r.from);
     localPaths.add(r.to);
   }
+  for (const f of localChanges.folderDeletions) localPaths.add(f.path);
 
   // Paths already consumed by an earlier phase (rename correlation etc.).
   const consumed = new Set<string>();
@@ -396,6 +401,19 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
       kind: index[c.path]?.deletedAt !== undefined ? ('restore' as const) : ('edit' as const),
     })),
     ...localChanges.deleted.map((d): LocalCandidate => ({ ...d, kind: 'delete' })),
+    // Folder placeholders whose directory vanished: tombstone pushes. They
+    // carry no content (hash ''/size 0) and can never pair with an add, so
+    // they join here rather than the `deleted` bucket (rename correlation,
+    // conflict copies — neither applies to placeholders).
+    ...localChanges.folderDeletions.map(
+      (f): LocalCandidate => ({
+        path: f.path,
+        kind: 'delete',
+        hash: '',
+        size: 0,
+        isFolder: true,
+      }),
+    ),
   ].sort((a, b) => compareStrings(a.path, b.path));
 
   for (const candidate of candidates) {
@@ -427,6 +445,7 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
         parentVersion: entry?.versionId ?? null,
         hash: entry?.hash ?? candidate.hash,
         size: entry?.size ?? candidate.size,
+        ...(candidate.isFolder ? { isFolder: true } : {}),
       });
       return;
     }
@@ -481,6 +500,7 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
           parentVersion: entry?.versionId ?? null,
           hash: entry?.hash ?? local.hash,
           size: entry?.size ?? local.size,
+          ...(local.isFolder ? { isFolder: true } : {}),
         });
         conflicts.push({
           path, reason, winner: 'local', loserContent: 'remote',

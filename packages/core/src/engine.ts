@@ -16,6 +16,22 @@
  *     (temp + rename per the adapter contract) at
  *     `/.vaultsyncforagents/state`, including on the failure path.
  *
+ * Folder lifecycle (FR-10 and its deletion counterpart):
+ *
+ *   - applying a REMOTE FOLDER TOMBSTONE removes the local directory when
+ *     it exists and is empty (adapter `removeDir`); non-empty or missing ⇒
+ *     record the tombstone only — the directory converges later, and a
+ *     non-empty directory is never deleted;
+ *   - PRUNE-ON-DELETE: applying a remote file deletion (or rename away)
+ *     removes the deleted path's parent directory when it is now empty on
+ *     disk and holds no live file entries in the index — this is what stops
+ *     an emptied directory from self-resurrecting as an empty-folder
+ *     placeholder on the next scan. Exactly ONE level per deletion: the
+ *     immediate parent only, never a cascade (a chain of emptied
+ *     directories converges over successive cycles; the safety invariant —
+ *     never delete a non-empty directory, never lose user content — is
+ *     checked before every removal).
+ *
  * Pushes/conflicts/folder ops are the network phase's business; retry
  * queues are explicitly out of scope here.
  */
@@ -30,6 +46,7 @@ import {
   serializeLocalIndex,
   type LocalIndex,
 } from './localindex.js';
+import { isStrictlyBeneath, parentPath } from './paths.js';
 import type { PullOp, SyncPlan } from './resolve.js';
 
 /** Injected content transport: fetch the blob for a content hash. */
@@ -92,20 +109,29 @@ async function applyOnePull(
       // Old path never materialized here (or already moved): fetch content.
       await fetchVerified(storage, pull.toPath, pull.hash, fetchBlob);
     }
-    return applyCommit(removeEntry(index, pull.fromPath), {
+    const moved = applyCommit(removeEntry(index, pull.fromPath), {
       path: pull.toPath,
       versionId: pull.version,
       hash: pull.hash,
       size: pull.size,
       clock: pull.clock,
     });
+    // The last file may just have left its old parent directory (prune-on-
+    // delete applies to moves too; the rename itself is untouched).
+    await pruneParentOnDelete(storage, moved, pull.fromPath);
+    return moved;
   }
 
   if (pull.isFolder) {
     // Folder placeholders (FR-10): create the directory, record the entry.
-    // Tombstoned placeholders record only — deleting a directory from storage
-    // (and cascading to any files placed inside it) is a platform concern.
-    if (!pull.deleted) await storage.ensureDir(pull.path);
+    // A folder TOMBSTONE additionally removes the local directory when it
+    // exists and is empty; non-empty or missing ⇒ record only (converges
+    // later — a non-empty directory is never deleted here).
+    if (pull.deleted) {
+      await removeDirIfVacant(storage, index, pull.path);
+    } else {
+      await storage.ensureDir(pull.path);
+    }
     return applyCommit(index, {
       path: pull.path,
       versionId: pull.version,
@@ -122,7 +148,7 @@ async function applyOnePull(
     // Idempotent per the adapter contract; a local .trash copy is a
     // platform-layer concern (daemon/plugin), not engine logic.
     await storage.deleteFile(pull.path);
-    return applyCommit(index, {
+    const tombstoned = applyCommit(index, {
       path: pull.path,
       versionId: pull.version,
       hash: pull.hash,
@@ -131,6 +157,10 @@ async function applyOnePull(
       deleted: true,
       deletedAt: now,
     });
+    // Prune-on-delete: an emptied parent directory must not linger and
+    // re-surface as an empty-folder placeholder on the next scan.
+    await pruneParentOnDelete(storage, tombstoned, pull.path);
+    return tombstoned;
   }
 
   const current = index[pull.path];
@@ -161,6 +191,88 @@ async function applyOnePull(
     size: pull.size,
     clock: pull.clock,
   });
+}
+
+// --- folder lifecycle helpers (B: tombstone-apply, C: prune-on-delete) --------
+
+/** Outcome of a prune attempt: the directory judged deletable, and whether it was. */
+export interface PrunedDir {
+  /** The directory that qualified for removal (the deleted path's parent). */
+  dir: string;
+  /** Whether `storage.removeDir` actually removed it (false when the adapter
+   *  lacks the hook or refused — eligibility alone still suppresses a
+   *  placeholder push for it, `client.ts`). */
+  removed: boolean;
+}
+
+/**
+ * Whether `dir` may be deleted without losing anything: it exists, nothing
+ * (file or directory) lives beneath it in storage, and the index holds no
+ * live file entry beneath it. The root is never deletable. This is the
+ * never-delete-non-empty / never-lose-content invariant made explicit —
+ * every directory removal in core goes through it.
+ */
+async function dirIsVacant(
+  storage: StorageAdapter,
+  index: LocalIndex,
+  dir: string,
+): Promise<boolean> {
+  if (dir === '/') return false;
+  if (!(await storage.exists(dir))) return false;
+  for (const file of await storage.listFiles()) {
+    if (isStrictlyBeneath(file.path, dir)) return false;
+  }
+  for (const child of await storage.listDirs()) {
+    if (isStrictlyBeneath(child, dir)) return false;
+  }
+  for (const [path, entry] of Object.entries(index)) {
+    if (entry.isFolder || entry.deletedAt !== undefined) continue;
+    if (isStrictlyBeneath(path, dir)) return false;
+  }
+  return true;
+}
+
+/** Remove `dir` through the adapter when it is vacant. Missing/non-empty/unsupported ⇒ false. */
+async function removeDirIfVacant(
+  storage: StorageAdapter,
+  index: LocalIndex,
+  dir: string,
+): Promise<boolean> {
+  if (!(await dirIsVacant(storage, index, dir))) return false;
+  return removeVacantDir(storage, dir);
+}
+
+async function removeVacantDir(storage: StorageAdapter, dir: string): Promise<boolean> {
+  if (storage.removeDir === undefined) return false; // pre-hook adapters: record-only
+  try {
+    await storage.removeDir(dir);
+    return true;
+  } catch {
+    // A refused or raced removal is record-only, never fatal and never data
+    // loss — the tombstone is still recorded and state converges later.
+    return false;
+  }
+}
+
+/**
+ * Prune-on-delete (C): after `deletedPath` was deleted (or renamed away),
+ * remove its immediate parent directory when it is now empty on disk and
+ * unrepresented by live index entries — exactly ONE level, no cascade.
+ *
+ * Returns the `PrunedDir` when the parent QUALIFIED for removal (whether or
+ * not the adapter could perform it — callers use eligibility to suppress an
+ * empty-folder placeholder push for that directory), `undefined` when the
+ * parent was not deletable (non-empty, holds live entries, missing, or root).
+ * Pure with respect to the index: never mutates it.
+ */
+export async function pruneParentOnDelete(
+  storage: StorageAdapter,
+  index: LocalIndex,
+  deletedPath: string,
+): Promise<PrunedDir | undefined> {
+  const dir = parentPath(deletedPath);
+  if (!(await dirIsVacant(storage, index, dir))) return undefined;
+  return { dir, removed: await removeVacantDir(storage, dir) };
 }
 
 /** Download, verify, and write one blob. A hash mismatch aborts the plan. */

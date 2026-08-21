@@ -74,6 +74,19 @@ export const api = {
     return post('/admin/login', { passphrase });
   },
 
+  /**
+   * Rotate the admin passphrase (POST /admin/passphrase-change). The server
+   * verifies `current`, replaces the hash, rotates the session secret (every
+   * OTHER admin session dies instantly), and re-issues a fresh cookie on this
+   * response — so this tab stays signed in. A 401 whose message names the
+   * current passphrase ("invalid current passphrase") is a validation error;
+   * any other 401 means this session itself is stale (e.g. a rotation in
+   * another tab) and maps to the login view like everywhere else.
+   */
+  adminPassphraseChange(current: string, next: string): Promise<{ ok: boolean; expiresAt: number }> {
+    return post('/admin/passphrase-change', { current, next });
+  },
+
   /** Mint a one-time pairing code (10-min TTL). */
   adminPair(deviceName: string, deviceType: string): Promise<PairCodeDoc> {
     return post<PairCodeDoc>('/admin/pair', { deviceName, deviceType });

@@ -22,7 +22,7 @@
 
 import type { LogAdapter, StorageAdapter, WatchAdapter } from './adapters.js';
 import { compareClocks } from './clock.js';
-import { applyPull, loadLocalIndex, type FetchBlob } from './engine.js';
+import { applyPull, loadLocalIndex, pruneParentOnDelete, type FetchBlob } from './engine.js';
 import { NetworkError, ProtocolError, RevokedError, UnauthorizedError } from './errors.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
@@ -526,7 +526,40 @@ export class SyncClient {
       for (const commit of staged) {
         await this.sendCommit(commit);
       }
+      // Prune-on-delete (C), local side: every deletion that actually
+      // committed this cycle (the index now tombstones it / migrated it away)
+      // may have emptied its parent directory. Remove such directories —
+      // BEFORE the placeholder pushes below, so an emptied directory is not
+      // immediately re-pushed as an empty-folder placeholder.
+      const emptiedDirs = new Set<string>();
+      for (const commit of staged) {
+        // The path that ceased to exist, IF its commit actually landed
+        // (tombstoned in the index for deletes; migrated away for renames —
+        // a delete that lost its race to a remote edit is not a deletion).
+        let ceasedPath: string | undefined;
+        if (commit.kind === 'delete' && commit.isFolder !== true) {
+          if (this.index[commit.path]?.deletedAt !== undefined) ceasedPath = commit.path;
+        } else if (commit.kind === 'rename' && commit.fromPath !== undefined) {
+          if (!(commit.fromPath in this.index)) ceasedPath = commit.fromPath;
+        }
+        if (ceasedPath === undefined) continue;
+        const pruned = await pruneParentOnDelete(this.options.storage, this.index, ceasedPath);
+        if (pruned === undefined) continue;
+        emptiedDirs.add(pruned.dir);
+        const placeholder = this.index[pruned.dir];
+        if (placeholder?.isFolder && placeholder.deletedAt === undefined) {
+          // We just removed the directory a live placeholder still claims:
+          // scan again so the placeholder is tombstoned and propagates.
+          this.scheduleReconcile();
+        }
+      }
+
       for (const path of plan.folderPushes) {
+        // Never resurrect a directory this cycle emptied (delete-derived
+        // placeholders are suppressed even when removal itself was not
+        // possible), nor push one that vanished since the scan.
+        if (emptiedDirs.has(path)) continue;
+        if (!(await this.storageExists(path))) continue;
         await this.sendCommit({
           kind: 'edit',
           path,
@@ -638,6 +671,7 @@ export class SyncClient {
       parentVersion: push.parentVersion,
       hash: push.hash,
       size: push.size,
+      ...(push.isFolder ? { isFolder: true } : {}),
     };
   }
 

@@ -62,6 +62,7 @@ const EVENT_LABELS: Record<string, string> = {
   claimed: 'Vault claimed',
   device_paired: 'Device paired',
   device_revoked: 'Device revoked',
+  passphrase_changed: 'Passphrase changed',
   change: 'Synced',
 };
 

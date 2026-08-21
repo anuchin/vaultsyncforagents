@@ -629,6 +629,7 @@ describe('client/server arbitration agreement (the contract the real DO must sat
       deleted: [],
       renamed: [],
       emptyFolders: [],
+      folderDeletions: [],
       hashed: [],
     };
     const plan = computeSyncPlan({
@@ -691,6 +692,7 @@ describe('client/server arbitration agreement (the contract the real DO must sat
           deleted: [],
           renamed: [],
           emptyFolders: [],
+          folderDeletions: [],
           hashed: [],
         },
         index: {},

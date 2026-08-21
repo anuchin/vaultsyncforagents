@@ -9,6 +9,14 @@ import { api, ApiError } from '../api.js';
 import { badge, clear, field, h, primaryButton, quietButton } from '../dom.js';
 import { formatBytes, relativeTime } from '../format.js';
 import { pairingPanel } from '../pairpanel.js';
+import {
+  INITIAL_PASSPHRASE_FORM,
+  passphraseFormView,
+  reducePassphraseForm,
+  validatePassphraseChange,
+  type PassphraseFormEvent,
+  type PassphraseFormState,
+} from '../passphrase.js';
 import { deviceCounts, deviceNameMap, deviceRows, eventRows, healthBadge } from '../rows.js';
 import type { DeviceRowModel, EventRowModel } from '../rows.js';
 import type { StatusDoc } from '../types.js';
@@ -16,6 +24,8 @@ import { DEVICE_TYPES } from '../types.js';
 import type { ViewContext, ViewHandle } from '../view.js';
 
 const REFRESH_MS = 15_000;
+/** How long the post-rotation notice stays up before auto-dismissing. */
+const NOTICE_MS = 12_000;
 
 export function statusView(ctx: ViewContext): ViewHandle {
   let doc: StatusDoc | null = null;
@@ -42,6 +52,61 @@ export function statusView(ctx: ViewContext): ViewHandle {
   const deviceBody = h('tbody');
   const eventList = h('ul', { class: 'event-list' }, h('li', { class: 'event-empty', text: 'Loading…' }));
 
+  // --- admin passphrase change (rotation) --------------------------------------------------
+
+  const currentInput = h('input', {
+    class: 'input',
+    type: 'password',
+    placeholder: 'Current passphrase',
+    autocomplete: 'current-password',
+  }) as HTMLInputElement;
+  const nextInput = h('input', {
+    class: 'input',
+    type: 'password',
+    placeholder: 'New passphrase',
+    autocomplete: 'new-password',
+  }) as HTMLInputElement;
+  const confirmInput = h('input', {
+    class: 'input',
+    type: 'password',
+    placeholder: 'Repeat the new passphrase',
+    autocomplete: 'new-password',
+  }) as HTMLInputElement;
+  const changeError = h('p', { class: 'form-error', role: 'alert' });
+  const changeNotice = h('p', { class: 'form-notice', role: 'status' });
+  const changeSubmit = primaryButton('Change passphrase', () => void submitPassphraseChange());
+  const changeToggle = quietButton('Change admin passphrase', () => onFormEvent({ type: 'open' }));
+  const changeForm = h(
+    'form',
+    {
+      onsubmit: (event: Event) => {
+        event.preventDefault();
+        void submitPassphraseChange();
+      },
+    },
+    field('Current passphrase', currentInput),
+    field(
+      'New passphrase',
+      nextInput,
+      'Minimum 4 characters. Paired devices keep syncing — only admin sign-in changes.',
+    ),
+    field('Repeat new passphrase', confirmInput),
+    changeError,
+    h(
+      'div',
+      { class: 'form-actions' },
+      changeSubmit,
+      quietButton('Cancel', () => onFormEvent({ type: 'cancel' })),
+    ),
+  );
+  const adminSection = h(
+    'section',
+    { class: 'card admin-card' },
+    h('div', { class: 'card-head' }, h('h2', { text: 'Admin' }), changeToggle),
+    changeNotice,
+    changeForm,
+  );
+
   const root = h(
     'div',
     { class: 'page' },
@@ -63,6 +128,7 @@ export function statusView(ctx: ViewContext): ViewHandle {
         quietButton('Sign out', () => ctx.dispatch({ type: 'logged-out' })),
       ),
     ),
+    adminSection,
     h(
       'div',
       { class: 'stats-grid' },
@@ -221,6 +287,76 @@ export function statusView(ctx: ViewContext): ViewHandle {
     }
   }
 
+  // --- admin passphrase change (form logic) ------------------------------------------------
+
+  let formState: PassphraseFormState = INITIAL_PASSPHRASE_FORM;
+  let noticeTimer = 0;
+
+  function onFormEvent(event: PassphraseFormEvent): void {
+    formState = reducePassphraseForm(formState, event);
+    window.clearTimeout(noticeTimer);
+    if (formState.phase === 'success') {
+      // "Brief" notice: auto-dismiss unless the user acts first.
+      noticeTimer = window.setTimeout(() => onFormEvent({ type: 'dismissed' }), NOTICE_MS);
+    }
+    renderPassphraseForm();
+  }
+
+  function renderPassphraseForm(): void {
+    const view = passphraseFormView(formState);
+    changeForm.style.display = view.formVisible ? '' : 'none';
+    changeToggle.style.display = view.formVisible ? 'none' : '';
+    changeError.textContent = view.errorText ?? '';
+    changeNotice.textContent = view.noticeText ?? '';
+    changeSubmit.disabled = view.submitDisabled;
+    changeSubmit.textContent = view.submitLabel;
+  }
+
+  async function submitPassphraseChange(): Promise<void> {
+    const input = { current: currentInput.value, next: nextInput.value, confirm: confirmInput.value };
+    const invalid = validatePassphraseChange(input);
+    if (invalid !== null) {
+      onFormEvent({ type: 'validation-failed', error: invalid });
+      return;
+    }
+    onFormEvent({ type: 'submit' });
+    try {
+      // The response's Set-Cookie replaces this tab's session with one signed
+      // by the NEW secret — no re-login needed here.
+      await api.adminPassphraseChange(input.current, input.next);
+      ctx.dispatch({ type: 'network-ok' });
+      currentInput.value = '';
+      nextInput.value = '';
+      confirmInput.value = '';
+      onFormEvent({ type: 'succeeded' });
+    } catch (error) {
+      if (error instanceof ApiError) {
+        // A wrong `current` is a validation problem (the server's 401 names
+        // the current passphrase — see room.ts); any OTHER 401 means this
+        // session died (e.g. a rotation in another tab): back to login.
+        if (error.kind === 'unauthorized' && error.message.includes('current passphrase')) {
+          onFormEvent({ type: 'failed', error: 'Current passphrase is wrong — try again.' });
+          return;
+        }
+        if (error.kind === 'unauthorized' || error.kind === 'unclaimed') {
+          onFormEvent({ type: 'reset' });
+          handleApiError(error, 'Could not change the passphrase');
+          return;
+        }
+        if (error.kind === 'network') {
+          ctx.dispatch({ type: 'network-error' });
+          onFormEvent({ type: 'failed', error: 'Cannot reach the server — check your connection.' });
+          return;
+        }
+        // 400 (short next — client validation usually catches it first) and
+        // 429 (throttled) surface the server's own message inline.
+        onFormEvent({ type: 'failed', error: error.message });
+        return;
+      }
+      onFormEvent({ type: 'failed', error: 'Unexpected error — try again.' });
+    }
+  }
+
   // --- pair-a-device modal -----------------------------------------------------------------
 
   function openPairModal(): void {
@@ -311,6 +447,7 @@ export function statusView(ctx: ViewContext): ViewHandle {
 
   // --- wiring -------------------------------------------------------------------------------
 
+  renderPassphraseForm(); // starts hidden: only the toggle button shows
   void load();
   const timer = window.setInterval(() => void load(), REFRESH_MS);
 
@@ -322,6 +459,7 @@ export function statusView(ctx: ViewContext): ViewHandle {
     dispose(): void {
       disposed = true;
       window.clearInterval(timer);
+      window.clearTimeout(noticeTimer);
       closeModal();
     },
   };

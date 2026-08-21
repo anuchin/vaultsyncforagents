@@ -97,6 +97,7 @@ describe('scanVault — clean vault', () => {
       deleted: [],
       renamed: [],
       emptyFolders: [],
+      folderDeletions: [],
       // The clean index is legacy-style (no mtime): fast mode still hashed
       // every file to establish the stat cache — and found them all unchanged.
       hashed: await hashedObservations(storage),
@@ -363,6 +364,65 @@ describe('scanVault — empty folders (FR-10)', () => {
     const changes = await scanVault(storage, index, SETTINGS, NOW);
     expect(changes.deleted.map((d) => d.path)).toEqual(['/solo/only.md']);
     expect(changes.emptyFolders).toEqual(['/solo']);
+    expect(changes.folderDeletions).toEqual([]); // no placeholder indexed ⇒ nothing to tombstone
+  });
+});
+
+describe('scanVault — folder placeholder deletions (F5)', () => {
+  it('reports a live placeholder whose directory vanished as a folder deletion', async () => {
+    const storage = new InMemoryStorageAdapter({ '/notes/a.md': 'alpha' });
+    await storage.ensureDir('/gone-folder');
+    const index = await indexFrom({
+      '/notes/a.md': { content: 'alpha' },
+      '/gone-folder': { content: '', isFolder: true, versionId: 'v9' },
+    });
+    await storage.removeDir('/gone-folder');
+
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.folderDeletions).toEqual([{ path: '/gone-folder', versionId: 'v9' }]);
+    // Folder deletions never leak into the file buckets.
+    expect(changes.deleted).toEqual([]);
+    expect(changes.emptyFolders).toEqual([]);
+    expect(changes.modified).toEqual([]);
+  });
+
+  it('does not report placeholders whose directory still exists', async () => {
+    const storage = new InMemoryStorageAdapter({ '/notes/a.md': 'alpha' });
+    await storage.ensureDir('/still-here');
+    const index = await indexFrom({
+      '/notes/a.md': { content: 'alpha' },
+      '/still-here': { content: '', isFolder: true },
+    });
+
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.folderDeletions).toEqual([]);
+    expect(changes.emptyFolders).toEqual([]); // represented by the live placeholder
+  });
+
+  it('skips already-tombstoned placeholders and paths that only became ignored', async () => {
+    const storage = new InMemoryStorageAdapter({ '/keep.md': 'k' });
+    const index = await indexFrom({
+      '/keep.md': { content: 'k' },
+      '/buried': { content: '', isFolder: true, deletedAt: 5 }, // already tombstoned
+      '.obsidian/plugins': { content: '', isFolder: true }, // ignored (obsidianSync off)
+    });
+
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.folderDeletions).toEqual([]);
+  });
+
+  it('reports several vanished placeholders deterministically sorted by path', async () => {
+    const storage = new InMemoryStorageAdapter({});
+    const index = await indexFrom({
+      '/z-dir': { content: '', isFolder: true, versionId: 'vz' },
+      '/a-dir': { content: '', isFolder: true, versionId: 'va' },
+    });
+
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.folderDeletions).toEqual([
+      { path: '/a-dir', versionId: 'va' },
+      { path: '/z-dir', versionId: 'vz' },
+    ]);
   });
 });
 

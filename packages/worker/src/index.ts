@@ -161,6 +161,9 @@ export default {
     if (request.method === 'POST' && path === '/admin/login') {
       return handleAdminLogin(request, env);
     }
+    if (request.method === 'POST' && path === '/admin/passphrase-change') {
+      return handleAdminPassphraseChange(request, env);
+    }
     if (request.method === 'POST' && path === '/admin/pair') {
       return roomPost(env, '/admin/pair', await readJsonBody(request), cookieHeader(request));
     }
@@ -252,6 +255,32 @@ function clientIpHeaders(request: Request): Record<string, string> {
 async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
   const body = await readJsonBody(request);
   const res = await roomPost(env, '/admin/login', { passphrase: body.passphrase }, clientIpHeaders(request));
+  if (!res.ok) return res;
+  const { cookie, expiresAt } = (await res.json()) as { cookie: string; expiresAt: number };
+  const response = json(200, { ok: true, expiresAt });
+  response.headers.append(
+    'set-cookie',
+    `${ADMIN_COOKIE_NAME}=${cookie}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE}`,
+  );
+  return response;
+}
+
+/**
+ * `POST /admin/passphrase-change` → the DO verifies `current` (argon2, with
+ * the shared per-IP failure budget), stores the new hash, and ROTATES the
+ * session secret so every pre-existing admin cookie dies instantly. The DO
+ * hands back a freshly signed session, re-issued here as a cookie so the
+ * acting admin stays signed in mid-action. Same cookie shape/lifetime as
+ * login; same-origin only (admin routes never carry CORS headers).
+ */
+async function handleAdminPassphraseChange(request: Request, env: Env): Promise<Response> {
+  const body = await readJsonBody(request);
+  const res = await roomPost(
+    env,
+    '/admin/passphrase-change',
+    { current: body.current, next: body.next },
+    { ...cookieHeader(request), ...clientIpHeaders(request) },
+  );
   if (!res.ok) return res;
   const { cookie, expiresAt } = (await res.json()) as { cookie: string; expiresAt: number };
   const response = json(200, { ok: true, expiresAt });

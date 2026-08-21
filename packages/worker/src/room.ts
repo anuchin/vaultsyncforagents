@@ -596,6 +596,9 @@ export class VaultRoom extends DurableObject<Env> {
     }
     if (request.method === 'POST' && path === '/claim') return this.httpClaim(request);
     if (request.method === 'POST' && path === '/admin/login') return this.httpAdminLogin(request);
+    if (request.method === 'POST' && path === '/admin/passphrase-change') {
+      return this.httpAdminPassphraseChange(request);
+    }
     if (request.method === 'POST' && path === '/admin/pair') return this.httpAdminPair(request);
     if (request.method === 'POST' && path === '/admin/revoke') return this.httpAdminRevoke(request);
     if (request.method === 'POST' && path === '/pair') return this.httpPair(request);
@@ -629,12 +632,7 @@ export class VaultRoom extends DurableObject<Env> {
     }
 
     const now = this.now();
-    const salt = randomBytes(16);
-    const hashBytes = argon2id(new TextEncoder().encode(body.passphrase), salt, { ...ARGON2_PARAMS });
-    await this.setMeta(
-      'admin_argon',
-      JSON.stringify({ algo: 'argon2id', salt: toHex(salt), hash: toHex(hashBytes), params: ARGON2_PARAMS }),
-    );
+    await this.setAdminPassphrase(body.passphrase);
     await this.setMeta('session_secret', randomToken64url(32));
     await this.setMeta('vault_name', body.vaultName.trim());
     await this.setMeta('settings_obsidian_sync', '0');
@@ -665,6 +663,60 @@ export class VaultRoom extends DurableObject<Env> {
       return json(401, { error: 'invalid passphrase' });
     }
     this.authFailures.delete(ip);
+    const { value, expiresAt } = await this.signSession();
+    return json(200, { ok: true, cookie: value, expiresAt });
+  }
+
+  /**
+   * `POST /admin/passphrase-change` — rotate the admin passphrase. Requires a
+   * valid admin session; `current` is re-verified against the stored argon2
+   * hash (the same constant-time path as login).
+   *
+   * Semantics:
+   *  - wrong `current` → 401 and counts toward the SAME per-IP auth-failure
+   *    budget as `/admin/login` and `/pair` (a stolen session cookie must not
+   *    become an unlimited passphrase-guessing surface);
+   *  - success clears that budget (same as a successful login);
+   *  - the new hash REPLACES `admin_argon` and the session secret ROTATES, so
+   *    every admin cookie issued before this moment dies instantly — the
+   *    acting admin gets a fresh cookie back and stays signed in;
+   *  - `next` may equal `current` (simpler semantics): it is still a real
+   *    rotation — fresh salt, fresh session secret;
+   *  - device tokens are untouched: they authenticate against
+   *    `devices.token_hash`, not the passphrase or the session secret, so
+   *    paired devices keep syncing straight through a change.
+   */
+  private async httpAdminPassphraseChange(request: Request): Promise<Response> {
+    if (!(await this.requireAdmin(request))) return json(401, { error: 'admin session required' });
+    const ip = clientIpOf(request);
+    const throttled = this.authThrottle(ip);
+    if (throttled !== null) return throttled;
+    const body = (await request.json().catch(() => null)) as
+      | { current?: unknown; next?: unknown }
+      | null;
+    if (
+      body === null ||
+      typeof body.current !== 'string' ||
+      typeof body.next !== 'string' ||
+      body.next.length < 4
+    ) {
+      return json(400, { error: 'current and next passphrase (min 4 chars) are required' });
+    }
+    if (!(await this.verifyAdminPassphrase(body.current))) {
+      // The error text names the CURRENT passphrase on purpose: the dashboard
+      // must tell a wrong-`current` 401 (inline form error) apart from a
+      // stale-session 401 (back to the login view) at the same status code.
+      this.noteAuthFailure(ip, this.now());
+      return json(401, { error: 'invalid current passphrase' });
+    }
+    this.authFailures.delete(ip);
+
+    const now = this.now();
+    await this.setAdminPassphrase(body.next);
+    // Rotate the session secret: any cookie signed with the old one (other
+    // admin tabs, a stolen copy) fails HMAC verification on its next use.
+    await this.setMeta('session_secret', randomToken64url(32));
+    this.appendEvent(now, null, 'passphrase_changed', null, null);
     const { value, expiresAt } = await this.signSession();
     return json(200, { ok: true, cookie: value, expiresAt });
   }
@@ -995,6 +1047,19 @@ export class VaultRoom extends DurableObject<Env> {
       argon2id(new TextEncoder().encode(passphrase), hexToBytes(record.salt), { ...record.params }),
     );
     return timingSafeEqualHex(candidate, record.hash);
+  }
+
+  /**
+   * Hash `passphrase` with a fresh random salt and store the argon2 record —
+   * the single write path shared by claim and passphrase-change.
+   */
+  private async setAdminPassphrase(passphrase: string): Promise<void> {
+    const salt = randomBytes(16);
+    const hashBytes = argon2id(new TextEncoder().encode(passphrase), salt, { ...ARGON2_PARAMS });
+    await this.setMeta(
+      'admin_argon',
+      JSON.stringify({ algo: 'argon2id', salt: toHex(salt), hash: toHex(hashBytes), params: ARGON2_PARAMS }),
+    );
   }
 
   private async signSession(): Promise<{ value: string; expiresAt: number }> {

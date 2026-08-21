@@ -112,8 +112,18 @@ export function parentPath(path: string): VaultPath {
 /**
  * Final path segment. `basename('/a/b.md')` → `b.md`; `basename('/')` → `''`.
  */
-export function basename(path: string): string {
+export function basename(path: string): VaultPath {
   const normalized = normalizeVaultPath(path);
   if (normalized === '/') return '';
   return normalized.slice(normalized.lastIndexOf('/') + 1);
+}
+
+/**
+ * Whether `child` names something at least one level BELOW `ancestor`
+ * (both normalized vault paths). The root is an ancestor of everything
+ * except itself; a path is never strictly beneath itself.
+ */
+export function isStrictlyBeneath(child: string, ancestor: string): boolean {
+  if (ancestor === '/') return child !== '/';
+  return child.length > ancestor.length && child.startsWith(`${ancestor}/`);
 }

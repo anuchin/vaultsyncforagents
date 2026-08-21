@@ -3,13 +3,14 @@
  * two-client simulation tests of later phases.
  *
  * Files live in a `Map` keyed by normalized vault path, directories in a
- * `Set` (so `exists`/`ensureDir` behave for empty folders, FR-10). Writes
- * stage into a temp entry and then commit with rename semantics — within
- * one synchronous section, so no observer can see a half-written file.
+ * `Set` (so `exists`/`ensureDir`/`removeDir` behave for empty folders,
+ * FR-10 and the folder-tombstone lifecycle). Writes stage into a temp entry
+ * and then commit with rename semantics — within one synchronous section,
+ * so no observer can see a half-written file.
  */
 
 import type { FileStat, StorageAdapter } from '../adapters.js';
-import { normalizeVaultPath, parentPath } from '../paths.js';
+import { isStrictlyBeneath, normalizeVaultPath, parentPath } from '../paths.js';
 
 interface Entry {
   data: Uint8Array;
@@ -84,6 +85,30 @@ export class InMemoryStorageAdapter implements StorageAdapter {
 
   async ensureDir(path: string): Promise<void> {
     this.recordDir(normalizeVaultPath(path));
+  }
+
+  /**
+   * Remove an empty directory (the `StorageAdapter.removeDir` contract):
+   * idempotent when missing; refuses (throws) when a file occupies the path
+   * or anything lives beneath it — the adapter never cascades a deletion.
+   */
+  async removeDir(path: string): Promise<void> {
+    const key = this.key(path);
+    if (this.files.has(key)) {
+      throw new Error(`Path is a file, not a directory: ${normalizeVaultPath(path)}`);
+    }
+    if (!this.dirs.has(key)) return; // already gone — idempotent
+    for (const file of this.files.keys()) {
+      if (isStrictlyBeneath(file, key)) {
+        throw new Error(`Directory not empty (contains file ${file}): ${normalizeVaultPath(path)}`);
+      }
+    }
+    for (const dir of this.dirs) {
+      if (isStrictlyBeneath(dir, key)) {
+        throw new Error(`Directory not empty (contains directory ${dir}): ${normalizeVaultPath(path)}`);
+      }
+    }
+    this.dirs.delete(key);
   }
 
   async exists(path: string): Promise<boolean> {
