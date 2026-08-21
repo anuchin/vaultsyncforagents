@@ -5,6 +5,7 @@
  * messages, so command logic never sees raw `TypeError: fetch failed`.
  */
 
+import type { SnapshotSummary } from '@vsa/core';
 import { CommandError } from './runtime.js';
 
 /** Worker call failed (unreachable or unexpected HTTP). */
@@ -23,6 +24,13 @@ export interface HealthInfo {
   claimed: boolean;
   /** Worker-reported Date (ms) parsed from the response header, if present. */
   serverDateMs: number | null;
+  /**
+   * Worker-reported release version (null on workers ≤ 0.1, which predate
+   * version reporting — the compat policy treats that as a warning).
+   */
+  serverVersion: string | null;
+  /** Wire protocol version the worker advertises, when present. */
+  protocolVersion: number | null;
   /** Unparsed error when the worker could not be reached. */
   unreachableReason?: string;
 }
@@ -48,6 +56,8 @@ export interface StatusDoc {
   vaultName: string;
   claimed: boolean;
   health: string;
+  /** Worker-reported release version (absent on workers ≤ 0.1). */
+  serverVersion?: string | null;
   devices: StatusDevice[];
   lastEdit: { ts: number; deviceId: string; path: string } | null;
   attachments: { count: number; bytes: number };
@@ -112,6 +122,8 @@ export class WorkerApi {
         reachable: false,
         claimed: false,
         serverDateMs: null,
+        serverVersion: null,
+        protocolVersion: null,
         unreachableReason: error instanceof Error ? error.message : String(error),
       };
     }
@@ -120,15 +132,23 @@ export class WorkerApi {
         reachable: false,
         claimed: false,
         serverDateMs: null,
+        serverVersion: null,
+        protocolVersion: null,
         unreachableReason: `HTTP ${response.status}`,
       };
     }
-    const body = (await response.json().catch(() => ({}))) as { claimed?: boolean };
+    const body = (await response.json().catch(() => ({}))) as {
+      claimed?: boolean;
+      serverVersion?: unknown;
+      protocolVersion?: unknown;
+    };
     const dateHeader = response.headers.get('date');
     return {
       reachable: true,
       claimed: body.claimed === true,
       serverDateMs: dateHeader === null ? null : Date.parse(dateHeader),
+      serverVersion: typeof body.serverVersion === 'string' ? body.serverVersion : null,
+      protocolVersion: typeof body.protocolVersion === 'number' ? body.protocolVersion : null,
     };
   }
 
@@ -140,6 +160,12 @@ export class WorkerApi {
   /** GET /api/history?path=… (FR-54). */
   async history(token: string, path: string): Promise<HistoryDoc> {
     return this.getJson<HistoryDoc>(`/api/history?path=${encodeURIComponent(path)}`, token);
+  }
+
+  /** GET /api/snapshots — vault-level snapshots, newest-first. */
+  async snapshots(token: string): Promise<SnapshotSummary[]> {
+    const body = await this.getJson<{ snapshots: SnapshotSummary[] }>('/api/snapshots', token);
+    return body.snapshots;
   }
 
   /** POST /pair — redeem a pairing code for a device token. */

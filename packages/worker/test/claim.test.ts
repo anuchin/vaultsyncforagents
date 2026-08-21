@@ -13,6 +13,9 @@ import {
   request,
   resetAll,
 } from './helpers.js';
+import { SERVER_VERSION } from '../src/version.js';
+
+const unclaimedHealth = { ok: true, claimed: false, serverVersion: SERVER_VERSION, protocolVersion: 1 };
 
 beforeEach(async () => {
   await resetAll();
@@ -22,7 +25,7 @@ describe('unclaimed worker', () => {
   it('health answers 200 with claimed:false (doctor/uptime work pre-claim)', async () => {
     const res = await get('/health');
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, claimed: false });
+    expect(await res.json()).toEqual(unclaimedHealth);
   });
 
   it('API/sync/blob/pairing routes answer 421 (GET / serves the claim SPA)', async () => {
@@ -47,7 +50,7 @@ describe('unclaimed worker', () => {
 describe('claim', () => {
   it('claims, registers the claiming device, and flips health', async () => {
     const before = await (await get('/health')).json();
-    expect(before).toEqual({ ok: true, claimed: false });
+    expect(before).toEqual(unclaimedHealth);
 
     const res = await post('/claim', {
       passphrase: 'hunter22',
@@ -63,7 +66,7 @@ describe('claim', () => {
     expect(body.token).toMatch(/^[A-Za-z0-9_-]{40,}$/); // 256-bit base64url
 
     const after = await (await get('/health')).json();
-    expect(after).toEqual({ ok: true, claimed: true });
+    expect(after).toEqual({ ...unclaimedHealth, claimed: true });
   });
 
   it('rejects a second claim with 409 (already claimed)', async () => {

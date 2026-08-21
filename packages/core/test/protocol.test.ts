@@ -26,6 +26,8 @@ import {
   type PongMessage,
   type PutBlobMessage,
   type ServerMessage,
+  type SnapshotCreateAckMessage,
+  type SnapshotRestoreAckMessage,
 } from '../src/index.js';
 
 const clock = { counter: 5, deviceId: 'd1' } as const;
@@ -52,6 +54,9 @@ const clientSamples: ClientMessage[] = [
   { type: 'getBlob', hash: 'ef'.repeat(32) },
   { type: 'ping' },
   { type: 'ping', ts: 1234 },
+  { type: 'snapshotCreate' },
+  { type: 'snapshotCreate', name: 'pre-agent' },
+  { type: 'snapshotRestore', id: 's1' },
 ];
 
 const serverSamples: ServerMessage[] = [
@@ -104,6 +109,8 @@ const serverSamples: ServerMessage[] = [
   { type: 'blob', hash: 'ef'.repeat(32), content: 'aGVsbG8=' },
   { type: 'error', code: 'UNAUTHORIZED', message: 'unknown token' },
   { type: 'pong', ts: 1234 },
+  { type: 'snapshotCreateAck', id: 's1', name: 'pre-agent', ts: 1700000000000, seq: 7, fileCount: 12 },
+  { type: 'snapshotRestoreAck', id: 's1', restored: 4, tombstoned: 2, seq: 13 },
 ];
 
 describe('protocol constants', () => {
@@ -206,6 +213,16 @@ describe('message field shapes (compile-time + spot runtime checks)', () => {
     const conflict: ConflictMessage = serverSamples[3] as ConflictMessage;
     expect(conflict.winner.clock.counter).toBe(6);
     expect(conflict.loserDisposition).toBe('conflictCopy');
+  });
+
+  it('snapshot messages carry id/name/ts/seq/fileCount and restore counts', () => {
+    const create: SnapshotCreateAckMessage = serverSamples[11] as SnapshotCreateAckMessage;
+    expect(create.id).toBe('s1');
+    expect(create.name).toBe('pre-agent');
+    expect(create.seq).toBe(7);
+    expect(create.fileCount).toBe(12);
+    const restore: SnapshotRestoreAckMessage = serverSamples[12] as SnapshotRestoreAckMessage;
+    expect(restore).toMatchObject({ id: 's1', restored: 4, tombstoned: 2, seq: 13 });
   });
 
   it('hello/helloAck/commit/blob/ping/pong/deviceSeen/error shapes hold', () => {

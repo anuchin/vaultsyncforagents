@@ -27,7 +27,9 @@
  * emitted there, keeping the session-cookie CSRF surface at zero.
  */
 
+import { ProtocolVersion } from '@vsa/core';
 import { ADMIN_COOKIE_NAME, blobKey, type VaultRoom } from './room.js';
+import { SERVER_VERSION } from './version.js';
 
 /** Hard cap on blob uploads (§5: ~100 MB, enforced while streaming). */
 const BLOB_MAX_BYTES = 100 * 1024 * 1024;
@@ -60,12 +62,13 @@ const PLUGIN_CORS_HEADERS: Record<string, string> = {
 };
 
 /**
- * Paths the plugin's cross-origin renderer talks to. `/api/status` is here
- * deliberately: the plugin's About section reads the storage summary with the
- * device's Bearer token from the renderer — token-authenticated, no cookies
- * involved, so a wildcard ACAO adds no exposure. The admin dashboard calls the
- * same route same-origin and is unaffected (the headers are additive);
- * every OTHER /api/* route (/api/history included) stays same-origin only.
+ * Paths the plugin's cross-origin renderer talks to. `/api/status` and
+ * `/api/snapshots` are here deliberately: the plugin's About section reads the
+ * storage summary and the snapshot list with the device's Bearer token from
+ * the renderer — token-authenticated, no cookies involved, so a wildcard ACAO
+ * adds no exposure. The admin dashboard calls the same routes same-origin and
+ * is unaffected (the headers are additive); every OTHER /api/* route
+ * (/api/history included) stays same-origin only.
  */
 function isPluginCorsPath(path: string): boolean {
   return (
@@ -73,6 +76,7 @@ function isPluginCorsPath(path: string): boolean {
     path === '/pair' ||
     path === '/device' ||
     path === '/api/status' ||
+    path === '/api/snapshots' ||
     path.startsWith('/blob/')
   );
 }
@@ -141,9 +145,18 @@ export default {
       return new Response(null, { status: 204, headers: PLUGIN_CORS_HEADERS });
     }
 
-    // The two endpoints that work on an unclaimed worker (§3).
+    // The two endpoints that work on an unclaimed worker (§3). The body also
+    // reports the worker's own version + wire protocol version, so `vsa
+    // doctor` and the plugin can assess skew against an unclaimed worker too.
     if (request.method === 'GET' && path === '/health') {
-      return withPluginCors(json(200, { ok: true, claimed: await isClaimed(env) }));
+      return withPluginCors(
+        json(200, {
+          ok: true,
+          claimed: await isClaimed(env),
+          serverVersion: SERVER_VERSION,
+          protocolVersion: ProtocolVersion,
+        }),
+      );
     }
     if (path === '/claim') {
       if (request.method !== 'POST') return json(405, { error: 'POST required' });
@@ -188,6 +201,12 @@ export default {
       // the device token (see `isPluginCorsPath`). Auth is unchanged — the
       // room still accepts the device Bearer token OR the admin cookie.
       return withPluginCors(await roomFetch(env, '/api/status', { headers: authForwardHeaders(request) }));
+    }
+    if (request.method === 'GET' && path === '/api/snapshots') {
+      // Plugin-CORS route like /api/status: the snapshot list is read with the
+      // device token cross-origin (the plugin's snapshot UI); token-authenticated,
+      // no cookies involved, so a wildcard ACAO adds no exposure.
+      return withPluginCors(await roomFetch(env, '/api/snapshots', { headers: authForwardHeaders(request) }));
     }
     if (request.method === 'GET' && path === '/api/history') {
       // Read-only version-chain lookup for `vsa history` / `vsa restore`

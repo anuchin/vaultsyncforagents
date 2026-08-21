@@ -3,7 +3,8 @@
  * the ring buffer is bounded and level-gated, the round-trip wrapper logs one
  * short line per frame at debug only, and the bundle carries the full payload
  * shape the spec demands (versions, identity, worker, pairing state, client
- * status snapshot, platform, last N log lines).
+ * status snapshot, platform, last N log lines). The support bundle is the
+ * markdown sibling — same redaction contract, richer sections.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -11,15 +12,18 @@ import { ProtocolVersion } from '@vsa/core';
 import type { Message, Transport } from '@vsa/core';
 import {
   buildDiagnosticsBundle,
+  buildSupportBundle,
   copyToClipboard,
   createPluginLog,
   describeMessage,
   formatBytes,
+  formatSupportBundleStamp,
   platformSummary,
   RING_CAPACITY,
   withRoundTripLogging,
 } from '../src/diagnostics.js';
-import type { SyncClientStatus } from '@vsa/core';
+import type { ConflictOp, SyncClientStatus } from '@vsa/core';
+import type { PluginSyncSettings } from '../src/data.js';
 import { resetObsidianMock, Platform } from './helpers/obsidian-mock.js';
 
 const status = (partial: Partial<SyncClientStatus>): SyncClientStatus => ({
@@ -27,6 +31,7 @@ const status = (partial: Partial<SyncClientStatus>): SyncClientStatus => ({
   lastSyncAt: null,
   pending: 0,
   conflicts: [],
+  serverVersion: null,
   ...partial,
 });
 
@@ -220,6 +225,125 @@ describe('buildDiagnosticsBundle — payload shape', () => {
     expect(unpaired).toContain('Device: (unassigned)');
     expect(unpaired).toContain('Worker: (not configured)');
     expect(unpaired).toContain('(no recorded log lines)');
+  });
+});
+
+describe('buildSupportBundle — the markdown support bundle', () => {
+  const settings: PluginSyncSettings = {
+    rescanIntervalSec: 30,
+    obsidianSync: false,
+    statusBarMode: 'compact',
+    syncOnStartup: true,
+    logLevel: 'debug',
+    ignorePatterns: 'private/**\n*.tmp\n',
+  };
+  const NOW = Date.parse('2026-08-21T12:34:56.789Z');
+  const LAST_SYNC = Date.parse('2026-08-21T12:30:00.000Z');
+  const base = {
+    pluginVersion: '1.4.2',
+    deviceId: 'dev-abc123',
+    deviceName: 'MacBook',
+    workerUrl: 'https://personal.x.workers.dev',
+    paired: true,
+    paused: false,
+    clientStatus: status({
+      state: 'syncing',
+      lastSyncAt: LAST_SYNC,
+      pending: 2,
+      progress: { phase: 'pushing', done: 12, total: 500 },
+    }),
+    recentLogLines: ['2026-01-01T00:00:00.000Z [info] hello', '2026-01-01T00:00:01.000Z [warn] bye'],
+    serverVersion: null,
+    settings,
+    recentConflicts: [{ path: '/notes/conflicted.md' }],
+  };
+
+  it('renders every section: header, versions, connection, settings, sync state, log', () => {
+    resetObsidianMock(); // desktop platform flags
+    const bundle = buildSupportBundle(base, NOW);
+    expect(bundle).toContain('# VaultSync for Agents — support bundle');
+    expect(bundle).toContain('Generated: 2026-08-21T12:34:56.789Z');
+    expect(bundle).toContain('## Versions');
+    expect(bundle).toContain('- Plugin: 1.4.2');
+    expect(bundle).toContain(`- Protocol: ${ProtocolVersion}`);
+    expect(bundle).toContain('- Server: unknown'); // not reported yet
+    expect(bundle).toContain('- Platform: Obsidian desktop app');
+    expect(bundle).toContain('- Worker URL: https://personal.x.workers.dev');
+    expect(bundle).toContain('- Device ID: dev-abc123');
+    expect(bundle).toContain('- Device name: MacBook');
+    expect(bundle).toContain('- Pairing: paired');
+    expect(bundle).toContain('- Syncing: active');
+    // Settings: every PluginSyncSettings field, verbatim values.
+    expect(bundle).toContain('## Settings');
+    expect(bundle).toContain('- Rescan interval: 30 seconds');
+    expect(bundle).toContain('- Sync .obsidian/ folder: off');
+    expect(bundle).toContain('- Status bar indicator: compact');
+    expect(bundle).toContain('- Sync on startup: on');
+    expect(bundle).toContain('- Diagnostics log level: debug');
+    expect(bundle).toContain('private/**');
+    expect(bundle).toContain('*.tmp');
+    // Sync state: state, ISO last sync, pending, conflict paths, progress.
+    expect(bundle).toContain('## Sync state');
+    expect(bundle).toContain('- State: syncing');
+    expect(bundle).toContain(`- Last sync: ${new Date(LAST_SYNC).toISOString()}`);
+    expect(bundle).toContain('- Pending changes: 2');
+    expect(bundle).toContain('- Progress: pushing 12/500');
+    // Recent log lines inside a fenced block.
+    expect(bundle).toContain('## Recent log (last 2 lines)');
+    expect(bundle).toContain('```text');
+    expect(bundle).toContain('2026-01-01T00:00:00.000Z [info] hello');
+  });
+
+  it('renders the worker-reported server version when known', () => {
+    resetObsidianMock();
+    expect(buildSupportBundle({ ...base, serverVersion: '1.2.0' }, NOW)).toContain('- Server: 1.2.0');
+  });
+
+  it('redacts: conflicts contribute vault-relative paths only', () => {
+    resetObsidianMock();
+    // A full clientStatus carries whole ConflictOps (winner, clocks, remote
+    // metadata); the bundle reads ONLY `.path` from them. recentConflicts is
+    // absent here, so paths are derived from the status.
+    const withFullConflicts = {
+      ...base,
+      recentConflicts: undefined,
+      clientStatus: status({ conflicts: [{ path: '/notes/from-status.md' } as ConflictOp] }),
+    };
+    const derived = buildSupportBundle(withFullConflicts, NOW);
+    expect(derived).toContain('- Conflicts: 1');
+    expect(derived).toContain('/notes/from-status.md');
+    // Pre-redacted recentConflicts (the plugin's path) renders its paths too.
+    expect(buildSupportBundle(base, NOW)).toContain('/notes/conflicted.md');
+  });
+
+  it('covers the minimal shape: unlinked, not running, no settings, empty log', () => {
+    resetObsidianMock();
+    const bundle = buildSupportBundle(
+      {
+        pluginVersion: 'unknown',
+        deviceId: '',
+        deviceName: '',
+        workerUrl: '',
+        paired: false,
+        paused: true,
+        clientStatus: null,
+        recentLogLines: [],
+      },
+      NOW,
+    );
+    expect(bundle).toContain('- Worker URL: (not configured)');
+    expect(bundle).toContain('- Device ID: (unassigned)');
+    expect(bundle).toContain('- Pairing: not paired');
+    expect(bundle).toContain('- Syncing: paused');
+    expect(bundle).toContain('- State: paused'); // paused wins when there is no status
+    expect(bundle).not.toContain('## Settings'); // section omitted when settings absent
+    expect(bundle).toContain('(no recorded log lines)');
+  });
+
+  it('formats local-time file-name stamps, zero-padded', () => {
+    // Constructed in local time, so the expectation holds in any timezone.
+    const local = new Date(2026, 0, 5, 9, 4, 7).getTime();
+    expect(formatSupportBundleStamp(local)).toBe('20260105-090407');
   });
 });
 

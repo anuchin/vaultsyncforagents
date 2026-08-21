@@ -119,6 +119,11 @@ export function roomSql<T>(query: string): Promise<T[]> {
   });
 }
 
+/** Run a callback inside the real DO instance (with the inRoom retry guard). */
+export function callRoom<T>(callback: (instance: never, state: DurableObjectState) => T): Promise<T> {
+  return inRoom<T>(callback);
+}
+
 /** Pin (or release, with `null`) the DO's clock — the room.ts time seam. */
 export function setRoomTime(ms: number | null): Promise<void> {
   return inRoom((instance) => {
@@ -144,7 +149,7 @@ export async function resetAll(): Promise<void> {
     room.setTimeForTests(null);
     room.clearAuthFailuresForTests();
     const sql = state.storage.sql;
-    for (const table of ['files', 'versions', 'devices', 'events', 'pairs', 'blobs', 'meta']) {
+    for (const table of ['files', 'versions', 'devices', 'events', 'pairs', 'blobs', 'snapshots', 'meta']) {
       try {
         sql.exec(`DELETE FROM ${table}`);
       } catch {

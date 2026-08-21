@@ -10,6 +10,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import { claim, get, post, request, resetAll } from './helpers.js';
+import { SERVER_VERSION } from '../src/version.js';
 
 beforeEach(async () => {
   await resetAll();
@@ -81,7 +82,12 @@ describe('unclaimed gate vs. assets (§14)', () => {
   it('health stays public and claim stays reachable while unclaimed', async () => {
     const health = await get('/health');
     expect(health.status).toBe(200);
-    expect(await health.json()).toEqual({ ok: true, claimed: false });
+    expect(await health.json()).toEqual({
+      ok: true,
+      claimed: false,
+      serverVersion: SERVER_VERSION,
+      protocolVersion: 1,
+    });
 
     const claimRes = await post('/claim', { passphrase: 'abcd', vaultName: 'v' });
     expect(claimRes.status).toBe(200);

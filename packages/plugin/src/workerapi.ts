@@ -237,6 +237,8 @@ export interface WorkerStatusSummary {
   devices: Array<{ id: string; name: string; type: string; online: boolean; revoked: boolean }>;
   attachments: { count: number; bytes: number };
   storageBytes: number;
+  /** Worker-reported release version (absent on servers ≤ 0.1). */
+  serverVersion?: string;
 }
 
 /**
@@ -266,5 +268,6 @@ export async function fetchWorkerStatus(params: {
     devices: Array.isArray(body.devices) ? body.devices : [],
     attachments: body.attachments,
     storageBytes: body.storageBytes,
+    ...(typeof body.serverVersion === 'string' ? { serverVersion: body.serverVersion } : {}),
   };
 }

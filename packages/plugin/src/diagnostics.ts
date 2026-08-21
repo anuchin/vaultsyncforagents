@@ -6,13 +6,14 @@
  *
  * The bundle is a plain-text snapshot meant for bug reports: versions,
  * identity, worker, a client status snapshot, the platform, and the last N
- * log lines.
+ * log lines. `buildSupportBundle` is its richer markdown sibling — the file
+ * a "sync ate my note" report attaches.
  */
 
 import { ProtocolVersion } from '@vsa/core';
 import type { LogAdapter, SyncClientStatus, Transport } from '@vsa/core';
 import { Platform } from 'obsidian';
-import type { LogLevel } from './data.js';
+import type { LogLevel, PluginSyncSettings } from './data.js';
 
 /** Severity ranking; `error` always outranks every selectable level. */
 const LEVEL_RANK: Record<LogLevel | 'error', number> = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -157,6 +158,15 @@ export interface DiagnosticsInput {
   paused: boolean;
   clientStatus: SyncClientStatus | null;
   recentLogLines: readonly string[];
+  /** Worker-reported version (null until a later change populates it). */
+  serverVersion?: string | null;
+  /** Client-side settings (none are secret — all fields render verbatim). */
+  settings?: PluginSyncSettings;
+  /**
+   * Conflict paths for the support bundle, derived from
+   * `clientStatus.conflicts` — PATHS ONLY, never file content.
+   */
+  recentConflicts?: Array<{ path: string }>;
 }
 
 /** The protocol version from core, surfaced for the bundle/About section. */
@@ -188,6 +198,93 @@ export function buildDiagnosticsBundle(input: DiagnosticsInput): string {
     for (const line of input.recentLogLines) lines.push(`  ${line}`);
   }
   return lines.join('\n');
+}
+
+/** Epoch ms → `20260821-143005` (local time) for support-bundle file names. */
+export function formatSupportBundleStamp(now: number): string {
+  const d = new Date(now);
+  const two = (n: number): string => String(n).padStart(2, '0');
+  return (
+    `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}` +
+    `-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`
+  );
+}
+
+const onOff = (value: boolean): string => (value ? 'on' : 'off');
+
+/**
+ * The "Save support bundle" markdown. Redaction contract: the device token
+ * never appears (the input structurally cannot carry it), and files
+ * contribute vault-relative PATHS ONLY — never content.
+ */
+export function buildSupportBundle(input: DiagnosticsInput, now: number): string {
+  const status = input.clientStatus;
+  // Conflicts render as paths only; `recentConflicts` (pre-redacted by the
+  // caller) wins when present, else paths are derived from the status.
+  const conflictPaths =
+    input.recentConflicts?.map((c) => c.path) ?? status?.conflicts.map((c) => c.path) ?? [];
+
+  const lines: string[] = [
+    '# VaultSync for Agents — support bundle',
+    '',
+    `Generated: ${new Date(now).toISOString()}`,
+    '',
+    '## Versions',
+    '',
+    `- Plugin: ${input.pluginVersion}`,
+    `- Protocol: ${ProtocolVersion}`,
+    `- Server: ${input.serverVersion ?? 'unknown'}`,
+    `- Platform: ${platformSummary()}`,
+    '',
+    '## Connection',
+    '',
+    `- Worker URL: ${input.workerUrl || '(not configured)'}`,
+    `- Device ID: ${input.deviceId || '(unassigned)'}`,
+    `- Device name: ${input.deviceName || '(default)'}`,
+    `- Pairing: ${input.paired ? 'paired' : 'not paired'}`,
+    `- Syncing: ${input.paused ? 'paused' : 'active'}`,
+  ];
+
+  if (input.settings !== undefined) {
+    const { settings } = input;
+    const patterns = settings.ignorePatterns
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+    lines.push('', '## Settings', '', `- Rescan interval: ${settings.rescanIntervalSec === 0 ? 'off' : `${settings.rescanIntervalSec} seconds`}`, `- Sync .obsidian/ folder: ${onOff(settings.obsidianSync)}`, `- Status bar indicator: ${settings.statusBarMode}`, `- Sync on startup: ${onOff(settings.syncOnStartup)}`, `- Diagnostics log level: ${settings.logLevel}`);
+    if (patterns.length === 0) {
+      lines.push('- Ignore patterns: (none)');
+    } else {
+      lines.push('- Ignore patterns:');
+      for (const pattern of patterns) lines.push(`  ${pattern}`);
+    }
+  }
+
+  lines.push('', '## Sync state', '');
+  if (input.paused) lines.push('- State: paused');
+  else if (status === null) lines.push('- State: not running');
+  else lines.push(`- State: ${status.state}`);
+  if (status !== null) {
+    lines.push(
+      `- Last sync: ${status.lastSyncAt === null ? 'never' : new Date(status.lastSyncAt).toISOString()}`,
+      `- Pending changes: ${status.pending}`,
+      `- Conflicts: ${conflictPaths.length}`,
+    );
+    for (const path of conflictPaths) lines.push(`  - ${path}`);
+    if (status.progress !== undefined) {
+      lines.push(`- Progress: ${status.progress.phase} ${status.progress.done}/${status.progress.total}`);
+    }
+  }
+
+  lines.push('', `## Recent log (last ${input.recentLogLines.length} lines)`, '');
+  if (input.recentLogLines.length === 0) {
+    lines.push('(no recorded log lines)');
+  } else {
+    lines.push('```text');
+    lines.push(...input.recentLogLines);
+    lines.push('```');
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 /** Human platform summary from `Platform` (mobile vs desktop, OS, form factor). */

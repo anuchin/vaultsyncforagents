@@ -22,6 +22,7 @@ import {
   setRoomTime,
 } from './helpers.js';
 import type { ChangeMessage, CommitAckMessage, ConflictMessage, ManifestMessage } from '@vsa/core';
+import { SERVER_VERSION } from '../src/version.js';
 
 interface TwoDevices {
   desktop: { token: string; deviceId: string };
@@ -87,6 +88,7 @@ describe('scenario (a): an edit propagates to the other client', () => {
       deviceId: desktop.deviceId,
       vaultName: 'personal',
       settings: { obsidianSync: false, displayName: 'personal' },
+      serverVersion: SERVER_VERSION,
     });
     const manifest = await manifestOf(wsDesktop);
     expect(manifest.entries).toEqual({});

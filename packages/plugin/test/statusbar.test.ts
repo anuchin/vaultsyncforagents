@@ -15,6 +15,7 @@ function status(partial: Partial<SyncClientStatus>): SyncClientStatus {
     lastSyncAt: null,
     pending: 0,
     conflicts: [],
+    serverVersion: null,
     ...partial,
   };
 }

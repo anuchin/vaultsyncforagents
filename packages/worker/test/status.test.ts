@@ -17,11 +17,13 @@ import {
   pair,
   resetAll,
 } from './helpers.js';
+import { SERVER_VERSION } from '../src/version.js';
 
 interface StatusShape {
   vaultName: string;
   claimed: boolean;
   health: string;
+  serverVersion?: string;
   devices: Array<{
     id: string;
     name: string;
@@ -88,6 +90,7 @@ describe('GET /api/status', () => {
     expect(status.vaultName).toBe('personal');
     expect(status.claimed).toBe(true);
     expect(status.health).toBe('ok');
+    expect(status.serverVersion).toBe(SERVER_VERSION);
 
     expect(status.devices).toHaveLength(2);
     const byName = Object.fromEntries(status.devices.map((d) => [d.name, d]));

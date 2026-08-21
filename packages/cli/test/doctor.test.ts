@@ -21,6 +21,7 @@ describe('runDoctor', () => {
     expect(byName['claimed']).toBe('ok');
     expect(byName['token']).toBe('ok');
     expect(byName['clock skew']).toBe('ok');
+    expect(byName['server version']).toBe('ok');
     expect(report.hints).toEqual([]);
   });
 
@@ -56,6 +57,68 @@ describe('runDoctor', () => {
     seedVault(rig);
     const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
     expect(report.checks.find((check) => check.name === 'clock skew')?.status).toBe('ok');
+    expect(report.healthy).toBe(true);
+  });
+
+  it('a newer server version warns (update the client) without failing doctor', async () => {
+    const rig = await makeRig({ fake: { serverVersion: '99.0.0' } });
+    seedVault(rig);
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    const version = report.checks.find((check) => check.name === 'server version')!;
+    expect(version.status).toBe('warn');
+    expect(version.detail).toContain('99.0.0');
+    expect(version.detail).toContain('update the client');
+    expect(report.healthy).toBe(true); // warnings never fail doctor
+  });
+
+  it('a server below the minimum supported version fails doctor', async () => {
+    const rig = await makeRig({ fake: { serverVersion: '0.0.9' } });
+    seedVault(rig);
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    const version = report.checks.find((check) => check.name === 'server version')!;
+    expect(version.status).toBe('fail');
+    expect(version.detail).toContain('older than the minimum supported');
+    expect(version.detail).toContain('docs/UPGRADING.md');
+    expect(report.healthy).toBe(false);
+  });
+
+  it('a legacy worker (no version reported) warns with the upgrade pointer', async () => {
+    const rig = await makeRig({ fake: { serverVersion: null } });
+    seedVault(rig);
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    const version = report.checks.find((check) => check.name === 'server version')!;
+    expect(version.status).toBe('warn');
+    expect(version.detail).toMatch(/predates version reporting/);
+    expect(report.healthy).toBe(true);
+  });
+
+  it('an unparseable server version warns (compatibility unknown) without failing doctor', async () => {
+    // Wiring-level: /health's raw field reaches the shared compat policy —
+    // a two-part version is not semver, and the verdict rides the check.
+    const rig = await makeRig({ fake: { serverVersion: '0.2' } });
+    seedVault(rig);
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    const version = report.checks.find((check) => check.name === 'server version')!;
+    expect(version.status).toBe('warn');
+    expect(version.detail).toContain('"0.2"');
+    expect(version.detail).toContain('not semver');
+    expect(report.healthy).toBe(true); // warnings never fail doctor
+  });
+
+  it('an unreachable worker skips the version check (the reachable check fails)', async () => {
+    const rig = await makeRig({ fake: { unreachable: true } });
+    seedVault(rig);
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    expect(report.checks.find((check) => check.name === 'server version')?.status).toBe('skip');
+  });
+
+  it('/api/status disagreeing with /health downgrades the version check to a warning', async () => {
+    const rig = await makeRig({ fake: { statusServerVersion: '0.2.0' } });
+    seedVault(rig);
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    const version = report.checks.find((check) => check.name === 'server version')!;
+    expect(version.status).toBe('warn');
+    expect(version.detail).toContain('/api/status reports 0.2.0');
     expect(report.healthy).toBe(true);
   });
 

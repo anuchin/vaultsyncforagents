@@ -281,6 +281,8 @@ export class Plugin {
   statusBarItems: Array<Record<string, unknown>> = [];
   registeredIntervals: number[] = [];
   registeredEventRefs: unknown[] = [];
+  /** Commands registered via addCommand (the command palette entries). */
+  readonly commands: MockCommand[] = [];
 
   constructor(app: any, manifest: any) {
     this.app = app;
@@ -293,6 +295,11 @@ export class Plugin {
 
   async saveData(data: unknown): Promise<void> {
     this.store = JSON.parse(JSON.stringify(data)) as Record<string, unknown>;
+  }
+
+  addCommand(command: MockCommand): MockCommand {
+    this.commands.push(command);
+    return command;
   }
 
   addSettingTab(tab: PluginSettingTab): void {
@@ -342,12 +349,20 @@ export class Plugin {
   onunload(): void {}
 }
 
+/** A recorded `addCommand` registration (id + name + callback). */
+export interface MockCommand {
+  id: string;
+  name: string;
+  callback: () => unknown;
+}
+
 /** The mock-only surface of a plugin instance (recorded UI state). */
 export interface MockPluginSurface {
   store: Record<string, unknown> | null;
   settingTabs: PluginSettingTab[];
   statusBarItems: Array<Record<string, any>>;
   registeredIntervals: number[];
+  commands: MockCommand[];
 }
 
 /** Tests reach the mock's bookkeeping through this cast. */

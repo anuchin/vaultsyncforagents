@@ -22,6 +22,7 @@ import {
   request,
   resetAll,
 } from './helpers.js';
+import { SERVER_VERSION } from '../src/version.js';
 
 const PLUGIN_ORIGIN = 'app://obsidian.md';
 
@@ -94,7 +95,12 @@ describe('plugin-facing routes: actual responses carry the headers', () => {
     const res = await get('/health', { origin: PLUGIN_ORIGIN });
     expect(res.status).toBe(200);
     expectCorsHeaders(res);
-    expect(await res.json()).toEqual({ ok: true, claimed: false });
+    expect(await res.json()).toEqual({
+      ok: true,
+      claimed: false,
+      serverVersion: SERVER_VERSION,
+      protocolVersion: 1,
+    });
   });
 
   it('POST /pair carries the headers (claimed worker, real pairing flow)', async () => {

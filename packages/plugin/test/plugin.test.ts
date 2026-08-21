@@ -481,3 +481,66 @@ describe('fetch seam — detached invocation (real-Obsidian illegal-invocation r
     expect(outcome).toMatchObject({ status: 'paired', token: 'tok-y' });
   });
 });
+
+describe('VaultSyncPlugin — commands + support bundle export', () => {
+  beforeEach(() => {
+    resetObsidianMock();
+    FakeSocket.opened = [];
+  });
+  afterEach(() => {
+    for (const plugin of created.splice(0)) plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it('onload registers the two palette commands', async () => {
+    const { plugin } = makePlugin({});
+    await plugin.onload();
+
+    const commands = asMockPlugin(plugin).commands;
+    expect(commands.map((c) => `${c.id}:${c.name}`)).toEqual([
+      'copy-diagnostics:Copy diagnostics',
+      'save-support-bundle:Save support bundle',
+    ]);
+    // Both callbacks are wired to the plugin's actions.
+    expect(commands[0]!.callback).toBeInstanceOf(Function);
+    expect(commands[1]!.callback).toBeInstanceOf(Function);
+  });
+
+  it('saveSupportBundle writes a redacted markdown file into .vaultsyncforagents/ and notices the path', async () => {
+    const { plugin, vault } = makePlugin({ store: LINKED });
+    await plugin.onload();
+    await flush();
+
+    await plugin.saveSupportBundle();
+
+    const written = [...vault.adapter.files.keys()].filter((p) =>
+      /^\.vaultsyncforagents\/support-bundle-\d{8}-\d{6}\.md$/.test(p),
+    );
+    expect(written).toHaveLength(1);
+    const markdown = new TextDecoder().decode(vault.adapter.files.get(written[0]!)!);
+    expect(markdown).toContain('# VaultSync for Agents — support bundle');
+    expect(markdown).toContain('## Settings');
+    expect(markdown).toContain('- Worker URL: https://w.example');
+    // Redaction: the device token (tok-1, in plugin.data) never appears.
+    expect(markdown.includes('tok-1')).toBe(false);
+    const notice = Notice.messages.find((n) => n.message.includes('support bundle saved'));
+    expect(notice).toBeDefined();
+    expect(notice!.message).toContain(written[0]!); // the relative vault path
+  });
+
+  it('saveSupportBundle works pre-sync too (state dir absent) and still writes the file', async () => {
+    // Unlinked, syncOnStartup irrelevant — the state dir does not exist yet;
+    // the write must mkdir it on demand.
+    const { plugin, vault } = makePlugin({});
+    await plugin.onload();
+    expect(vault.adapter.folders.has('.vaultsyncforagents')).toBe(false);
+
+    await plugin.saveSupportBundle();
+
+    expect(vault.adapter.folders.has('.vaultsyncforagents')).toBe(true);
+    expect(
+      [...vault.adapter.files.keys()].some((p) => p.startsWith('.vaultsyncforagents/support-bundle-')),
+    ).toBe(true);
+    expect(Notice.messages.some((n) => n.message.includes('support bundle saved'))).toBe(true);
+  });
+});

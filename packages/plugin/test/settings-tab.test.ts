@@ -315,6 +315,23 @@ describe('VaultSyncSettingTab', () => {
     }
   });
 
+  it('Save support bundle writes the file into the vault and reports the path', async () => {
+    await linkAndDisplay();
+
+    await findButton('Save support bundle').click();
+
+    const written = [...vault.adapter.files.keys()].filter((p) =>
+      p.startsWith('.vaultsyncforagents/support-bundle-'),
+    );
+    expect(written).toHaveLength(1);
+    const notice = Notice.messages.find((n) => n.message.includes('support bundle saved'));
+    expect(notice).toBeDefined();
+    expect(notice!.message).toContain(written[0]!);
+    // Redaction: the token stored in plugin data never reaches the file.
+    const markdown = new TextDecoder().decode(vault.adapter.files.get(written[0]!)!);
+    expect(markdown.includes('tok-1')).toBe(false);
+  });
+
   // --- pause / resume buttons ------------------------------------------------------
 
   it('Pause syncing flips the button and status readout; Resume restores', async () => {

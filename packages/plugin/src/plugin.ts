@@ -14,16 +14,26 @@
 
 import { Notice, Plugin } from 'obsidian';
 import type { App, PluginManifest } from 'obsidian';
-import { RevokedError, SyncClient, UnauthorizedError } from '@vsa/core';
+import {
+  checkServerCompatibility,
+  RevokedError,
+  SyncClient,
+  UnauthorizedError,
+  type CompatibilityVerdict,
+  type SyncClientStatus,
+} from '@vsa/core';
 import { ObsidianStorageAdapter } from './adapters/obsidian-storage.js';
 import { ObsidianWatchAdapter, RescanScheduler } from './adapters/obsidian-watch.js';
 import { HttpBlobStore } from './blobstore.js';
 import {
   buildDiagnosticsBundle,
+  buildSupportBundle,
   copyToClipboard,
   createPluginLog,
+  formatSupportBundleStamp,
   platformSummary,
   withRoundTripLogging,
+  type DiagnosticsInput,
   type PluginLog,
 } from './diagnostics.js';
 import {
@@ -52,6 +62,8 @@ import type { WorkerStatusSummary } from './workerapi.js';
 /** The in-vault device marker shared with the daemon/CLI (FR-44 handshake). */
 const DEVICE_MARKER_VAULT_PATH = '/.vaultsyncforagents/device.json';
 const LOCAL_INDEX_VAULT_PATH = '/.vaultsyncforagents/state';
+/** Where "Save support bundle" writes its diagnostic file. */
+const SUPPORT_BUNDLE_DIR_VAULT_PATH = '/.vaultsyncforagents';
 const SUPERVISION_TICK_MS = 1000;
 
 /** Timer handles (number in the DOM, `Timeout` when Node types leak in). */
@@ -82,6 +94,14 @@ export class VaultSyncPlugin extends Plugin {
   /** Set when the worker rejected the token — reconnecting cannot help. */
   private authFailed = false;
   private statusNote = '';
+  /**
+   * Latest server-version verdict (core compat.ts), re-assessed by the
+   * supervision tick after every helloAck; null before the first ack of a
+   * sync session. Non-ok verdicts ride the status-bar tooltip; a Notice is
+   * shown at most once per plugin session.
+   */
+  private serverCompat: CompatibilityVerdict | null = null;
+  private serverCompatNotified = false;
   /** Pause-syncing state (runtime only — a reload starts per syncOnStartup). */
   private paused = false;
   /** The plugin's log: console mirror + bounded ring (Copy diagnostics). */
@@ -120,6 +140,16 @@ export class VaultSyncPlugin extends Plugin {
     // Cheap focus-driven rescan (FR-12): every note/app switch pokes the
     // scheduler, which coalesces into at most one cycle per debounce window.
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.rescan?.poke()));
+    this.addCommand({
+      id: 'copy-diagnostics',
+      name: 'Copy diagnostics',
+      callback: () => this.copyDiagnostics(),
+    });
+    this.addCommand({
+      id: 'save-support-bundle',
+      name: 'Save support bundle',
+      callback: () => this.saveSupportBundle(),
+    });
     // "Sync on startup" OFF = manual-only mode: load idle; the first "Sync
     // now" starts the machinery (watcher included).
     if (this.linked && this.data.settings.syncOnStartup) await this.startSync();
@@ -299,6 +329,7 @@ export class VaultSyncPlugin extends Plugin {
     this.client = client;
     this.authFailed = false;
     this.statusNote = '';
+    this.serverCompat = null; // re-assessed from the fresh helloAck
     this.supervisor = new ReconnectSupervisor(this.overrides.reconnect ?? {});
 
     try {
@@ -488,18 +519,31 @@ export class VaultSyncPlugin extends Plugin {
     });
   }
 
-  /** Copy the diagnostics bundle to the clipboard (fallback: console). */
-  async copyDiagnostics(): Promise<void> {
-    const bundle = buildDiagnosticsBundle({
+  /**
+   * The shared snapshot behind "Copy diagnostics" and "Save support bundle".
+   * Structurally redacted: the device token never enters (it lives only in
+   * `this.data`), and conflicts contribute paths only — never file content.
+   */
+  private collectDiagnosticsInput(): DiagnosticsInput {
+    const status = this.client?.status() ?? null;
+    return {
       pluginVersion: this.manifest.version || 'unknown',
       deviceId: this.data.deviceId,
       deviceName: this.resolveDeviceName(),
       workerUrl: this.data.url,
       paired: this.linked,
       paused: this.paused,
-      clientStatus: this.client?.status() ?? null,
+      clientStatus: status,
       recentLogLines: this.syncLog.recentLines(),
-    });
+      serverVersion: status?.serverVersion ?? null,
+      settings: this.data.settings,
+      recentConflicts: status === null ? [] : status.conflicts.map((conflict) => ({ path: conflict.path })),
+    };
+  }
+
+  /** Copy the diagnostics bundle to the clipboard (fallback: console). */
+  async copyDiagnostics(): Promise<void> {
+    const bundle = buildDiagnosticsBundle(this.collectDiagnosticsInput());
     const copied = await copyToClipboard(bundle);
     if (copied) {
       new Notice('VaultSync: diagnostics copied to the clipboard.');
@@ -507,6 +551,27 @@ export class VaultSyncPlugin extends Plugin {
     }
     console.info('[vsa] diagnostics (clipboard unavailable):\n' + bundle);
     new Notice('VaultSync: clipboard unavailable — diagnostics written to the developer console.', 10000);
+  }
+
+  /**
+   * Write the support bundle (markdown) into `.vaultsyncforagents/` in the
+   * vault — the richer, attachable sibling of "Copy diagnostics".
+   */
+  async saveSupportBundle(): Promise<void> {
+    const now = this.now();
+    const markdown = buildSupportBundle(this.collectDiagnosticsInput(), now);
+    const fileName = `support-bundle-${formatSupportBundleStamp(now)}.md`;
+    const vaultPath = `${SUPPORT_BUNDLE_DIR_VAULT_PATH}/${fileName}`;
+    try {
+      // The storage adapter mkdirs the state dir on demand (it can be absent
+      // before the first sync) and falls back to a plain write where the
+      // adapter cannot rename.
+      await this.createStorageAdapter().writeFile(vaultPath, new TextEncoder().encode(markdown));
+      new Notice(`VaultSync: support bundle saved to ${vaultPath.slice(1)}.`);
+    } catch (error) {
+      this.syncLog.warn('failed to write support bundle', error);
+      new Notice('VaultSync: could not write the support bundle — see the developer console.', 10000);
+    }
   }
 
   /** The platform line for the About/diagnostics readouts. */
@@ -540,12 +605,16 @@ export class VaultSyncPlugin extends Plugin {
     const client = this.client;
     if (client === null) return;
     const status = client.status();
+    this.assessServerVersion(status);
     this.statusBar?.update(
       status,
       {
         url: this.data.url,
         deviceName: this.resolveDeviceName(),
-        note: this.statusNote,
+        // Both notes can be live at once (an auth-failure note while the
+        // server also reports version skew): concatenate instead of letting
+        // either hide the other; empty parts drop out.
+        note: [this.statusNote, this.serverCompatNote].filter((part) => part !== '').join(' · '),
         paused: this.paused,
         mode: this.data.settings.statusBarMode,
       },
@@ -556,6 +625,38 @@ export class VaultSyncPlugin extends Plugin {
     if (decision.action === 'wait') return;
     this.supervisor.acknowledged();
     this.scheduleReconnect(decision.delayMs);
+  }
+
+  /**
+   * Latest server-version verdict for the settings tab; null until the first
+   * helloAck of the current sync session.
+   */
+  get serverCompatibility(): CompatibilityVerdict | null {
+    return this.serverCompat;
+  }
+
+  /** The verdict's tooltip line ('' when compatible — nothing to nag about). */
+  private get serverCompatNote(): string {
+    return this.serverCompat !== null && this.serverCompat.level !== 'ok'
+      ? this.serverCompat.message
+      : '';
+  }
+
+  /**
+   * Version-skew assessment, run by the tick once the connection has acked
+   * (states 'syncing'/'live' both follow the helloAck; pre-ack states read
+   * serverVersion null for "not yet known" and must not produce a spurious
+   * "legacy server" verdict). Never kills sync: the wire `ProtocolVersion`
+   * check at hello remains the hard gate; a verdict is advisory.
+   */
+  private assessServerVersion(status: SyncClientStatus): void {
+    if (status.state !== 'syncing' && status.state !== 'live') return;
+    const verdict = checkServerCompatibility(this.manifest.version || 'unknown', status.serverVersion);
+    this.serverCompat = verdict;
+    if (verdict.level === 'ok') return; // also clears any stale tooltip note
+    if (this.serverCompatNotified) return; // one Notice per plugin session
+    this.serverCompatNotified = true;
+    new Notice(`VaultSync: ${verdict.message}`, 10000);
   }
 
   private scheduleReconnect(delayMs: number): void {

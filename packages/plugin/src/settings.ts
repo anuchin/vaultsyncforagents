@@ -6,7 +6,7 @@
  *   Sync       — rescan interval, .obsidian/ toggle, pause/resume,
  *                sync-on-startup
  *   Advanced   — status-bar indicator mode, ignore patterns, diagnostics
- *                (log level + Copy diagnostics)
+ *                (log level + Copy diagnostics + Save support bundle)
  *   About      — versions, storage usage, project README link
  *
  * All logic lives on `VaultSyncPlugin`; the tab is presentation plus wiring.
@@ -93,6 +93,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   private hintSetting: Setting | null = null;
   private statusSetting: Setting | null = null;
   private storageSetting: Setting | null = null;
+  private serverVersionSetting: Setting | null = null;
   private refreshHandle: ReturnType<typeof setInterval> | null = null;
 
   constructor(app: App, plugin: VaultSyncPlugin) {
@@ -107,6 +108,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     this.hintSetting = null;
     this.statusSetting = null;
     this.storageSetting = null;
+    this.serverVersionSetting = null;
     this.renameDraft = null;
 
     this.renderConnectionSection();
@@ -413,6 +415,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           }
         }),
       );
+
+    new Setting(containerEl)
+      .setName('Save support bundle')
+      .setDesc(
+        'Writes a richer markdown diagnostic file (versions, settings, sync state, recent log) to .vaultsyncforagents/ in this vault — attach it to bug reports. It never contains note contents or the device token.',
+      )
+      .addButton((button) =>
+        button.setButtonText('Save support bundle').onClick(async () => {
+          button.setDisabled(true);
+          try {
+            await this.plugin.saveSupportBundle();
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
+      );
   }
 
   private renderAboutSection(): void {
@@ -424,6 +442,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       .setDesc(
         `Plugin ${this.plugin.manifest.version || 'unknown'} · protocol v${PROTOCOL_VERSION} · ${this.plugin.platformSummary()}`,
       );
+
+    this.serverVersionSetting = new Setting(containerEl)
+      .setName('Server version')
+      .setDesc(this.serverVersionText());
+    this.refreshServerVersion();
 
     this.storageSetting = new Setting(containerEl)
       .setName('Vault storage')
@@ -489,6 +512,30 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
   private refreshStatus(): void {
     this.statusSetting?.setDesc(this.statusText());
+    this.refreshServerVersion();
+  }
+
+  /**
+   * The About section's server-version line: the helloAck-reported version
+   * plus the compat verdict when it is not ok. `serverVersion` may lag the
+   * verdict by a tick (the plugin assesses on its own 1 Hz supervision), so
+   * the verdict message is authoritative when present.
+   */
+  private serverVersionText(): string {
+    if (!this.plugin.linked) return 'Pair this vault to see the worker version.';
+    const status = this.plugin.client?.status();
+    const verdict = this.plugin.serverCompatibility;
+    if (verdict !== null && verdict.level !== 'ok') return verdict.message;
+    const version = status?.serverVersion ?? null;
+    return version === null
+      ? 'Unknown — the worker has not reported a version yet.'
+      : `Server ${version} · compatible with this plugin.`;
+  }
+
+  /** Repaint the server-version row (called by the 1 Hz refresh loop). */
+  private refreshServerVersion(): void {
+    // The tab may have been closed/re-rendered meanwhile; paint only if live.
+    if (this.serverVersionSetting !== null) this.serverVersionSetting.setDesc(this.serverVersionText());
   }
 
   /** Pair feedback: success re-renders; failures land in the hint Setting. */

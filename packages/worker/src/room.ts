@@ -28,8 +28,10 @@ import {
   bytesToBase64,
   INLINE_CONTENT_MAX_BYTES,
   parseMessage,
+  planSnapshotRestore,
   ProtocolVersion,
   sha256Hex,
+  snapshotHeadsOf,
   type ArbitrationFileState,
   type ArbitrationState,
   type ChangeMessage,
@@ -40,9 +42,13 @@ import {
   type HelloMessage,
   type ManifestEntry,
   type ServerMessage,
+  type SnapshotCreateMessage,
+  type SnapshotHeadRecord,
+  type SnapshotRestoreMessage,
   type Version,
   type VersionKind,
 } from '@vsa/core';
+import { SERVER_VERSION } from './version.js';
 
 // --- tunables ---------------------------------------------------------------------
 
@@ -94,6 +100,8 @@ const CLIENT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'putBlob',
   'getBlob',
   'ping',
+  'snapshotCreate',
+  'snapshotRestore',
 ]);
 
 /** R2 key for a content hash (§7). */
@@ -202,6 +210,19 @@ interface PairRow {
 /** Per-socket auth state (hibernation-safe attachment). */
 interface SocketAttachment {
   deviceId: string | null;
+}
+
+/**
+ * One restore step's durable footprint, collected in phase 1 (pure) and
+ * written in phase 2 of `handleSnapshotRestore`: the minted head version
+ * (`versions` row + blob refcount), the path's new file state (`files` row),
+ * and the change to record + fan out.
+ */
+interface SnapshotRestoreStep {
+  version: Version;
+  file: ArbitrationFileState;
+  broadcast: ChangePayload;
+  tombstone: boolean;
 }
 
 // --- the Durable Object --------------------------------------------------------------------
@@ -351,6 +372,12 @@ export class VaultRoom extends DurableObject<Env> {
       case 'getBlob':
         await this.handleGetBlob(ws, message.hash);
         return;
+      case 'snapshotCreate':
+        this.handleSnapshotCreate(ws, attachment, message);
+        return;
+      case 'snapshotRestore':
+        this.handleSnapshotRestore(ws, attachment, message);
+        return;
       default:
         this.failWs(
           ws,
@@ -398,6 +425,9 @@ export class VaultRoom extends DurableObject<Env> {
       // No change events retained ⇒ "nothing servable" (`head + 1`), which
       // reads as servable only to a cursor already at the head.
       oldestRetainedSeq: await this.oldestRetainedSeq(),
+      // Version reporting: lets clients assess skew (core compat.ts). The
+      // field is optional on the wire; pre-0.1 servers simply omit it.
+      serverVersion: SERVER_VERSION,
     });
     this.broadcastOthers(ws, { type: 'deviceSeen', deviceId: device.id, ts: now });
     // Catch-up replay (§5): everything the client missed since its cursor.
@@ -595,6 +625,149 @@ export class VaultRoom extends DurableObject<Env> {
     });
   }
 
+  // --- snapshots --------------------------------------------------------------------------
+
+  /**
+   * Capture every file head as a vault-level snapshot. The `files` table
+   * carries each head's full state (content hash, size, tombstone flag,
+   * folder flag, head kind), so no join with `versions` is needed to
+   * reconstruct the head state exactly. No fan-out: snapshots are pull-based
+   * (`GET /api/snapshots`); other devices learn nothing live.
+   */
+  private handleSnapshotCreate(
+    ws: WebSocket,
+    attachment: SocketAttachment,
+    message: SnapshotCreateMessage,
+  ): void {
+    const now = this.now();
+    const heads = snapshotHeadsOf(this.loadArbitrationFiles());
+    const fileCount = Object.keys(heads).length;
+    const count = this.sql('SELECT COUNT(*) AS n FROM snapshots').toArray()[0]?.n as number;
+    // Safe under runExclusive: snapshot creation cannot interleave.
+    const id = `s${(count ?? 0) + 1}`;
+    const name = message.name ?? '';
+    this.sql(
+      'INSERT INTO snapshots (id, name, ts, device_id, seq, file_count, heads) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      id,
+      name,
+      now,
+      attachment.deviceId,
+      this.globalSeq(),
+      fileCount,
+      JSON.stringify(heads),
+    );
+    this.appendEvent(now, attachment.deviceId, 'snapshot', null, JSON.stringify({ id, name }));
+    this.safeSend(ws, {
+      type: 'snapshotCreateAck',
+      id,
+      name,
+      ts: now,
+      seq: this.globalSeq(),
+      fileCount,
+    });
+  }
+
+  /**
+   * Revert the whole vault to a snapshot: N synthetic fast-path commits (one
+   * per diverged path — `planSnapshotRestore` parents each on the path's
+   * CURRENT head, so arbitration is deterministic and conflict-free), applied
+   * in TWO phases so a whole-vault restore is safe on the DO's single thread:
+   *
+   *   Phase 1 (pure, no SQL): arbitrate EVERY item against the threaded
+   *   in-memory state and collect the verdicts' durable footprints. The
+   *   fast-path invariant is validated for the whole plan here, so a throw —
+   *   the defensive invariant, or a runtime CPU-limit kill mid-plan on a big
+   *   vault — leaves ZERO durable effect: nothing persisted, no events, no
+   *   fan-out. No client can ever observe a partial restore whose events
+   *   replay for reconnecting clients while connected peers saw no fan-out.
+   *
+   *   Phase 2 (durable): persist exactly what each verdict touched (one
+   *   `versions` row + one `files` row — O(1) per item, so the restore stays
+   *   linear in diverged paths instead of quadratic in vault size), bump blob
+   *   refcounts from the COLLECTED new versions only, then record + fan out
+   *   each change exactly like a client commit (reconnecting clients replay
+   *   those event rows).
+   *
+   * Every restore change fans out to OTHER sockets, so all connected clients
+   * converge live; the restoring client re-syncs from a full manifest (it
+   * never sees its own fan-out). History is append-only: restore lands NEW
+   * versions and bumps blob refcounts; nothing is ever deleted.
+   */
+  private handleSnapshotRestore(
+    ws: WebSocket,
+    attachment: SocketAttachment,
+    message: SnapshotRestoreMessage,
+  ): void {
+    const row = this.sql('SELECT heads FROM snapshots WHERE id = ?', message.id).toArray()[0];
+    if (row === undefined) {
+      this.failWs(ws, 'NOT_FOUND', `no snapshot ${message.id}`);
+      return;
+    }
+    const heads = JSON.parse(row.heads as string) as Record<string, SnapshotHeadRecord>;
+    const deviceId = attachment.deviceId as string;
+    const now = this.now();
+    const devices = new Map<string, string>(
+      this.sql('SELECT id, name FROM devices').toArray().map((r) => [r.id as string, r.name as string]),
+    );
+
+    // Phase 1 — plan + arbitrate the whole restore in memory (no SQL).
+    const steps: SnapshotRestoreStep[] = [];
+    let state = this.loadArbitrationState();
+    for (const item of planSnapshotRestore(state, heads)) {
+      const verdict = arbitrateCommit(state, item.commit, deviceId, now, devices);
+      if (verdict.outcome.result !== 'applied') {
+        throw new Error(`snapshot restore for ${JSON.stringify(item.path)} left the fast path`);
+      }
+      // An applied fast-path verdict mints exactly one head version and moves
+      // exactly that path's file row — its entire durable footprint. (Restore
+      // commits are 'delete'/'restore' kinds only; renames never occur.)
+      const version = verdict.state.versions.get(verdict.outcome.newVersionId);
+      const file = version !== undefined ? verdict.state.files.get(version.path) : undefined;
+      if (version === undefined || file === undefined || file.currentVersion !== version.id) {
+        throw new Error(`snapshot restore for ${JSON.stringify(item.path)} minted no head version`);
+      }
+      steps.push({ version, file, broadcast: verdict.outcome.broadcast, tombstone: item.tombstone });
+      state = verdict.state;
+    }
+
+    // Phase 2 — durable effects. Per-change event rows and fan-out semantics
+    // match a client commit exactly: seqs are assigned in plan order and the
+    // fan-out follows the ack.
+    for (const step of steps) {
+      this.insertVersionRow(step.version);
+      this.upsertFileRow(step.version.path, step.file);
+    }
+    for (const step of steps) {
+      if (step.version.hash !== '') this.bumpBlobRefcount(step.version.hash, step.version.size, now);
+    }
+    let restored = 0;
+    let tombstoned = 0;
+    let lastSeq = this.globalSeq();
+    const changes: ChangeMessage[] = [];
+    for (const step of steps) {
+      const change = this.recordChange(step.broadcast, now);
+      changes.push(change);
+      lastSeq = change.seq;
+      if (step.tombstone) tombstoned += 1;
+      else restored += 1;
+    }
+    this.appendEvent(
+      now,
+      deviceId,
+      'snapshot_restore',
+      null,
+      JSON.stringify({ id: message.id, restored, tombstoned }),
+    );
+    this.safeSend(ws, {
+      type: 'snapshotRestoreAck',
+      id: message.id,
+      restored,
+      tombstoned,
+      seq: lastSeq,
+    });
+    for (const change of changes) this.broadcastOthers(ws, change);
+  }
+
   // --- HTTP surface (called by the worker's router) -------------------------------------------
 
   private async handleHttp(request: Request, url: URL, path: string): Promise<Response> {
@@ -613,6 +786,7 @@ export class VaultRoom extends DurableObject<Env> {
     if (request.method === 'PATCH' && path === '/device') return this.httpDeviceRename(request);
     if (request.method === 'GET' && path === '/api/status') return this.httpStatus(request);
     if (request.method === 'GET' && path === '/api/history') return this.httpHistory(request, url);
+    if (request.method === 'GET' && path === '/api/snapshots') return this.httpSnapshots(request);
     if (request.method === 'POST' && path === '/internal/auth') return this.httpInternalAuth(request);
     if (request.method === 'POST' && path === '/internal/blob-uploaded') return this.httpBlobUploaded(request);
     if (request.method === 'GET' && path === '/internal/gc') return this.httpGcList();
@@ -905,6 +1079,7 @@ export class VaultRoom extends DurableObject<Env> {
       vaultName,
       claimed: true,
       health: 'ok',
+      serverVersion: SERVER_VERSION,
       devices,
       lastEdit,
       attachments: { count: attachmentRow?.count ?? 0, bytes: attachmentRow?.bytes ?? 0 },
@@ -951,6 +1126,29 @@ export class VaultRoom extends DurableObject<Env> {
     }));
 
     return json(200, { path, head, versions });
+  }
+
+  /**
+   * `GET /api/snapshots` — vault-level snapshot list, newest-first
+   * (`vsa snapshot list`, dashboards). Device token or admin session, like
+   * `/api/status`.
+   */
+  private async httpSnapshots(request: Request): Promise<Response> {
+    const auth = await this.authenticateHttpRequest(request);
+    if (!auth.ok) return json(401, { error: 'device token or admin session required' });
+    const snapshots = this.sql(
+      'SELECT id, name, ts, device_id, seq, file_count FROM snapshots ORDER BY ts DESC, rowid DESC',
+    )
+      .toArray()
+      .map((row) => ({
+        id: row.id as string,
+        name: row.name as string,
+        ts: row.ts as number,
+        deviceId: row.device_id as string,
+        seq: row.seq as number,
+        fileCount: row.file_count as number,
+      }));
+    return json(200, { snapshots });
   }
 
   /** Bearer/cookie check used by the worker for /blob and /api/status. */
@@ -1144,6 +1342,29 @@ export class VaultRoom extends DurableObject<Env> {
 
   /** Load `files` + `versions` as the pure arbitration state (§6 ↔ arbitrate.ts). */
   private loadArbitrationState(): ArbitrationState {
+    const files = this.loadArbitrationFiles();
+    const versions = new Map<string, Version>();
+    for (const row of this.sql(
+      'SELECT id, path, hash, size, device_id, clock_counter, clock_device, parent_id, ts, kind FROM versions',
+    ).toArray()) {
+      const id = row.id as string;
+      versions.set(id, {
+        id,
+        path: row.path as string,
+        hash: row.hash as string,
+        size: row.size as number,
+        deviceId: row.device_id as string,
+        clock: { counter: row.clock_counter as number, deviceId: row.clock_device as string },
+        parentVersion: (row.parent_id as string | null) ?? null,
+        ts: row.ts as number,
+        kind: row.kind as VersionKind,
+      });
+    }
+    return { files, versions };
+  }
+
+  /** The `files` table alone as the arbitration file map (snapshot capture). */
+  private loadArbitrationFiles(): Map<string, ArbitrationFileState> {
     const files = new Map<string, ArbitrationFileState>();
     for (const row of this.sql(
       `SELECT path, current_version, deleted, is_folder, head_hash, head_size,
@@ -1169,74 +1390,69 @@ export class VaultRoom extends DurableObject<Env> {
         ...(row.is_folder === 1 ? { isFolder: true } : {}),
       });
     }
-    const versions = new Map<string, Version>();
-    for (const row of this.sql(
-      'SELECT id, path, hash, size, device_id, clock_counter, clock_device, parent_id, ts, kind FROM versions',
-    ).toArray()) {
-      const id = row.id as string;
-      versions.set(id, {
-        id,
-        path: row.path as string,
-        hash: row.hash as string,
-        size: row.size as number,
-        deviceId: row.device_id as string,
-        clock: { counter: row.clock_counter as number, deviceId: row.clock_device as string },
-        parentVersion: (row.parent_id as string | null) ?? null,
-        ts: row.ts as number,
-        kind: row.kind as VersionKind,
-      });
-    }
-    return { files, versions };
+    return files;
   }
 
   /** Diff the verdict's state against the pre-arbitration state and write it. */
   private persistVerdict(before: ArbitrationState, after: ArbitrationState): void {
     for (const [id, version] of after.versions) {
       if (before.versions.has(id)) continue;
-      this.sql(
-        `INSERT INTO versions (id, path, hash, size, device_id, clock_counter, clock_device, parent_id, ts, kind, seq)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-        id,
-        version.path,
-        version.hash,
-        version.size,
-        version.deviceId,
-        version.clock.counter,
-        version.clock.deviceId,
-        version.parentVersion,
-        version.ts,
-        version.kind,
-      );
+      this.insertVersionRow(version);
     }
     for (const [path, state] of after.files) {
       const old = before.files.get(path);
       if (old !== undefined && old.currentVersion === state.currentVersion) continue;
-      // head_seq is NOT overwritten on conflict (see recordChange); a fresh
-      // row starts at 0 (invisible to delta manifests until first recorded).
-      this.sql(
-        `INSERT INTO files (path, current_version, deleted, is_folder, updated_at, head_hash,
-                            head_size, head_clock_counter, head_clock_device, head_kind, head_seq)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-         ON CONFLICT(path) DO UPDATE SET current_version = excluded.current_version,
-           deleted = excluded.deleted, is_folder = excluded.is_folder,
-           updated_at = excluded.updated_at, head_hash = excluded.head_hash,
-           head_size = excluded.head_size, head_clock_counter = excluded.head_clock_counter,
-           head_clock_device = excluded.head_clock_device, head_kind = excluded.head_kind`,
-        path,
-        state.currentVersion,
-        state.deleted ? 1 : 0,
-        state.isFolder === true ? 1 : 0,
-        state.head.ts,
-        state.head.hash,
-        state.head.size,
-        state.head.clock.counter,
-        state.head.clock.deviceId,
-        state.head.kind,
-      );
+      this.upsertFileRow(path, state);
     }
     for (const path of before.files.keys()) {
       if (!after.files.has(path)) this.sql('DELETE FROM files WHERE path = ?', path);
     }
+  }
+
+  /** Insert one `versions` row (seq 0 — head_seq assignment is recordChange's). */
+  private insertVersionRow(version: Version): void {
+    this.sql(
+      `INSERT INTO versions (id, path, hash, size, device_id, clock_counter, clock_device, parent_id, ts, kind, seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      version.id,
+      version.path,
+      version.hash,
+      version.size,
+      version.deviceId,
+      version.clock.counter,
+      version.clock.deviceId,
+      version.parentVersion,
+      version.ts,
+      version.kind,
+    );
+  }
+
+  /**
+   * Upsert one `files` row. head_seq is NOT overwritten on conflict (see
+   * recordChange); a fresh row starts at 0 (invisible to delta manifests until
+   * first recorded).
+   */
+  private upsertFileRow(path: string, state: ArbitrationFileState): void {
+    this.sql(
+      `INSERT INTO files (path, current_version, deleted, is_folder, updated_at, head_hash,
+                          head_size, head_clock_counter, head_clock_device, head_kind, head_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT(path) DO UPDATE SET current_version = excluded.current_version,
+         deleted = excluded.deleted, is_folder = excluded.is_folder,
+         updated_at = excluded.updated_at, head_hash = excluded.head_hash,
+         head_size = excluded.head_size, head_clock_counter = excluded.head_clock_counter,
+         head_clock_device = excluded.head_clock_device, head_kind = excluded.head_kind`,
+      path,
+      state.currentVersion,
+      state.deleted ? 1 : 0,
+      state.isFolder === true ? 1 : 0,
+      state.head.ts,
+      state.head.hash,
+      state.head.size,
+      state.head.clock.counter,
+      state.head.clock.deviceId,
+      state.head.kind,
+    );
   }
 
   /** Assign the next global seq to a change, persist its event, update head_seq. */
@@ -1478,6 +1694,13 @@ export class VaultRoom extends DurableObject<Env> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       );
     }
+    if (version < 2) {
+      this.ctx.storage.sql.exec(MIGRATION_2);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      );
+    }
   }
 }
 
@@ -1547,5 +1770,23 @@ CREATE TABLE IF NOT EXISTS blobs (
   size INTEGER NOT NULL,
   refcount INTEGER NOT NULL DEFAULT 0,
   first_seen_at INTEGER NOT NULL
+);
+`;
+
+/**
+ * Migration 0002 — vault-level snapshots. `heads` is JSON
+ * `Record<path, SnapshotHeadRecord>`: enough to reconstruct every head at the
+ * snapshot moment exactly (versions and blobs are kept forever, so restore
+ * always finds the content).
+ */
+const MIGRATION_2 = `
+CREATE TABLE IF NOT EXISTS snapshots (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  device_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  file_count INTEGER NOT NULL,
+  heads TEXT NOT NULL
 );
 `;

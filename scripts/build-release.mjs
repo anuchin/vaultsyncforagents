@@ -41,6 +41,41 @@ const outDir = path.join(rootDir, 'dist');
 const stagingDir = path.join(outDir, 'release-bundle');
 const zipPath = path.join(outDir, 'worker-bundle.zip');
 
+// --- version injection -----------------------------------------------------------------------
+
+/**
+ * The release version baked into the worker (`__VSA_SERVER_VERSION__` in
+ * packages/worker/src/version.ts): the worker reports it on /health,
+ * /api/status, and helloAck so clients can assess version skew
+ * (core compat.ts). Source is the ROOT package.json — the version the whole
+ * monorepo ships as. Without it (missing/empty) the define is skipped and
+ * the worker reports its `-dev` fallback, which would be wrong for a
+ * release, so that case errors out.
+ */
+const releaseVersion = String(
+  JSON.parse(readFileSync(path.join(rootDir, 'package.json'), 'utf8')).version ?? '',
+);
+if (releaseVersion === '' || releaseVersion === 'undefined') {
+  console.error('error: root package.json has no version — refusing to build an unversioned release');
+  process.exit(1);
+}
+
+// CI sanity: a vX.Y.Z tag checkout must match the version being baked in,
+// otherwise the worker would report a version that never existed as a tag —
+// and the bundle check below cannot catch it (both values would be
+// consistently wrong). Hard-fail instead of shipping a mislabeled worker.
+// Non-tag contexts (branch builds, local runs) keep the warning-free path.
+const refName = process.env.GITHUB_REF_NAME ?? '';
+const refMatch = /^v(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)$/.exec(refName);
+if (refMatch !== null && refMatch[1] !== releaseVersion) {
+  console.error(
+    `error: GITHUB_REF_NAME is ${refName} but package.json version is ${releaseVersion} — ` +
+      `the worker would report ${releaseVersion} while the release ships as ${refName}; ` +
+      `fix the tag or the version before building`,
+  );
+  process.exit(1);
+}
+
 // --- inputs ---------------------------------------------------------------------------------
 
 if (!existsSync(workerEntry)) {
@@ -60,12 +95,17 @@ if (!existsSync(dashboardDist)) {
 rmSync(stagingDir, { recursive: true, force: true });
 mkdirSync(stagingDir, { recursive: true });
 
+console.log(`bundling worker.js (server version ${releaseVersion})`);
 await esbuild.build({
   entryPoints: [workerEntry],
   bundle: true,
   outfile: path.join(stagingDir, 'worker.js'),
   format: 'esm', // Workers ESM entry; re-exports VaultRoom for the DO migration
   target: 'es2022',
+  // Bakes the release version into packages/worker/src/version.ts (see
+  // `releaseVersion` above); the un-substituted `-dev` fallback only ever
+  // applies to wrangler dev / vitest, which run the source directly.
+  define: { __VSA_SERVER_VERSION__: JSON.stringify(releaseVersion) },
   // 'neutral': Workers runtime — Web APIs only (@vsa/core is Web-API-only by
   // design), no Node/browser builtins auto-polyfilled.
   platform: 'neutral',
@@ -87,6 +127,19 @@ const workerJs = readFileSync(path.join(stagingDir, 'worker.js'), 'utf8');
 const exportClause = workerJs.match(/export\s*\{[^{}]*\}\s*;?\s*$/s)?.[0] ?? '';
 if (!/\bVaultRoom\b/.test(exportClause) || !/\bdefault\b/.test(exportClause)) {
   console.error('error: bundled worker.js lost its VaultRoom/default exports — refusing to ship');
+  process.exit(1);
+}
+// The version define must have landed (a dropped define would silently ship
+// the `-dev` fallback, and clients would mis-assess version skew). esbuild
+// substitutes the identifier EVERYWHERE — including inside the `typeof`
+// guard, which it folds to `true` — so a surviving `__VSA_SERVER_VERSION__`
+// identifier is conclusive proof of a dropped define. (With `minify: false`
+// the dead fallback branch is kept, so its literal is NOT a valid signal.)
+if (workerJs.includes('__VSA_SERVER_VERSION__') || !workerJs.includes(JSON.stringify(releaseVersion))) {
+  console.error(
+    `error: bundled worker.js does not carry the release version ${releaseVersion} ` +
+      `(the __VSA_SERVER_VERSION__ define was not substituted) — refusing to ship`,
+  );
   process.exit(1);
 }
 

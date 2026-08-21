@@ -8,7 +8,7 @@
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { InMemorySyncServer } from '@vsa/core';
+import { InMemorySyncServer, type SnapshotSummary } from '@vsa/core';
 import type { Transport } from '@vsa/core';
 import {
   ConfigStore,
@@ -89,8 +89,17 @@ export interface FakeWorkerState {
   acceptedTokens: Set<string>;
   /** Seconds the worker's Date header runs behind local time (skew probe). */
   skewSeconds: number;
+  /**
+   * Version the fake worker reports on /health and /api/status (null = a
+   * legacy worker that predates version reporting).
+   */
+  serverVersion: string | null;
+  /** /api/status's version override for the doctor agreement check (defaults to serverVersion). */
+  statusServerVersion?: string | null;
   statusDoc: StatusDoc;
   historyDoc: HistoryDoc | ((path: string) => HistoryDoc);
+  /** Canned GET /api/snapshots body. */
+  snapshotsDoc: SnapshotSummary[];
   blobs: Map<string, Uint8Array>;
   unreachable: boolean;
   pairRejectStatus?: number;
@@ -103,6 +112,7 @@ function defaultStatusDoc(): StatusDoc {
     vaultName: 'personal',
     claimed: true,
     health: 'ok',
+    serverVersion: '0.1.0',
     devices: [
       { id: 'dev-desktop', name: 'MacBook', type: 'desktop', lastSeen: 1_000, revoked: false, online: true },
       { id: 'dev-phone', name: 'Pixel', type: 'mobile', lastSeen: 0, revoked: false, online: false },
@@ -132,8 +142,10 @@ export class FakeWorker {
       pairDeviceId: 'dev-1',
       acceptedTokens: new Set(['tok-dev-1']),
       skewSeconds: 0,
+      serverVersion: '0.1.0',
       statusDoc: defaultStatusDoc(),
       historyDoc: { path: '', head: null, versions: [] },
+      snapshotsDoc: [],
       blobs: new Map(),
       unreachable: false,
       ...state,
@@ -155,7 +167,17 @@ export class FakeWorker {
 
     if (method === 'GET' && url.pathname === '/health') {
       const dateMs = this.now() - this.state.skewSeconds * 1000;
-      return json(200, { ok: true, claimed: this.state.claimed }, { date: new Date(dateMs).toUTCString() });
+      return json(
+        200,
+        {
+          ok: true,
+          claimed: this.state.claimed,
+          ...(this.state.serverVersion !== null
+            ? { serverVersion: this.state.serverVersion }
+            : {}),
+        },
+        { date: new Date(dateMs).toUTCString() },
+      );
     }
     if (method === 'POST' && url.pathname === '/pair') {
       const body = JSON.parse(String(init?.body ?? '{}')) as { code?: string; deviceName?: string };
@@ -185,13 +207,25 @@ export class FakeWorker {
       }
     }
     if (method === 'GET' && url.pathname === '/api/status') {
-      return json(200, this.state.statusDoc);
+      // The version surfaces agree by default; statusServerVersion forces a
+      // disagreement for the doctor agreement check's test.
+      const reported =
+        this.state.statusServerVersion !== undefined
+          ? this.state.statusServerVersion
+          : this.state.serverVersion;
+      const doc = { ...this.state.statusDoc };
+      if (reported === null) delete doc.serverVersion;
+      else doc.serverVersion = reported;
+      return json(200, doc);
     }
     if (method === 'GET' && url.pathname === '/api/history') {
       const path = url.searchParams.get('path') ?? '';
       if (path === '' || !path.startsWith('/')) return json(400, { error: 'path required' });
       const doc = typeof this.state.historyDoc === 'function' ? this.state.historyDoc(path) : this.state.historyDoc;
       return json(200, { ...doc, path });
+    }
+    if (method === 'GET' && url.pathname === '/api/snapshots') {
+      return json(200, { snapshots: this.state.snapshotsDoc });
     }
     if (url.pathname.startsWith('/blob/')) {
       const hash = url.pathname.slice('/blob/'.length);

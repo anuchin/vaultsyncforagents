@@ -105,6 +105,24 @@ export interface GetBlobMessage {
   hash: string;
 }
 
+/**
+ * Snapshot every file head at a moment (a whole-vault restore point). The
+ * server records the head state atomically; snapshots are never broadcast —
+ * other devices learn nothing live, the list is pull-based.
+ */
+export interface SnapshotCreateMessage {
+  type: 'snapshotCreate';
+  /** Optional label; omitted/empty ⇒ unnamed. */
+  name?: string;
+}
+
+/** Restore the whole vault to a snapshot (FR-7: as NEW versions — history is never deleted). */
+export interface SnapshotRestoreMessage {
+  type: 'snapshotRestore';
+  /** Snapshot id (as returned by `snapshotCreateAck` / listed by the server). */
+  id: string;
+}
+
 // --- Server → Client -------------------------------------------------------
 
 /** Successful hello: this device's identity + vault-level info. */
@@ -123,6 +141,13 @@ export interface HelloAckMessage {
    * ⇒ the client must fall back to a full manifest.
    */
   oldestRetainedSeq?: number;
+  /**
+   * The server's own release version (the worker's package version).
+   * Optional because servers ≤ 0.1 predate version reporting and omit it —
+   * clients treat absence as "legacy server" (see `compat.ts`), never as a
+   * protocol failure.
+   */
+  serverVersion?: string;
 }
 
 /** Reply to `getManifest`: the (possibly delta) file index. */
@@ -226,6 +251,47 @@ export interface PongMessage {
   ts?: number;
 }
 
+/** Reply to `snapshotCreate`. */
+export interface SnapshotCreateAckMessage {
+  type: 'snapshotCreateAck';
+  /** Id assigned by the authority (`s{n}`). */
+  id: string;
+  /** Echoes the stored name (`''` for unnamed snapshots). */
+  name: string;
+  /** Epoch ms of the snapshot. */
+  ts: number;
+  /** Global sequence number at creation (cursor bookkeeping). */
+  seq: number;
+  /** Number of file heads captured. */
+  fileCount: number;
+}
+
+/** Reply to `snapshotRestore`. */
+export interface SnapshotRestoreAckMessage {
+  type: 'snapshotRestoreAck';
+  id: string;
+  /** Paths reverted to the snapshot's content (resurrected tombstones included). */
+  restored: number;
+  /** Paths newly tombstoned (live now, absent or deleted at the snapshot). */
+  tombstoned: number;
+  /** Global seq of the last restore change (current seq when nothing differed). */
+  seq: number;
+}
+
+/** One vault-level snapshot as listed by the server (`GET /api/snapshots`). */
+export interface SnapshotSummary {
+  id: string;
+  name: string;
+  /** Epoch ms of creation. */
+  ts: number;
+  /** Device that created the snapshot. */
+  deviceId: string;
+  /** Global sequence number at creation. */
+  seq: number;
+  /** Number of file heads captured. */
+  fileCount: number;
+}
+
 // --- Union + guards ---------------------------------------------------------
 
 export type ClientMessage =
@@ -234,7 +300,9 @@ export type ClientMessage =
   | CommitMessage
   | PutBlobMessage
   | GetBlobMessage
-  | PingMessage;
+  | PingMessage
+  | SnapshotCreateMessage
+  | SnapshotRestoreMessage;
 
 export type ServerMessage =
   | HelloAckMessage
@@ -246,7 +314,9 @@ export type ServerMessage =
   | BlobAckMessage
   | BlobMessage
   | ErrorMessage
-  | PongMessage;
+  | PongMessage
+  | SnapshotCreateAckMessage
+  | SnapshotRestoreAckMessage;
 
 export type Message = ClientMessage | ServerMessage;
 
@@ -257,6 +327,8 @@ const CLIENT_TYPES: ReadonlySet<string> = new Set([
   'putBlob',
   'getBlob',
   'ping',
+  'snapshotCreate',
+  'snapshotRestore',
 ]);
 const SERVER_TYPES: ReadonlySet<string> = new Set([
   'helloAck',
@@ -269,6 +341,8 @@ const SERVER_TYPES: ReadonlySet<string> = new Set([
   'blob',
   'error',
   'pong',
+  'snapshotCreateAck',
+  'snapshotRestoreAck',
 ]);
 
 /**

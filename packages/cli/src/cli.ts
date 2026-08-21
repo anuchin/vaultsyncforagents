@@ -16,6 +16,12 @@ import { runStatus, renderStatus } from './commands/status.js';
 import { runDevices, renderDevices, runRevoke } from './commands/devices.js';
 import { runLogs, renderLogs } from './commands/logs.js';
 import { runHistory, renderHistory, runRestore } from './commands/history.js';
+import {
+  renderSnapshotList,
+  runSnapshotCreate,
+  runSnapshotList,
+  runSnapshotRestore,
+} from './commands/snapshot.js';
 import { runDoctor, renderDoctor } from './commands/doctor.js';
 import { renderDaemonResult, runDaemonCommand, type DaemonAction } from './commands/daemon.js';
 import { runSetup } from './commands/setup.js';
@@ -28,6 +34,7 @@ import {
   type OutputWriter,
   type VsRuntime,
 } from './runtime.js';
+import { CLI_VERSION } from './version.js';
 
 export interface GlobalOptions {
   vault?: string;
@@ -60,7 +67,7 @@ export function buildProgram(runtime: VsRuntime): Command {
   program
     .name('vsa')
     .description('VaultSync for Agents — self-hosted Obsidian vault sync')
-    .version('0.1.0')
+    .version(CLI_VERSION)
     .option('--vault <id|path>', 'scope the command to one linked vault')
     .option('--json', 'machine-readable JSON output')
     .option('--config <path>', 'alternate machine config path');
@@ -217,6 +224,62 @@ export function buildProgram(runtime: VsRuntime): Command {
       if (reports.some((report) => !report.healthy)) {
         process.exitCode = 1;
       }
+    });
+
+  // --- snapshots -------------------------------------------------------------------------
+
+  const snapshot = program
+    .command('snapshot')
+    .description('vault-level snapshots: one-action, whole-vault restore points');
+  snapshot
+    .command('create [name]')
+    .description('snapshot every file head on the server (a whole-vault restore point)')
+    .action(async (name) => {
+      const options = globals();
+      const result = await runSnapshotCreate(runtime, name, options.vault);
+      if (options.json === true) {
+        runtime.output.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      runtime.output.log(
+        `Snapshot ${result.id}${result.name === '' ? '' : ` (${result.name})`} — ` +
+          `${result.fileCount} file(s), ${formatWhen(result.ts)}`,
+      );
+      runtime.output.log('Restore it with: vsa snapshot restore ' + result.id);
+    });
+  snapshot
+    .command('list')
+    .description('list snapshots, newest first (id, name, created, files, device)')
+    .action(async () => {
+      const options = globals();
+      const report = await runSnapshotList(runtime, options.vault);
+      if (options.json === true) {
+        runtime.output.log(JSON.stringify(report, null, 2));
+        return;
+      }
+      renderSnapshotList(report, runtime);
+    });
+  snapshot
+    .command('restore <idOrName>')
+    .description('restore the whole vault to a snapshot (new versions; history is never deleted)')
+    .option('--yes', 'skip the confirmation prompt')
+    .action(async (idOrName, options: Record<string, unknown>) => {
+      const merged: Record<string, unknown> = { ...globals(), ...options };
+      const result = await runSnapshotRestore(
+        runtime,
+        idOrName,
+        { yes: merged['yes'] === true },
+        merged['vault'] as string | undefined,
+      );
+      if (merged['json'] === true) {
+        runtime.output.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      runtime.output.log(
+        `Restored snapshot ${result.id}${result.name === '' ? '' : ` (${result.name})`} — ` +
+          `${result.restored} file(s) reverted, ${result.tombstoned} tombstoned`,
+      );
+      runtime.output.log('Every revert landed as a new version — history was kept. Other devices converge on their next sync.');
     });
 
   // --- setup (FR-50) ------------------------------------------------------------------------

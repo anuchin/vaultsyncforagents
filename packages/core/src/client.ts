@@ -56,6 +56,8 @@ import {
   type ManifestMessage,
   type Message,
   type ServerMessage,
+  type SnapshotCreateAckMessage,
+  type SnapshotRestoreAckMessage,
 } from './protocol.js';
 import {
   computeSyncPlan,
@@ -134,6 +136,12 @@ export interface SyncClientStatus {
   pending: number;
   /** Conflicts observed by plan cycles (informational; resolution is in the data). */
   conflicts: ConflictOp[];
+  /**
+   * Server release version as reported by helloAck (null before the first
+   * ack — and for legacy servers ≤ 0.1, which never send the field; see
+   * `checkServerCompatibility` for the shared skew policy).
+   */
+  serverVersion: string | null;
   /**
    * Progress of the RUNNING cycle's current bulk phase (`vsa ⋯ 1234/5000`);
    * absent between cycles. Updates are throttled to `progressThrottleMs`.
@@ -215,6 +223,8 @@ export class SyncClient {
   private syncedThrough: number | null = null;
   private needsFullManifest = false;
   private serverOldestRetainedSeq: number | null = null;
+  /** Server release from helloAck; null until acked (legacy servers stay null). */
+  private serverVersion: string | null = null;
 
   /** Current bulk-phase progress, cleared when a cycle settles. */
   private progress: SyncProgress | null = null;
@@ -318,6 +328,7 @@ export class SyncClient {
       lastSyncAt: this.lastSyncAt,
       pending: this.pending,
       conflicts: [...this.conflicts],
+      serverVersion: this.serverVersion,
       ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
   }
@@ -360,6 +371,10 @@ export class SyncClient {
       this.needsFullManifest = false;
     }
     this.serverOldestRetainedSeq = null;
+    // Version skew is re-assessed per connection: reset before the ack so a
+    // reconnect against a different (or legacy) server never reports a stale
+    // version between the dial and the fresh helloAck.
+    this.serverVersion = null;
 
     const transport = this.dialTransport();
     this.transport = transport;
@@ -389,6 +404,7 @@ export class SyncClient {
     // Replay-window answer: with this, the client can tell whether every
     // event after its cursor was retained (delta-manifest eligibility).
     this.serverOldestRetainedSeq = helloAck.oldestRetainedSeq ?? null;
+    this.serverVersion = helloAck.serverVersion ?? null;
 
     this.state = 'syncing';
     if (this.shouldRequestDeltaManifest()) {
@@ -481,6 +497,8 @@ export class SyncClient {
       case 'conflict':
       case 'blob':
       case 'blobAck':
+      case 'snapshotCreateAck':
+      case 'snapshotRestoreAck':
         // Replies arrive only against an outstanding expectation; a
         // spontaneous one is a protocol violation we log and drop.
         this.log.warn('unexpected server reply', message.type);
@@ -1187,6 +1205,44 @@ export class SyncClient {
       throw new ProtocolError(`blob ${hash} failed verification on download`);
     }
     return bytes;
+  }
+
+  // --- snapshots -----------------------------------------------------------------------
+
+  /**
+   * Snapshot every file head on the authority (a whole-vault restore point).
+   * Snapshots are not broadcast — other devices see nothing live.
+   */
+  async createSnapshot(name?: string): Promise<SnapshotCreateAckMessage> {
+    const transport = this.transport;
+    if (transport === null) throw new NetworkError('not connected');
+    const reply = await this.request<SnapshotCreateAckMessage | ServerErrorMessage>(
+      (m) => m.type === 'snapshotCreateAck' || m.type === 'error',
+      () => transport.send({ type: 'snapshotCreate', ...(name !== undefined ? { name } : {}) }),
+    );
+    if (reply.type === 'error') throw this.toError(reply);
+    return reply;
+  }
+
+  /**
+   * Restore the whole vault to a snapshot. The server lands every reverted
+   * head as a NEW version (history is never deleted) and fans the changes out
+   * to OTHER sockets only — this device does not receive its own fan-out, so
+   * the local index must re-converge from a FULL manifest: flag delta mode
+   * off, then run a cycle inline (one-shot callers close the transport as
+   * soon as this resolves, so a debounced cycle would never fire).
+   */
+  async restoreSnapshot(id: string): Promise<SnapshotRestoreAckMessage> {
+    const transport = this.transport;
+    if (transport === null) throw new NetworkError('not connected');
+    const reply = await this.request<SnapshotRestoreAckMessage | ServerErrorMessage>(
+      (m) => m.type === 'snapshotRestoreAck' || m.type === 'error',
+      () => transport.send({ type: 'snapshotRestore', id }),
+    );
+    if (reply.type === 'error') throw this.toError(reply);
+    this.needsFullManifest = true;
+    await this.enqueue(() => this.runCycle());
+    return reply;
   }
 
   // --- plumbing -------------------------------------------------------------------------------

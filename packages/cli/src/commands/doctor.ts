@@ -1,15 +1,17 @@
 /**
  * `vsa doctor` (FR-56) — per-vault diagnostics:
  *
- *   reachability   GET /health
- *   claim state    /health body
- *   token valid    a real WS hello roundtrip (SyncClient connect + disconnect)
- *   clock skew     local clock vs the worker's Date response header (warn >60s)
- *   storage        R2 bytes in use (via /api/status)
- *   hints          one-client rule (foreign state dir), claim, re-pair
+ *   reachability    GET /health
+ *   claim state     /health body
+ *   server version  /health-reported version vs the shared compat policy
+ *   token valid     a real WS hello roundtrip (SyncClient connect + disconnect)
+ *   clock skew      local clock vs the worker's Date response header (warn >60s)
+ *   storage         R2 bytes in use (via /api/status)
+ *   hints           one-client rule (foreign state dir), claim, re-pair
  *
- * Exit code is non-zero iff any check FAILS (unreachable / unclaimed / token
- * invalid or revoked / foreign state dir). Skew is a warning, not a failure.
+ * Exit code is non-zero iff any check FAILS (unreachable / unclaimed / server
+ * below the supported floor / token invalid or revoked / foreign state dir).
+ * Skew, and a newer-or-legacy server, are warnings, not failures.
  */
 
 import type { VaultEntry } from '@vsa/node-runtime';
@@ -18,11 +20,12 @@ import {
   readDeviceMarker,
   STATE_DIR_PATH,
 } from '@vsa/node-runtime';
-import { LOCAL_INDEX_STATE_PATH, RevokedError, UnauthorizedError } from '@vsa/core';
+import { checkServerCompatibility, LOCAL_INDEX_STATE_PATH, RevokedError, UnauthorizedError } from '@vsa/core';
 import { formatBytes, skewVerdict } from '../format.js';
 import { WorkerApi } from '../http.js';
 import { oneShotSync } from '../sync.js';
 import type { VsRuntime } from '../runtime.js';
+import { CLI_VERSION } from '../version.js';
 
 export interface DoctorCheck {
   name: string;
@@ -73,7 +76,22 @@ async function examine(runtime: VsRuntime, vault: VaultEntry): Promise<DoctorRep
     }
   }
 
-  // 3. Clock skew (warn-only).
+  // 3. Server version vs this CLI (core's shared compat policy). Skew is a
+  // warning; only a server below the supported floor fails. The check object
+  // is held so the /api/status fetch below can confirm the two surfaces agree.
+  const versionCheck: DoctorCheck = {
+    name: 'server version',
+    status: 'skip',
+    detail: 'worker unreachable',
+  };
+  checks.push(versionCheck);
+  if (health.reachable) {
+    const verdict = checkServerCompatibility(CLI_VERSION, health.serverVersion);
+    versionCheck.status = verdict.level === 'error' ? 'fail' : verdict.level;
+    versionCheck.detail = verdict.message;
+  }
+
+  // 4. Clock skew (warn-only).
   if (health.reachable) {
     const { skewMs, warn } = skewVerdict(runtime.now(), health.serverDateMs);
     checks.push({
@@ -86,7 +104,7 @@ async function examine(runtime: VsRuntime, vault: VaultEntry): Promise<DoctorRep
     });
   }
 
-  // 4. Token validity — a real hello roundtrip.
+  // 5. Token validity — a real hello roundtrip.
   let tokenOk = false;
   if (health.reachable && health.claimed) {
     if (token === undefined) {
@@ -119,10 +137,20 @@ async function examine(runtime: VsRuntime, vault: VaultEntry): Promise<DoctorRep
     }
   }
 
-  // 5. Storage usage (informational).
+  // 6. Storage usage (informational); also confirms /api/status and /health
+  // report the SAME server version (they should never disagree).
   if (tokenOk && token !== undefined) {
     try {
       const status = await api.status(token);
+      if (
+        status.serverVersion != null &&
+        health.serverVersion != null &&
+        status.serverVersion !== health.serverVersion
+      ) {
+        // Never downgrade a compat failure to a warning.
+        if (versionCheck.status !== 'fail') versionCheck.status = 'warn';
+        versionCheck.detail += ` (but /api/status reports ${status.serverVersion})`;
+      }
       checks.push({
         name: 'storage',
         status: 'ok',
@@ -133,7 +161,7 @@ async function examine(runtime: VsRuntime, vault: VaultEntry): Promise<DoctorRep
     }
   }
 
-  // 6. One-client-per-machine rule (FR-44).
+  // 7. One-client-per-machine rule (FR-44).
   const marker = await readDeviceMarker(storage);
   if (marker !== null && marker.deviceId !== vault.deviceId) {
     checks.push({

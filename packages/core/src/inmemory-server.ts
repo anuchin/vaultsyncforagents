@@ -16,6 +16,12 @@ import {
   emptyArbitrationState,
   type ArbitrationState,
 } from './server/arbitrate.js';
+import {
+  planSnapshotRestore,
+  snapshotHeadsOf,
+  type SnapshotHeadRecord,
+} from './server/snapshots.js';
+import { ProtocolError } from './errors.js';
 import { MessageBus, type MemoryTransport } from './transport.js';
 import {
   base64ToBytes,
@@ -27,6 +33,8 @@ import {
   type CommitMessage,
   type ManifestEntry,
   type ServerMessage,
+  type SnapshotCreateMessage,
+  type SnapshotRestoreMessage,
 } from './protocol.js';
 import { sha256Hex } from './hashing.js';
 
@@ -50,6 +58,16 @@ interface Connection {
   deviceId: string | null;
 }
 
+/** A stored vault-level snapshot (the DO's `snapshots` row). */
+interface StoredSnapshot {
+  id: string;
+  name: string;
+  ts: number;
+  deviceId: string;
+  seq: number;
+  heads: Record<string, SnapshotHeadRecord>;
+}
+
 /**
  * The authoritative server side of the protocol over a `MessageBus`.
  * Deterministic: all state transitions are driven by message order and the
@@ -67,6 +85,8 @@ export class InMemorySyncServer {
   /** Change log in sequence order (cursor replay). */
   private log: ChangeMessage[] = [];
   private seq = 0;
+  /** Vault-level snapshots, oldest first. */
+  private readonly snapshots: StoredSnapshot[] = [];
   private readonly connections = new Map<MemoryTransport, Connection>();
   private readonly bus = new MessageBus();
   private readonly now: () => number;
@@ -194,6 +214,12 @@ export class InMemorySyncServer {
               (error: unknown) =>
                 this.fail(server, 'PROTOCOL', error instanceof Error ? error.message : String(error)),
             );
+        case 'snapshotCreate':
+          this.handleSnapshotCreate(server, connection.deviceId as string, message);
+          return undefined;
+        case 'snapshotRestore':
+          this.handleSnapshotRestore(server, connection.deviceId as string, message);
+          return undefined;
         default:
           this.fail(server, 'PROTOCOL', `unexpected message type ${JSON.stringify((message as { type: string }).type)}`);
           return undefined;
@@ -372,6 +398,79 @@ export class InMemorySyncServer {
       return null;
     }
     return undefined;
+  }
+
+  // --- snapshots ---------------------------------------------------------------
+
+  /** Snapshot semantics mirror the DO exactly: capture, no fan-out. */
+  private handleSnapshotCreate(
+    server: MemoryTransport,
+    deviceId: string,
+    message: SnapshotCreateMessage,
+  ): void {
+    const heads = snapshotHeadsOf(this.state.files);
+    const snapshot: StoredSnapshot = {
+      id: `s${this.snapshots.length + 1}`,
+      name: message.name ?? '',
+      ts: this.now(),
+      deviceId,
+      seq: this.seq,
+      heads,
+    };
+    this.snapshots.push(snapshot);
+    this.reply(server, {
+      type: 'snapshotCreateAck',
+      id: snapshot.id,
+      name: snapshot.name,
+      ts: snapshot.ts,
+      seq: snapshot.seq,
+      fileCount: Object.keys(heads).length,
+    });
+  }
+
+  /**
+   * Restore = N synthetic fast-path commits (see `server/snapshots.ts`),
+   * each recorded in the replay log and fanned out so every connected client
+   * converges live; reconnecting clients converge through cursor replay.
+   */
+  private handleSnapshotRestore(
+    server: MemoryTransport,
+    deviceId: string,
+    message: SnapshotRestoreMessage,
+  ): void {
+    const snapshot = this.snapshots.find((entry) => entry.id === message.id);
+    if (snapshot === undefined) {
+      this.fail(server, 'NOT_FOUND', `no snapshot ${message.id}`);
+      return;
+    }
+    const now = this.now();
+    let restored = 0;
+    let tombstoned = 0;
+    let lastSeq = this.seq;
+    const changes: ChangeMessage[] = [];
+    for (const item of planSnapshotRestore(this.state, snapshot.heads)) {
+      const verdict = arbitrateCommit(this.state, item.commit, deviceId, now);
+      if (verdict.outcome.result !== 'applied') {
+        throw new ProtocolError(
+          `snapshot restore for ${JSON.stringify(item.path)} left the fast path`,
+        );
+      }
+      this.state.files = verdict.state.files;
+      this.state.versions = verdict.state.versions;
+      const change = this.record(verdict.outcome.broadcast);
+      changes.push(change);
+      lastSeq = change.seq;
+      if (item.tombstone) tombstoned += 1;
+      else restored += 1;
+    }
+    this.reply(server, {
+      type: 'snapshotRestoreAck',
+      id: message.id,
+      restored,
+      tombstoned,
+      seq: lastSeq,
+    });
+    for (const change of changes) this.broadcastOthers(server, change);
   }
 
   // --- plumbing ------------------------------------------------------------------

@@ -547,3 +547,85 @@ describe('SyncClient — folder lifecycle via change application (removeDir invo
     ).toEqual([]);
   });
 });
+
+describe('SyncClient — server version reporting', () => {
+  /** Minimal scripted server: hello → helloAck, getManifest → empty manifest. */
+  function scriptedServerRig(ack: { serverVersion?: string }) {
+    let listener: ((message: Message) => void) | null = null;
+    const transport = {
+      send: (message: Message) => {
+        queueMicrotask(() => {
+          if (message.type === 'hello') {
+            listener?.({
+              type: 'helloAck',
+              deviceId: 'dev-a',
+              vaultName: 'v',
+              settings: { obsidianSync: false, displayName: 'v' },
+              ...(ack.serverVersion !== undefined ? { serverVersion: ack.serverVersion } : {}),
+            });
+          } else if (message.type === 'getManifest') {
+            listener?.({ type: 'manifest', entries: {}, cursor: 0 });
+          }
+        });
+      },
+      onMessage: (cb: (message: Message) => void) => {
+        listener = cb;
+      },
+      onClose: (_cb: (reason: { code?: number; reason?: string }) => void) => {},
+      close: () => {},
+    };
+    const client = new SyncClient({
+      deviceId: 'dev-a',
+      deviceName: 'Alpha',
+      token: 'tok-a',
+      transport: () => transport,
+      blobStore: makeBlobStore(),
+      storage: new InMemoryStorageAdapter({}, { now: () => 1 }),
+      now: () => 1,
+      schedule: () => () => {},
+    });
+    return { client, transport };
+  }
+
+  it('status() carries helloAck.serverVersion (null before connect and for legacy servers)', async () => {
+    const { client } = scriptedServerRig({ serverVersion: '0.2.1' });
+    expect(client.status().serverVersion).toBeNull();
+    await client.connect();
+    expect(client.status().state).toBe('live');
+    expect(client.status().serverVersion).toBe('0.2.1');
+
+    const legacy = scriptedServerRig({});
+    await legacy.client.connect();
+    expect(legacy.client.status().serverVersion).toBeNull();
+  });
+
+  it('a reconnect resets the version until the new helloAck arrives', async () => {
+    const ack: { serverVersion?: string } = { serverVersion: '0.2.1' };
+    const { client, transport } = scriptedServerRig(ack);
+    await client.connect();
+    expect(client.status().serverVersion).toBe('0.2.1');
+
+    // Flip the server to legacy AND hold the helloAck: during the reconnect
+    // window (post-dial, pre-ack) status must read null, not the stale 0.2.1.
+    delete ack.serverVersion;
+    let holdAck = true;
+    const originalSend = transport.send.bind(transport);
+    transport.send = (message: Message) => {
+      if (message.type === 'hello' && holdAck) return; // dial happened, no ack yet
+      originalSend(message);
+    };
+    const reconnecting = client.reconnect();
+    // Generous microtask flush: startup runs (state load + dial) and then
+    // blocks on the held helloAck — it can never complete past this point.
+    for (let hop = 0; hop < 50; hop++) await Promise.resolve();
+    expect(client.status().state).toBe('connecting');
+    expect(client.status().serverVersion).toBeNull();
+
+    holdAck = false;
+    originalSend({ type: 'hello', token: 'tok-a', protocolVersion: 1, cursor: 0 } as Message);
+    await reconnecting;
+    expect(client.status().state).toBe('live');
+    expect(client.status().serverVersion).toBeNull(); // legacy server: stays null
+    client.close();
+  });
+});
