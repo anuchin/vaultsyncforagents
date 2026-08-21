@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   InMemoryStorageAdapter,
   InMemorySyncServer,
+  sha256Hex,
   SyncClient,
   type BlobStore,
   type FileChangeEvent,
@@ -292,5 +293,105 @@ describe('SyncClient — lifecycle', () => {
     await a.client.connect();
     a.client.close();
     expect(a.client.status().state).toBe('idle');
+  });
+});
+
+describe('SyncClient — dropped-edit hardening (edit between hash and ack)', () => {
+  /**
+   * Real-Obsidian E2E regression: an edit landing between a cycle's hash and
+   * the commit's ack was once silently dropped — the index ended up recording
+   * the file as synced with a stat that hid the edit from every later fast
+   * scan. Deterministic interleave with a controlled stat sequence: hash at
+   * t1 (mtime 1001) → edit lands at t2 (mtime 1002) → ack processed at t3.
+   * The ack must pin the HASH-time stat (1001), so the next scan misses the
+   * fast path, re-hashes the edit, and pushes it.
+   */
+  it('pins the hash-time mtime at ack; the next scan detects and pushes the edit', async () => {
+    let t = 100_000;
+    const server = new InMemorySyncServer({ now: () => ++t, vaultName: 'v' });
+    server.register('dev-a', 'Alpha');
+
+    let diskTime = 1000; // controlled stat sequence (t1=1001, t2=1002)
+    const storage = new InMemoryStorageAdapter({}, { now: () => diskTime });
+    const blobStore = makeBlobStore();
+    const sent: Message[] = [];
+    const heldAckFlushers: Array<() => void> = [];
+    let gating = true;
+
+    const client = new SyncClient({
+      deviceId: 'dev-a',
+      deviceName: 'Alpha',
+      token: 'tok-dev-a',
+      transport: () => {
+        const pair = server.connectPair('tok-dev-a');
+        return {
+          send: (message) => {
+            sent.push(message);
+            pair.client.send(message);
+          },
+          onMessage: (cb) =>
+            pair.client.onMessage((message) => {
+              if (gating && message.type === 'commitAck') {
+                heldAckFlushers.push(() => cb(message));
+                return;
+              }
+              cb(message);
+            }),
+          onClose: (cb) => pair.client.onClose(cb),
+          close: () => pair.client.close(),
+        };
+      },
+      blobStore,
+      storage,
+      now: () => ++t,
+      debounceMs: 250,
+      schedule: new ManualScheduler().schedule,
+    });
+
+    let cycle1: Promise<void> = Promise.resolve();
+    try {
+      await client.connect(); // empty vault → live
+
+      // t1 — create hashed with stat mtime=1001, commit sent, ack HELD.
+      diskTime = 1001;
+      await storage.writeFile('/race.md', enc('create content'));
+      cycle1 = client.triggerSync();
+      await vi.waitFor(() => expect(heldAckFlushers.length).toBe(1)); // ack in flight
+
+      // t2 — the edit lands on disk while the ack is held.
+      diskTime = 1002;
+      await storage.writeFile('/race.md', enc('edited content — longer'));
+
+      // t3 — release the ack; cycle 1 completes.
+      gating = false;
+      for (const flush of heldAckFlushers.splice(0)) flush();
+      await cycle1;
+
+      const hashOfCreate = await sha256Hex(enc('create content'));
+      const entry = client.currentIndex()['/race.md'];
+      expect(entry).toBeDefined();
+      expect(entry!.hash).toBe(hashOfCreate);
+      // The invariant: hash-time stat pinned at ack — never the current one.
+      expect(entry!.mtime).toBe(1001);
+      expect(entry!.mtime).not.toBe((await storage.listFiles()).find((f) => f.path === '/race.md')!.mtime);
+
+      // The next scan detects the edit and pushes it.
+      await client.triggerSync();
+      const hashOfEdit = await sha256Hex(enc('edited content — longer'));
+      const commits = sent.filter((m): m is Extract<Message, { type: 'commit' }> => m.type === 'commit');
+      expect(commits).toHaveLength(2);
+      expect(commits[1]!.hash).toBe(hashOfEdit);
+      const finalEntry = client.currentIndex()['/race.md']!;
+      expect(finalEntry.hash).toBe(hashOfEdit);
+      expect(finalEntry.mtime).toBe(1002); // now honestly describing the pushed content
+    } finally {
+      // Drain the in-flight cycle (release any held ack) BEFORE closing, so a
+      // failed assertion never leaves a cycle to trip over the closed socket.
+      gating = false;
+      for (const flush of heldAckFlushers.splice(0)) flush();
+      await cycle1.catch(() => {});
+      await client.waitIdle().catch(() => {});
+      client.close();
+    }
   });
 });

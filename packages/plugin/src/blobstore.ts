@@ -36,7 +36,10 @@ export class HttpBlobStore implements BlobStore {
   constructor(options: HttpBlobStoreOptions) {
     this.base = options.baseUrl.replace(/\/+$/, '');
     this.token = options.token;
-    this.doFetch = options.fetchImpl ?? fetch;
+    // Bound like the plugin's `fetchImpl` seam: this class calls `doFetch`
+    // detached, and a bare global `fetch` is an illegal invocation in
+    // Chromium renderers (real Obsidian).
+    this.doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
   /** GET /blob/:hash → bytes, or `undefined` on 404. */

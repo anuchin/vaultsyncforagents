@@ -3,7 +3,7 @@ import type { App, PluginManifest } from 'obsidian';
 import { VaultSyncPlugin } from '../src/plugin.js';
 import { asMockPlugin, Notice, protocolHandlers, resetObsidianMock } from './helpers/obsidian-mock.js';
 import { makeFakeApp, FakeVault } from './helpers/fake-vault.js';
-import { FakeFetch, FakeSocket, offlineWsFactory } from './helpers/network-fakes.js';
+import { FakeFetch, FakeSocket, jsonResult, offlineWsFactory } from './helpers/network-fakes.js';
 
 const LINKED = { url: 'https://w.example', token: 'tok-1', deviceId: 'dev-1', deviceName: 'Desk' };
 
@@ -250,5 +250,74 @@ describe('VaultSyncPlugin lifecycle', () => {
     const { plugin } = makePlugin({});
     await plugin.onload();
     expect(() => plugin.onunload()).not.toThrow();
+  });
+});
+
+describe('fetch seam — detached invocation (real-Obsidian illegal-invocation regression)', () => {
+  beforeEach(() => {
+    resetObsidianMock();
+    FakeSocket.opened = [];
+  });
+  afterEach(() => {
+    for (const plugin of created.splice(0)) plugin.onunload();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * Chromium's `window.fetch` is receiver-sensitive: called with `this !==
+   * window` it throws `TypeError: Failed to execute 'fetch' on 'Window':
+   * Illegal invocation` — the failure the real-Obsidian E2E hit, because the
+   * plugin's default fetchImpl was the bare global handed to callers that
+   * invoke it detached (`fetchImpl(url)`). The mock reproduces the binding
+   * rule so the regression cannot come back unnoticed.
+   */
+  function strictGlobalFetch(this: unknown, input: RequestInfo | URL): Promise<Response> {
+    if (this !== globalThis) {
+      return Promise.reject(
+        new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation"),
+      );
+    }
+    const path = String(input).replace(/^https?:\/\/[^/]+/, '');
+    if (path === '/health') return Promise.resolve(jsonResult(200, { ok: true, claimed: true }));
+    if (path === '/pair') {
+      return Promise.resolve(jsonResult(200, { ok: true, token: 'tok-x', deviceId: 'dev-x' }));
+    }
+    return Promise.resolve(new Response('not found', { status: 404 }));
+  }
+
+  it('the default fetchImpl is bound to the global: pairing succeeds without a fetch override', async () => {
+    vi.stubGlobal('fetch', strictGlobalFetch);
+
+    const vault = new FakeVault();
+    const { app } = makeFakeApp(vault);
+    // NOTE: no `fetchImpl` override — the plugin must fall back to a BOUND
+    // global fetch. With the old bare-`fetch` default, workerapi's detached
+    // call rejects with the TypeError above and pairing reports unreachable.
+    const plugin = new VaultSyncPlugin(app as unknown as App, {} as PluginManifest, {
+      wsFactory: offlineWsFactory,
+    });
+    asMockPlugin(plugin).store = { url: 'https://w.example' };
+    created.push(plugin);
+    await plugin.onload();
+
+    const outcome = await plugin.pairFromSettings('ABCD-EFGH');
+    expect(outcome).toMatchObject({ status: 'paired', token: 'tok-x', deviceId: 'dev-x' });
+  });
+
+  it('an explicitly injected fetchImpl still wins over the bound default', async () => {
+    const fetcher = new FakeFetch().health(true).pair(200, { ok: true, token: 'tok-y', deviceId: 'dev-y' });
+    const vault = new FakeVault();
+    const { app } = makeFakeApp(vault);
+    const plugin = new VaultSyncPlugin(app as unknown as App, {} as PluginManifest, {
+      fetchImpl: fetcher.fetchImpl,
+      wsFactory: offlineWsFactory,
+    });
+    asMockPlugin(plugin).store = { url: 'https://w.example' };
+    created.push(plugin);
+    await plugin.onload();
+
+    const outcome = await plugin.pairFromSettings('ABCD-EFGH');
+    expect(outcome).toMatchObject({ status: 'paired', token: 'tok-y' });
   });
 });

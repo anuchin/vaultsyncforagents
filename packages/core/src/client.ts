@@ -58,7 +58,7 @@ import {
   type RemoteFile,
   type SyncPlan,
 } from './resolve.js';
-import { recordHashedFiles, scanVault } from './scan.js';
+import { recordHashedFiles, scanVault, type HashedFile } from './scan.js';
 import type { Transport } from './transport.js';
 import type { LogicalClock } from './types.js';
 
@@ -126,6 +126,16 @@ interface StagedCommit {
   fromPath?: string;
   isFolder?: boolean;
   bytes?: Uint8Array;
+  /**
+   * Storage mtime observed by THIS cycle's scan when it hashed the content
+   * (`HashedFile.mtime` of the push source). Pinned onto the index entry when
+   * the ack lands, so the entry's (hash, size, mtime) always describes ONE
+   * consistent instant of the file — never a later stat paired with this
+   * hash. That ordering is what lets the scan fast-path (mtime+size) skip
+   * re-hashing safely: an edit landing between hash and ack changes the disk
+   * stat, misses the fast path, and is re-hashed and pushed on the next scan.
+   */
+  mtime?: number;
 }
 
 // --- the client ---------------------------------------------------------------------
@@ -501,7 +511,7 @@ export class SyncClient {
 
       // Stage push contents BEFORE pulls overwrite the working tree (a
       // conflict-copy push reads the loser content from the original path).
-      const staged = await this.stagePushes(plan);
+      const staged = await this.stagePushes(plan, localChanges.hashed);
 
       this.index = await this.applyPulls(plan.pulls);
 
@@ -547,7 +557,10 @@ export class SyncClient {
     return Object.values(reply.entries).map((entry) => ({ ...entry }));
   }
 
-  private async stagePushes(plan: SyncPlan): Promise<StagedCommit[]> {
+  private async stagePushes(
+    plan: SyncPlan,
+    hashed: readonly HashedFile[],
+  ): Promise<StagedCommit[]> {
     // A conflict-copy push carries content read from the *original* path.
     const copySources = new Map<string, string>();
     for (const conflict of plan.conflicts) {
@@ -555,6 +568,9 @@ export class SyncClient {
         copySources.set(conflict.conflictCopyPath, conflict.path);
       }
     }
+    // Hash-time stats by path: pinning these onto the acked entries (below)
+    // keeps the fast-path cache honest — see `StagedCommit.mtime`.
+    const hashTimeMtime = new Map(hashed.map((observed) => [observed.path, observed.mtime]));
 
     const staged: StagedCommit[] = [];
     for (const push of plan.pushes) {
@@ -579,10 +595,20 @@ export class SyncClient {
       if (push.kind === 'conflictCopy') {
         // Materialize the copy locally NOW, before the pulls overwrite the
         // original: the server broadcasts the copy to *other* clients only,
-        // so this device must write its own copy itself.
+        // so this device must write its own copy itself. The copy lands at a
+        // NEW path whose on-disk stat differs from the source's — no hash-time
+        // stat to pin, the next scan records one.
         await this.options.storage.writeFile(push.path, bytes);
+        staged.push({ ...this.toStaged(push), bytes });
+        continue;
       }
-      staged.push({ ...this.toStaged(push), bytes });
+      staged.push({
+        ...this.toStaged(push),
+        bytes,
+        ...(hashTimeMtime.get(sourcePath) !== undefined
+          ? { mtime: hashTimeMtime.get(sourcePath) }
+          : {}),
+      });
     }
     return staged;
   }
@@ -664,6 +690,10 @@ export class SyncClient {
       });
       return;
     }
+    // `commit.mtime` is the stat observed at HASH time for this exact content
+    // (threaded through `stagePushes`), never a stat taken at ack time — an
+    // edit that landed between hashing and this ack changed the disk stat, so
+    // the next scan misses the fast path and re-hashes/pushes the edit.
     this.index = applyCommit(this.index, {
       path: commit.path,
       versionId,
@@ -673,6 +703,7 @@ export class SyncClient {
       deleted,
       deletedAt: deleted ? this.now() : undefined,
       ...(commit.isFolder === true ? { isFolder: true } : {}),
+      ...(commit.mtime !== undefined ? { mtime: commit.mtime } : {}),
     });
   }
 

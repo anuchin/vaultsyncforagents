@@ -79,12 +79,22 @@ export interface LocalIndexCommit {
   hash: string;
   size: number;
   clock: LogicalClock;
-  /** Tombstone the entry instead of marking it live. */
+  /** Present ⇒ tombstone: the path was deleted at this epoch ms. */
   deleted?: boolean;
   /** Epoch ms of the deletion — required when `deleted` is true. */
   deletedAt?: number;
   /** True when this commit records an empty-folder placeholder (FR-10). */
   isFolder?: boolean;
+  /**
+   * Storage mtime observed at HASH time for this exact content — pinned onto
+   * the entry when the commit is folded (i.e. at commit-ack time). Threading
+   * the stat that co-occurred with the hashed bytes (rather than any
+   * later/current stat) guarantees the fast-path cache can never pair a
+   * fresher stat with this hash, which would hide an edit from every future
+   * scan (the silent dropped-edit class). Absent ⇒ unknown; the next scan
+   * re-hashes and records via `recordHashedFiles`.
+   */
+  mtime?: number;
 }
 
 /**
@@ -112,6 +122,7 @@ export function applyCommit(index: LocalIndex, commit: LocalIndexCommit): LocalI
   };
   if (commit.deleted) entry.deletedAt = commit.deletedAt;
   if (commit.isFolder) entry.isFolder = true;
+  if (commit.mtime !== undefined) entry.mtime = commit.mtime;
   next[commit.path] = entry;
   return next;
 }

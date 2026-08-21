@@ -25,6 +25,15 @@ export class FakeDataAdapter {
   failRename = false;
   /** Recorded mkdir calls (for asserting dir creation). */
   readonly mkdirs: string[] = [];
+  /**
+   * Optional wall clock for per-file mtimes. Unset (default): every file
+   * reports `FIXED_MTIME` — the historical fake behavior existing tests rely
+   * on. Set (tests that need a realistic stat sequence): `writeBinary` stamps
+   * the file with `clock()` so successive writes are distinguishable by
+   * mtime, like a real filesystem.
+   */
+  clock?: () => number;
+  private readonly mtimes = new Map<string, number>();
 
   constructor(seed: Record<string, string> = {}) {
     for (const [path, content] of Object.entries(seed)) {
@@ -51,6 +60,7 @@ export class FakeDataAdapter {
 
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
     this.files.set(path, new Uint8Array(data).slice());
+    if (this.clock !== undefined) this.mtimes.set(path, this.clock());
     ensureDirs(this.folders, path);
   }
 
@@ -59,6 +69,12 @@ export class FakeDataAdapter {
     if (this.files.has(from)) {
       this.files.set(to, this.files.get(from)!);
       this.files.delete(from);
+      // The mtime stamp follows the content (real renames preserve mtime).
+      const stamp = this.mtimes.get(from);
+      if (stamp !== undefined) {
+        this.mtimes.set(to, stamp);
+        this.mtimes.delete(from);
+      }
       ensureDirs(this.folders, to);
       return;
     }
@@ -87,7 +103,12 @@ export class FakeDataAdapter {
   async stat(path: string): Promise<FakeStat | null> {
     const file = this.files.get(path);
     if (file !== undefined) {
-      return { type: 'file', ctime: FIXED_MTIME, mtime: FIXED_MTIME, size: file.byteLength };
+      return {
+        type: 'file',
+        ctime: FIXED_MTIME,
+        mtime: this.mtimes.get(path) ?? FIXED_MTIME,
+        size: file.byteLength,
+      };
     }
     if (path === '' || path === '/' || this.folders.has(path)) {
       return { type: 'folder', ctime: FIXED_MTIME, mtime: FIXED_MTIME, size: 0 };

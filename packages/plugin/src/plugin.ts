@@ -88,7 +88,12 @@ export class VaultSyncPlugin extends Plugin {
   }
 
   private get fetchImpl(): typeof fetch {
-    return this.overrides.fetchImpl ?? fetch;
+    // Bind at the seam: consumers (pairing, `HttpBlobStore`) invoke this as a
+    // detached function, and a detached `fetch` throws
+    // `TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation`
+    // in Chromium renderers — i.e. in real Obsidian (desktop and mobile).
+    // Binding to the global makes the default safe to call bare.
+    return this.overrides.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
   get linked(): boolean {

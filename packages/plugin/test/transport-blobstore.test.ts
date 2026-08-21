@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HttpBlobStore } from '../src/blobstore.js';
 import { WebSocketTransport, toWebSocketUrl } from '../src/transport.js';
 import { FakeFetch, FakeSocket, jsonResult } from './helpers/network-fakes.js';
@@ -141,5 +141,31 @@ describe('HttpBlobStore', () => {
     });
     fetcher.on('PUT', '/blob/err', () => new Response('nope', { status: 500 }));
     await expect(store.put('err', new Uint8Array(0))).rejects.toThrow(/HTTP 500/);
+  });
+
+  // The blob store calls `doFetch` detached; an unbound global `fetch` is an
+  // illegal invocation in Chromium renderers (real Obsidian). Same mock
+  // strategy as the plugin-side fetch seam test.
+  it('defaults to a fetch bound to the global (illegal-invocation regression)', async () => {
+    const strictGlobalFetch = function (this: unknown, input: RequestInfo | URL): Promise<Response> {
+      if (this !== globalThis) {
+        return Promise.reject(
+          new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation"),
+        );
+      }
+      return Promise.resolve(new Response(new Uint8Array([7, 7, 7]).slice()));
+    };
+    vi.stubGlobal('fetch', strictGlobalFetch);
+    try {
+      const store = new HttpBlobStore({ baseUrl: 'https://w.example', token: 'tok-1' });
+      const bytes = await store.get('anything');
+      expect(Array.from(bytes!)).toEqual([7, 7, 7]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 });
