@@ -1,9 +1,11 @@
 /**
  * Minimal typed client for the worker's HTTP surface as the plugin uses it:
- * `GET /health` (claim-state probe before pairing) and `POST /pair` (redeem a
- * pairing code, ARCHITECTURE §3). Built on an injectable `fetch`; failures
- * map to typed errors with actionable messages so the settings UI and the
- * deep-link handler never see a raw `TypeError: Failed to fetch`.
+ * `GET /health` (claim-state probe before pairing), `POST /pair` (redeem a
+ * pairing code, ARCHITECTURE §3), `PATCH /device` (device self-service
+ * rename), and `GET /api/status` (storage/device summary for About). Built
+ * on an injectable `fetch`; failures map to typed errors with actionable
+ * messages so the settings UI and the deep-link handler never see a raw
+ * `TypeError: Failed to fetch`.
  */
 
 /** A worker call failed (unreachable or unexpected HTTP). */
@@ -147,4 +149,122 @@ export async function requestPair(params: PairRequestParams): Promise<PairCreden
     throw new WorkerApiError('pairing reply was missing token/deviceId', response.status);
   }
   return { token: body.token, deviceId: body.deviceId };
+}
+
+// --- device self-service (PATCH /device) -----------------------------------------------
+
+/** The device document the worker returns from `PATCH /device`. */
+export interface WorkerDevice {
+  id: string;
+  name: string;
+  type: string;
+}
+
+export type RenameOutcome =
+  | { ok: true; device: WorkerDevice }
+  | { ok: false; error: string };
+
+export interface RenameParams {
+  origin: string;
+  /** The calling device's own token — it can only ever rename itself. */
+  token: string;
+  name: string;
+  fetchImpl: typeof fetch;
+}
+
+/**
+ * `PATCH /device` — rename THIS device on the worker (device-token
+ * authenticated; never throws: failures come back as `{ok:false, error}`).
+ */
+export async function renameDevice(params: RenameParams): Promise<RenameOutcome> {
+  let response: Response;
+  try {
+    response = await params.fetchImpl(`${params.origin}/device`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${params.token}` },
+      body: JSON.stringify({ name: params.name }),
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: `could not reach the worker at ${params.origin}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  const detail = (await response.text().catch(() => '')).trim();
+  if (response.status === 421) {
+    return { ok: false, error: 'this worker has not been claimed yet' };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return {
+      ok: false,
+      error: 'the worker rejected this device\u2019s token (revoked?) — unlink and re-pair with a fresh code.',
+    };
+  }
+  if (!response.ok) {
+    let reason = `HTTP ${response.status}`;
+    try {
+      const parsed = JSON.parse(detail) as { error?: unknown };
+      if (typeof parsed.error === 'string') reason = parsed.error;
+    } catch {
+      // keep the bare status
+    }
+    return { ok: false, error: reason };
+  }
+  let body: { device?: unknown };
+  try {
+    body = JSON.parse(detail) as { device?: unknown };
+  } catch {
+    return { ok: false, error: 'rename reply was not JSON' };
+  }
+  const device = body.device as Partial<WorkerDevice> | undefined;
+  if (
+    typeof device?.id !== 'string' ||
+    typeof device.name !== 'string' ||
+    typeof device.type !== 'string'
+  ) {
+    return { ok: false, error: 'rename reply was missing the device document' };
+  }
+  return { ok: true, device: { id: device.id, name: device.name, type: device.type } };
+}
+
+// --- worker status (GET /api/status, device token) --------------------------------------
+
+/** The slice of `/api/status` the plugin's About section shows. */
+export interface WorkerStatusSummary {
+  vaultName: string;
+  devices: Array<{ id: string; name: string; type: string; online: boolean; revoked: boolean }>;
+  attachments: { count: number; bytes: number };
+  storageBytes: number;
+}
+
+/**
+ * `GET /api/status` with the device token — storage usage + device list for
+ * the About section. Resolves `null` on any failure (About shows "unknown").
+ */
+export async function fetchWorkerStatus(params: {
+  origin: string;
+  token: string;
+  fetchImpl: typeof fetch;
+}): Promise<WorkerStatusSummary | null> {
+  let response: Response;
+  try {
+    response = await params.fetchImpl(`${params.origin}/api/status`, {
+      headers: { authorization: `Bearer ${params.token}` },
+    });
+  } catch {
+    return null;
+  }
+  if (!response.ok) return null;
+  const body = (await response.json().catch(() => null)) as Partial<WorkerStatusSummary> | null;
+  if (body === null || typeof body.storageBytes !== 'number' || typeof body.attachments !== 'object') {
+    return null;
+  }
+  return {
+    vaultName: typeof body.vaultName === 'string' ? body.vaultName : '',
+    devices: Array.isArray(body.devices) ? body.devices : [],
+    attachments: body.attachments,
+    storageBytes: body.storageBytes,
+  };
 }

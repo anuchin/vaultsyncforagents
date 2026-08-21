@@ -15,16 +15,25 @@
 import { Notice, Plugin } from 'obsidian';
 import type { App, PluginManifest } from 'obsidian';
 import { RevokedError, SyncClient, UnauthorizedError } from '@vsa/core';
-import type { LogAdapter } from '@vsa/core';
 import { ObsidianStorageAdapter } from './adapters/obsidian-storage.js';
 import { ObsidianWatchAdapter, RescanScheduler } from './adapters/obsidian-watch.js';
 import { HttpBlobStore } from './blobstore.js';
+import {
+  buildDiagnosticsBundle,
+  copyToClipboard,
+  createPluginLog,
+  platformSummary,
+  withRoundTripLogging,
+  type PluginLog,
+} from './diagnostics.js';
 import {
   defaultDeviceName,
   detectDeviceType,
   isLinked,
   normalizePluginData,
+  parseIgnorePatterns,
   defaultPluginData,
+  type LogLevel,
   type VaultSyncPluginData,
 } from './data.js';
 import { pairOutcomeMessage, pairWithWorker } from './pairing.js';
@@ -32,11 +41,13 @@ import type { PairOutcome } from './pairing.js';
 import { registerPairProtocolHandler } from './protocol-handler.js';
 import { ReconnectSupervisor } from './reconnect.js';
 import type { BackoffOptions } from './reconnect.js';
+import type { StatusBarMode } from './statusbar.js';
 import { VaultSyncSettingTab } from './settings.js';
 import { StatusBarIndicator } from './statusbar.js';
 import { WebSocketTransport } from './transport.js';
 import type { WebSocketFactory } from './transport.js';
-import { normalizeWorkerUrl } from './workerapi.js';
+import { fetchWorkerStatus, normalizeWorkerUrl, renameDevice } from './workerapi.js';
+import type { WorkerStatusSummary } from './workerapi.js';
 
 /** The in-vault device marker shared with the daemon/CLI (FR-44 handshake). */
 const DEVICE_MARKER_VAULT_PATH = '/.vaultsyncforagents/device.json';
@@ -71,12 +82,10 @@ export class VaultSyncPlugin extends Plugin {
   /** Set when the worker rejected the token — reconnecting cannot help. */
   private authFailed = false;
   private statusNote = '';
-  private readonly syncLog: LogAdapter = {
-    debug: (...args: unknown[]) => console.debug('[vsa]', ...args),
-    info: (...args: unknown[]) => console.info('[vsa]', ...args),
-    warn: (...args: unknown[]) => console.warn('[vsa]', ...args),
-    error: (...args: unknown[]) => console.error('[vsa]', ...args),
-  };
+  /** Pause-syncing state (runtime only — a reload starts per syncOnStartup). */
+  private paused = false;
+  /** The plugin's log: console mirror + bounded ring (Copy diagnostics). */
+  private readonly syncLog: PluginLog = createPluginLog();
 
   constructor(app: App, manifest: PluginManifest, overrides: PluginOverrides = {}) {
     super(app, manifest);
@@ -102,6 +111,7 @@ export class VaultSyncPlugin extends Plugin {
 
   override async onload(): Promise<void> {
     this.data = normalizePluginData(await this.loadData());
+    this.syncLog.setLevel(this.data.settings.logLevel);
     this.addSettingTab(new VaultSyncSettingTab(this.app, this));
     registerPairProtocolHandler(
       (action, handler) => this.registerObsidianProtocolHandler(action, handler),
@@ -110,7 +120,9 @@ export class VaultSyncPlugin extends Plugin {
     // Cheap focus-driven rescan (FR-12): every note/app switch pokes the
     // scheduler, which coalesces into at most one cycle per debounce window.
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.rescan?.poke()));
-    if (this.linked) await this.startSync();
+    // "Sync on startup" OFF = manual-only mode: load idle; the first "Sync
+    // now" starts the machinery (watcher included).
+    if (this.linked && this.data.settings.syncOnStartup) await this.startSync();
   }
 
   override onunload(): void {
@@ -203,6 +215,39 @@ export class VaultSyncPlugin extends Plugin {
     }
   }
 
+  /**
+   * `PATCH /device` — rename THIS device on the worker (the settings tab's
+   * Rename button). Updates plugin data + the in-vault device marker (which
+   * stores the name for the FR-44 double-client warning). Local state keeps
+   * its previous name on failure.
+   */
+  async renameDevice(name: string): Promise<boolean> {
+    if (!this.linked) {
+      new Notice('VaultSync: pair this vault first — the name applies at pairing time.');
+      return false;
+    }
+    const trimmed = name.trim();
+    if (trimmed === '' || trimmed.length > 30 || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+      new Notice('VaultSync: device name must be 1-30 characters, without control characters.', 8000);
+      return false;
+    }
+    const outcome = await renameDevice({
+      origin: this.data.url,
+      token: this.data.token,
+      name: trimmed,
+      fetchImpl: this.fetchImpl,
+    });
+    if (!outcome.ok) {
+      new Notice(`VaultSync: renaming failed — ${outcome.error}`, 10000);
+      return false;
+    }
+    this.data.deviceName = outcome.device.name;
+    await this.savePluginData();
+    await this.writeDeviceMarker();
+    new Notice(`VaultSync: device renamed to “${outcome.device.name}”.`);
+    return true;
+  }
+
   // --- sync lifecycle ------------------------------------------------------------------
 
   /** Build everything and run startup reconciliation (idempotent restart). */
@@ -219,10 +264,17 @@ export class VaultSyncPlugin extends Plugin {
       deviceId,
       deviceName,
       token,
-      transport: () => new WebSocketTransport({ url, token, wsFactory: this.overrides.wsFactory }),
+      transport: () =>
+        withRoundTripLogging(
+          new WebSocketTransport({ url, token, wsFactory: this.overrides.wsFactory }),
+          { log: this.syncLog, shouldLog: () => this.syncLog.debugEnabled },
+        ),
       blobStore: new HttpBlobStore({ baseUrl: url, token, fetchImpl: this.fetchImpl }),
       storage,
-      settings: { obsidianSync: this.data.settings.obsidianSync },
+      settings: {
+        obsidianSync: this.data.settings.obsidianSync,
+        extraIgnores: parseIgnorePatterns(this.data.settings.ignorePatterns),
+      },
       log: this.syncLog,
       now: this.now,
     });
@@ -249,15 +301,25 @@ export class VaultSyncPlugin extends Plugin {
       });
     });
 
-    // Status bar + the 1 Hz supervision tick that repaints it and supervises
-    // reconnection.
-    const item = this.addStatusBarItem();
-    this.statusBarItem = item;
-    this.statusBar = new StatusBarIndicator(item);
+    // Status bar (per the statusBarMode setting) + the 1 Hz supervision tick
+    // that repaints it and supervises reconnection.
+    this.mountStatusBar();
     const tick = setInterval(() => this.onTick(), SUPERVISION_TICK_MS);
     this.tickHandle = tick;
     this.registerInterval(tick as unknown as number); // Obsidian clears this on unload
     this.onTick();
+  }
+
+  /** (Re)mount the status-bar item per the current mode ('hidden' = none). */
+  private mountStatusBar(): void {
+    this.statusBarItem?.remove();
+    this.statusBarItem = null;
+    this.statusBar = null;
+    if (this.client === null) return;
+    if (this.data.settings.statusBarMode === 'hidden') return;
+    const item = this.addStatusBarItem();
+    this.statusBarItem = item;
+    this.statusBar = new StatusBarIndicator(item);
   }
 
   /** Tear down every timer, watcher, socket, and UI artifact. Idempotent. */
@@ -283,9 +345,26 @@ export class VaultSyncPlugin extends Plugin {
   // --- user actions ----------------------------------------------------------------------
 
   async syncNow(): Promise<void> {
+    if (this.paused) {
+      new Notice('VaultSync: syncing is paused — resume it in settings first.');
+      return;
+    }
     const client = this.client;
     if (client === null) {
-      new Notice('VaultSync: not paired yet — add your worker URL and a pairing code in settings.');
+      if (!this.linked) {
+        new Notice('VaultSync: not paired yet — add your worker URL and a pairing code in settings.');
+        return;
+      }
+      // Manual-only mode ("Sync on startup" OFF): this is the first start.
+      await this.startSync();
+      const status = this.client?.status();
+      if (status !== undefined) {
+        new Notice(
+          status.state === 'disconnected'
+            ? 'VaultSync: offline — changes will sync when the worker is reachable.'
+            : 'VaultSync: up to date.',
+        );
+      }
       return;
     }
     try {
@@ -302,23 +381,33 @@ export class VaultSyncPlugin extends Plugin {
     }
   }
 
-  async unlink(): Promise<void> {
-    this.stopSync();
-    // Clear local sync state (device marker + index) so a future client —
-    // this plugin after a re-pair, the daemon, the CLI — starts clean
-    // (FR-44: stale state would make it refuse or mis-sync).
-    const storage = new ObsidianStorageAdapter({ adapter: this.app.vault.adapter });
-    await storage.deleteFile(DEVICE_MARKER_VAULT_PATH);
-    await storage.deleteFile(LOCAL_INDEX_VAULT_PATH);
-    this.data = {
-      ...defaultPluginData(),
-      deviceName: this.data.deviceName,
-      settings: this.data.settings,
-    };
-    await this.savePluginData();
-    new Notice(
-      'VaultSync: unlinked. Revoke this device from the worker dashboard if you are done with it.',
-    );
+  /** Pause: transport down + watcher/rescan idle, link and state kept. */
+  pauseSyncing(): void {
+    if (!this.linked || this.paused) return;
+    this.paused = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.supervisor.settled();
+    this.rescan?.stop();
+    this.rescan = null;
+    this.client?.close(); // also stops the watcher; state → idle
+    this.onTick(); // repaint "vsa ⏸"
+    new Notice('VaultSync: paused. New and changed files stay local until you resume.');
+  }
+
+  /** Resume: reconnect and run a full catch-up cycle (startup reconciliation). */
+  async resumeSyncing(): Promise<void> {
+    if (!this.linked || !this.paused) return;
+    this.paused = false;
+    new Notice('VaultSync: resuming — running a full catch-up sync…');
+    await this.startSync();
+  }
+
+  /** Runtime pause state (the settings tab's button label + diagnostics). */
+  get syncingPaused(): boolean {
+    return this.paused;
   }
 
   async applyRescanInterval(seconds: number): Promise<void> {
@@ -337,6 +426,96 @@ export class VaultSyncPlugin extends Plugin {
     );
   }
 
+  async applyStatusBarMode(mode: StatusBarMode): Promise<void> {
+    this.data.settings.statusBarMode = mode;
+    await this.savePluginData();
+    this.mountStatusBar(); // re-mounts (or removes) the item per the mode
+    this.onTick();
+  }
+
+  async applySyncOnStartup(enabled: boolean): Promise<void> {
+    this.data.settings.syncOnStartup = enabled;
+    await this.savePluginData();
+    new Notice(
+      enabled
+        ? 'VaultSync: syncing will start automatically the next time Obsidian opens.'
+        : 'VaultSync: on the next launch this plugin stays idle until you press “Sync now”.',
+    );
+  }
+
+  async applyLogLevel(level: LogLevel): Promise<void> {
+    this.data.settings.logLevel = level;
+    await this.savePluginData();
+    this.syncLog.setLevel(level);
+  }
+
+  /**
+   * New ignore patterns: persist, then restart the sync machinery while live
+   * so the scan/watcher pick them up immediately (a paused session applies
+   * them on resume — resume always rebuilds the client).
+   */
+  async applyIgnorePatterns(text: string): Promise<void> {
+    this.data.settings.ignorePatterns = text;
+    await this.savePluginData();
+    if (this.client !== null && !this.paused) await this.startSync();
+  }
+
+  /** Storage/attachment summary for the About section (null = unavailable). */
+  async fetchStorageSummary(): Promise<WorkerStatusSummary | null> {
+    if (!this.linked) return null;
+    return fetchWorkerStatus({
+      origin: this.data.url,
+      token: this.data.token,
+      fetchImpl: this.fetchImpl,
+    });
+  }
+
+  /** Copy the diagnostics bundle to the clipboard (fallback: console). */
+  async copyDiagnostics(): Promise<void> {
+    const bundle = buildDiagnosticsBundle({
+      pluginVersion: this.manifest.version || 'unknown',
+      deviceId: this.data.deviceId,
+      deviceName: this.resolveDeviceName(),
+      workerUrl: this.data.url,
+      paired: this.linked,
+      paused: this.paused,
+      clientStatus: this.client?.status() ?? null,
+      recentLogLines: this.syncLog.recentLines(),
+    });
+    const copied = await copyToClipboard(bundle);
+    if (copied) {
+      new Notice('VaultSync: diagnostics copied to the clipboard.');
+      return;
+    }
+    console.info('[vsa] diagnostics (clipboard unavailable):\n' + bundle);
+    new Notice('VaultSync: clipboard unavailable — diagnostics written to the developer console.', 10000);
+  }
+
+  /** The platform line for the About/diagnostics readouts. */
+  platformSummary(): string {
+    return platformSummary();
+  }
+
+  async unlink(): Promise<void> {
+    this.stopSync();
+    this.paused = false;
+    // Clear local sync state (device marker + index) so a future client —
+    // this plugin after a re-pair, the daemon, the CLI — starts clean
+    // (FR-44: stale state would make it refuse or mis-sync).
+    const storage = new ObsidianStorageAdapter({ adapter: this.app.vault.adapter });
+    await storage.deleteFile(DEVICE_MARKER_VAULT_PATH);
+    await storage.deleteFile(LOCAL_INDEX_VAULT_PATH);
+    this.data = {
+      ...defaultPluginData(),
+      deviceName: this.data.deviceName,
+      settings: this.data.settings,
+    };
+    await this.savePluginData();
+    new Notice(
+      'VaultSync: unlinked. Revoke this device from the worker dashboard if you are done with it.',
+    );
+  }
+
   // --- supervision --------------------------------------------------------------------------
 
   private onTick(): void {
@@ -345,10 +524,16 @@ export class VaultSyncPlugin extends Plugin {
     const status = client.status();
     this.statusBar?.update(
       status,
-      { url: this.data.url, deviceName: this.resolveDeviceName(), note: this.statusNote },
+      {
+        url: this.data.url,
+        deviceName: this.resolveDeviceName(),
+        note: this.statusNote,
+        paused: this.paused,
+        mode: this.data.settings.statusBarMode,
+      },
       this.now(),
     );
-    if (this.authFailed) return; // token rejected: reconnecting cannot fix it
+    if (this.paused || this.authFailed) return; // no reconnect while paused / token rejected
     const decision = this.supervisor.consider(status.state);
     if (decision.action === 'wait') return;
     this.supervisor.acknowledged();

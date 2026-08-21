@@ -1,8 +1,13 @@
 /**
- * The settings tab (plugin scope item #6): worker URL + device name +
- * pairing code + "Pair" (with unclaimed-worker onboarding guidance), "Sync
- * now", unlink-with-confirm, rescan-interval and `.obsidian/` toggles, and a
- * live status readout (connected, last sync, pending, conflicts).
+ * The settings tab (plugin scope item #6), organized in four sections:
+ *
+ *   Connection — worker URL, device name (pairing-time OR rename when
+ *                linked), pairing form / status readout + Sync now + unlink
+ *   Sync       — rescan interval, .obsidian/ toggle, pause/resume,
+ *                sync-on-startup
+ *   Advanced   — status-bar indicator mode, ignore patterns, diagnostics
+ *                (log level + Copy diagnostics)
+ *   About      — versions, storage usage, project README link
  *
  * All logic lives on `VaultSyncPlugin`; the tab is presentation plus wiring.
  */
@@ -12,10 +17,12 @@ import type { App } from 'obsidian';
 import {
   defaultDeviceName,
   RESCAN_INTERVAL_CHOICES,
+  type LogLevel,
   type VaultSyncPluginData,
 } from './data.js';
 import type { PairOutcome } from './pairing.js';
 import { pairOutcomeMessage } from './pairing.js';
+import { formatBytes, PROTOCOL_VERSION } from './diagnostics.js';
 import { formatSince } from './statusbar.js';
 import type { VaultSyncPlugin } from './plugin.js';
 
@@ -28,10 +35,19 @@ export const DEPLOY_URL =
   'https://deploy.workers.cloudflare.com/?url=' +
   'https://github.com/vaultsyncforagents/vaultsyncforagents-template';
 
+/** The project README (the About section's link). */
+export const PROJECT_README_URL = 'https://github.com/vaultsyncforagents/vaultsyncforagents#readme';
+
 /** Open the deploy page in the system browser (no-op where `window` is absent). */
 export function openDeployPage(): void {
   if (typeof window === 'undefined') return;
   window.open(DEPLOY_URL, '_blank');
+}
+
+/** Open the project README in the system browser (no-op without `window`). */
+export function openReadmePage(): void {
+  if (typeof window === 'undefined') return;
+  window.open(PROJECT_README_URL, '_blank');
 }
 
 /** Small confirmation dialog (the unlink button's safety net). */
@@ -69,8 +85,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   private readonly plugin: VaultSyncPlugin;
   /** Pairing codes never touch disk — they are one-time, short-lived secrets. */
   private pairingCode = '';
+  /**
+   * Linked-mode device-name draft: edits stage here (NOT in plugin data) so a
+   * failed rename cannot leave the local name out of sync with the worker.
+   */
+  private renameDraft: string | null = null;
   private hintSetting: Setting | null = null;
   private statusSetting: Setting | null = null;
+  private storageSetting: Setting | null = null;
   private refreshHandle: ReturnType<typeof setInterval> | null = null;
 
   constructor(app: App, plugin: VaultSyncPlugin) {
@@ -84,13 +106,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     this.hintSetting = null;
     this.statusSetting = null;
+    this.storageSetting = null;
+    this.renameDraft = null;
 
     this.renderConnectionSection();
-    if (this.plugin.linked) {
-      this.renderLinkedSection();
-    } else {
-      this.renderPairingSection();
-    }
+    this.renderSyncSection();
+    this.renderAdvancedSection();
+    this.renderAboutSection();
     this.startRefresh();
   }
 
@@ -100,8 +122,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
   // --- sections -----------------------------------------------------------------
 
+  private heading(text: string): void {
+    new Setting(this.containerEl).setName(text).setHeading();
+  }
+
   private renderConnectionSection(): void {
     const { containerEl } = this;
+    this.heading('Connection');
+
     new Setting(containerEl)
       .setName('Worker URL')
       .setDesc(
@@ -117,7 +145,18 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
+    if (this.plugin.linked) {
+      this.renderLinkedDeviceName();
+      this.renderLinkedStatus();
+    } else {
+      this.renderPairingDeviceName();
+      this.renderPairingSection();
+    }
+  }
+
+  /** Unlinked: the name is a pairing-time default (applies at next pair). */
+  private renderPairingDeviceName(): void {
+    new Setting(this.containerEl)
       .setName('Device name')
       .setDesc(`Shown in the worker dashboard's device list. Applies when (re)pairing.`)
       .addText((text) =>
@@ -128,6 +167,35 @@ export class VaultSyncSettingTab extends PluginSettingTab {
             this.plugin.data.deviceName = value.trim();
             await this.plugin.savePluginData();
           }),
+      );
+  }
+
+  /** Linked: the field shows the current name; Rename pushes it to the worker. */
+  private renderLinkedDeviceName(): void {
+    const current = this.renameDraft ?? this.plugin.data.deviceName;
+    new Setting(this.containerEl)
+      .setName('Device name')
+      .setDesc(
+        'The worker dashboard shows this name. Edit it and press "Rename device" to update this device on the worker (1-30 characters).',
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder(defaultDeviceName())
+          .setValue(current)
+          .onChange((value) => {
+            this.renameDraft = value;
+          }),
+      )
+      .addButton((button) =>
+        button.setButtonText('Rename device').onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const ok = await this.plugin.renameDevice(this.renameDraft ?? this.plugin.data.deviceName);
+            if (ok) this.display(); // re-render with the persisted name
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
       );
   }
 
@@ -175,9 +243,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       );
   }
 
-  private renderLinkedSection(): void {
+  private renderLinkedStatus(): void {
     const { containerEl } = this;
-    const data = this.plugin.data;
 
     this.statusSetting = new Setting(containerEl)
       .setName('Status')
@@ -196,33 +263,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       }),
     );
 
-    new Setting(containerEl)
-      .setName('Rescan interval')
-      .setDesc(
-        'Periodic full reconciliation — catches external edits while Obsidian is open and covers mobile background limits. Vault events and app-open sync always run.',
-      )
-      .addDropdown((dropdown) => {
-        for (const choice of RESCAN_INTERVAL_CHOICES) {
-          dropdown.addOption(String(choice.value), choice.label);
-        }
-        dropdown.setValue(String(data.settings.rescanIntervalSec));
-        dropdown.onChange(async (value) => {
-          await this.plugin.applyRescanInterval(Number(value));
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('Sync .obsidian/ folder')
-      .setDesc(
-        'Opt in to syncing .obsidian/ (settings and plugins), excluding workspace.json and caches. ' +
-          'The worker\u2019s per-vault setting takes precedence once connected.',
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(data.settings.obsidianSync).onChange(async (value) => {
-          await this.plugin.applyObsidianSync(value);
-        }),
-      );
-
     new Setting(containerEl).addButton((button) =>
       button.setButtonText('Unlink this vault').onClick(() => {
         new ConfirmModal(this.app, {
@@ -238,11 +278,194 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     );
   }
 
+  private renderSyncSection(): void {
+    const { containerEl } = this;
+    const data = this.plugin.data;
+    this.heading('Sync');
+
+    if (this.plugin.linked) {
+      new Setting(containerEl)
+        .setName('Rescan interval')
+        .setDesc(
+          'Periodic full reconciliation — catches external edits while Obsidian is open and covers mobile background limits. Vault events and app-open sync always run.',
+        )
+        .addDropdown((dropdown) => {
+          for (const choice of RESCAN_INTERVAL_CHOICES) {
+            dropdown.addOption(String(choice.value), choice.label);
+          }
+          dropdown.setValue(String(data.settings.rescanIntervalSec));
+          dropdown.onChange(async (value) => {
+            await this.plugin.applyRescanInterval(Number(value));
+          });
+        });
+
+      new Setting(containerEl)
+        .setName('Sync .obsidian/ folder')
+        .setDesc(
+          'Opt in to syncing .obsidian/ (settings and plugins), excluding workspace.json and caches. ' +
+            'The worker\u2019s per-vault setting takes precedence once connected.',
+        )
+        .addToggle((toggle) =>
+          toggle.setValue(data.settings.obsidianSync).onChange(async (value) => {
+            await this.plugin.applyObsidianSync(value);
+          }),
+        );
+
+      const paused = this.plugin.syncingPaused;
+      new Setting(containerEl)
+        .setName(paused ? 'Syncing paused' : 'Pause syncing')
+        .setDesc(
+          paused
+            ? 'Syncing is paused: the connection is down and vault changes stay local. Resume reconnects and runs a full catch-up sync.'
+            : 'Temporarily stop syncing without unlinking — the transport disconnects and the watcher goes idle. Your link and local state are kept.',
+        )
+        .addButton((button) =>
+          button
+            .setButtonText(paused ? 'Resume syncing' : 'Pause syncing')
+            .onClick(async () => {
+              button.setDisabled(true);
+              try {
+                if (paused) await this.plugin.resumeSyncing();
+                else this.plugin.pauseSyncing();
+              } finally {
+                this.display(); // re-render: the button (and label) flip
+              }
+            }),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName('Sync on startup')
+      .setDesc(
+        'ON (default): sync starts as soon as Obsidian opens. OFF: the plugin loads idle and the first "Sync now" press starts syncing (manual-only mode).',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(data.settings.syncOnStartup).onChange(async (value) => {
+          await this.plugin.applySyncOnStartup(value);
+        }),
+      );
+  }
+
+  private renderAdvancedSection(): void {
+    const { containerEl } = this;
+    const data = this.plugin.data;
+    this.heading('Advanced');
+
+    new Setting(containerEl)
+      .setName('Status bar indicator')
+      .setDesc(
+        'Detailed: "vsa ✓ 12s" with state and age. Compact: just the symbol. Hidden: no status bar item at all.',
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption('detailed', 'Detailed');
+        dropdown.addOption('compact', 'Compact');
+        dropdown.addOption('hidden', 'Hidden');
+        dropdown.setValue(data.settings.statusBarMode);
+        dropdown.onChange(async (value) => {
+          await this.plugin.applyStatusBarMode(
+            value === 'compact' || value === 'hidden' ? value : 'detailed',
+          );
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Ignore patterns')
+      .setDesc(
+        'One pattern per line, e.g. private/** or *.tmp. Glob-lite: * matches within one folder name, ** spans folders (dir/** skips the folder and everything in it); a pattern without / matches file names at any depth. Case-insensitive; applies on this device only; saving reconnects sync to apply them.',
+      )
+      .addTextArea((area) =>
+        area
+          .setPlaceholder('private/**\n*.tmp')
+          .setValue(data.settings.ignorePatterns)
+          .onChange(async (value) => {
+            await this.plugin.applyIgnorePatterns(value);
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('Diagnostics log level')
+      .setDesc(
+        'info (default) records lifecycle events; debug additionally logs protocol round-trips (one short line per frame); warn keeps only warnings and errors.',
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption('info', 'info');
+        dropdown.addOption('debug', 'debug');
+        dropdown.addOption('warn', 'warn');
+        dropdown.setValue(data.settings.logLevel);
+        dropdown.onChange(async (value) => {
+          const level: LogLevel = value === 'debug' || value === 'warn' ? value : 'info';
+          await this.plugin.applyLogLevel(level);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Copy diagnostics')
+      .setDesc(
+        'Copies a bug-report bundle: plugin + protocol versions, device, worker URL, pairing state, a status snapshot, the platform, and the last 20 log lines.',
+      )
+      .addButton((button) =>
+        button.setButtonText('Copy diagnostics').onClick(async () => {
+          button.setDisabled(true);
+          try {
+            await this.plugin.copyDiagnostics();
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
+      );
+  }
+
+  private renderAboutSection(): void {
+    const { containerEl } = this;
+    this.heading('About');
+
+    new Setting(containerEl)
+      .setName('Versions')
+      .setDesc(
+        `Plugin ${this.plugin.manifest.version || 'unknown'} · protocol v${PROTOCOL_VERSION} · ${this.plugin.platformSummary()}`,
+      );
+
+    this.storageSetting = new Setting(containerEl)
+      .setName('Vault storage')
+      .setDesc(this.plugin.linked ? 'Checking the worker…' : 'Pair this vault to see storage usage.');
+    if (this.plugin.linked) void this.refreshStorage();
+
+    new Setting(containerEl)
+      .setName('Project home')
+      .setDesc(`Documentation and source: ${PROJECT_README_URL}`)
+      .addButton((button) =>
+        button.setButtonText('Open README').onClick(() => openReadmePage()),
+      );
+  }
+
+  /** Fill the About storage line from /api/status (device-token auth). */
+  private async refreshStorage(): Promise<void> {
+    const summary = await this.plugin.fetchStorageSummary();
+    const desc =
+      summary === null
+        ? 'Storage usage is currently unavailable (the worker is unreachable).'
+        : `Storage used: ${formatBytes(summary.storageBytes)} · ${summary.attachments.count} attachment${
+            summary.attachments.count === 1 ? '' : 's'
+          } (${formatBytes(summary.attachments.bytes)})` +
+          (summary.devices.length > 0
+            ? ` · ${summary.devices.length} device${summary.devices.length === 1 ? '' : 's'}`
+            : '');
+    // The tab may have been closed/re-rendered meanwhile; paint only if live.
+    if (this.storageSetting !== null) this.storageSetting.setDesc(desc);
+  }
+
   // --- status / feedback -----------------------------------------------------------
 
   private statusText(): string {
     const data: VaultSyncPluginData = this.plugin.data;
     const status = this.plugin.client?.status();
+    if (this.plugin.syncingPaused) {
+      return [
+        'State: paused',
+        `Worker: ${data.url}`,
+        'Vault changes stay local until you resume syncing.',
+      ].join('\n');
+    }
     if (status === undefined) {
       return `Linked to ${data.url} (device ${data.deviceName || data.deviceId}).`;
     }

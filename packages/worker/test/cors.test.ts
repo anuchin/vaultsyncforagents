@@ -27,7 +27,8 @@ const PLUGIN_ORIGIN = 'app://obsidian.md';
 /** The exact header set every plugin-facing response must carry. */
 const CORS_HEADERS: Record<string, string> = {
   'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
+  // PATCH joined the set with the device self-rename route (`PATCH /device`).
+  'access-control-allow-methods': 'GET, POST, PUT, PATCH, OPTIONS',
   'access-control-allow-headers': 'Authorization, Content-Type',
   'access-control-max-age': '86400',
 };

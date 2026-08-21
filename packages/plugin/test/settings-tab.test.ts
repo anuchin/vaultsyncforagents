@@ -12,6 +12,13 @@ function findSetting(name: string): SettingRecord {
   return record;
 }
 
+/** The most recent render's record (re-renders append new records). */
+function findLastSetting(name: string): SettingRecord {
+  const record = [...Setting.instances].reverse().find((r) => r.name === name);
+  if (record === undefined) throw new Error(`setting not rendered: ${name}`);
+  return record;
+}
+
 function findButton(text: string): { click: () => Promise<void> } {
   for (const record of [...Setting.instances].reverse()) {
     const button = record.buttons.find((b) => b.text === text);
@@ -229,5 +236,233 @@ describe('VaultSyncSettingTab', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // --- linked-mode helpers -------------------------------------------------------
+
+  /** Mark the (offline) plugin linked and re-render the tab. */
+  async function linkAndDisplay(overrides: Record<string, unknown> = {}): Promise<void> {
+    Object.assign(plugin.data, { url: 'https://w.example', token: 'tok-1', deviceId: 'dev-1', deviceName: 'Desk', ...overrides });
+    await plugin.savePluginData();
+    tab.display();
+  }
+
+  // --- the new settings (status bar, startup, ignores, log level) ------------------
+
+  it('status bar dropdown offers Detailed/Compact/Hidden and persists the choice', async () => {
+    await linkAndDisplay();
+    const dropdown = findSetting('Status bar indicator').dropdown!;
+    expect(dropdown.options).toEqual({ detailed: 'Detailed', compact: 'Compact', hidden: 'Hidden' });
+    expect(dropdown.value).toBe('detailed'); // the default
+
+    dropdown.onChange('compact');
+    await flush();
+    expect(plugin.data.settings.statusBarMode).toBe('compact');
+    expect(asMockPlugin(plugin).store).toMatchObject({ settings: { statusBarMode: 'compact' } });
+
+    dropdown.onChange('hidden');
+    await flush();
+    expect(asMockPlugin(plugin).store).toMatchObject({ settings: { statusBarMode: 'hidden' } });
+  });
+
+  it('sync-on-startup toggle defaults ON and persists OFF', async () => {
+    await linkAndDisplay();
+    const toggle = findSetting('Sync on startup').toggle!;
+    expect(toggle.value).toBe(true); // the documented default
+
+    toggle.onChange(false);
+    await flush();
+    expect(plugin.data.settings.syncOnStartup).toBe(false);
+    expect(asMockPlugin(plugin).store).toMatchObject({ settings: { syncOnStartup: false } });
+    expect(Notice.messages.some((n) => n.message.includes('idle until you press'))).toBe(true);
+  });
+
+  it('ignore patterns textarea persists the raw multi-line text', async () => {
+    await linkAndDisplay();
+    const area = findSetting('Ignore patterns').textarea!;
+    expect(area).not.toBeNull();
+    // The description documents the glob-lite syntax.
+    expect(findSetting('Ignore patterns').desc).toContain('**');
+
+    area.onChange('private/**\n*.tmp\n');
+    await flush();
+    expect(plugin.data.settings.ignorePatterns).toBe('private/**\n*.tmp\n');
+    expect(asMockPlugin(plugin).store).toMatchObject({
+      settings: { ignorePatterns: 'private/**\n*.tmp\n' },
+    });
+  });
+
+  it('diagnostics log-level dropdown offers info/debug/warn and persists', async () => {
+    await linkAndDisplay();
+    const dropdown = findSetting('Diagnostics log level').dropdown!;
+    expect(dropdown.options).toEqual({ info: 'info', debug: 'debug', warn: 'warn' });
+    expect(dropdown.value).toBe('info'); // the default
+
+    dropdown.onChange('debug');
+    await flush();
+    expect(plugin.data.settings.logLevel).toBe('debug');
+    expect(asMockPlugin(plugin).store).toMatchObject({ settings: { logLevel: 'debug' } });
+  });
+
+  it('Copy diagnostics reports where the bundle went (no clipboard → console)', async () => {
+    vi.stubGlobal('navigator', {}); // clipboard unavailable
+    try {
+      await linkAndDisplay();
+      await findButton('Copy diagnostics').click();
+      expect(Notice.messages.some((n) => n.message.includes('clipboard unavailable'))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // --- pause / resume buttons ------------------------------------------------------
+
+  it('Pause syncing flips the button and status readout; Resume restores', async () => {
+    await linkAndDisplay();
+    expect(findButton('Pause syncing')).toBeDefined();
+    expect(findSetting('Status').desc).not.toContain('State: paused');
+
+    await findButton('Pause syncing').click();
+
+    expect(plugin.syncingPaused).toBe(true);
+    expect(plugin.linked).toBe(true); // pause never unlinks
+    // Re-rendered: the button flipped and the readout says paused.
+    expect(findButton('Resume syncing')).toBeDefined();
+    expect(findLastSetting('Status').desc).toContain('State: paused');
+    expect(findLastSetting('Syncing paused').name).toBe('Syncing paused'); // label flips too
+
+    await findButton('Resume syncing').click();
+    expect(plugin.syncingPaused).toBe(false);
+    expect(findButton('Pause syncing')).toBeDefined();
+  });
+
+  // --- linked device rename (PATCH /device behind the button) ----------------------
+
+  it('Rename device: button PATCHes, updates data + marker, and re-renders', async () => {
+    fetcher.on('PATCH', '/device', (call) => {
+      const body = JSON.parse(String(call.init?.body)) as { name?: unknown };
+      return new Response(
+        JSON.stringify({ ok: true, device: { id: 'dev-1', name: body.name ?? '?', type: 'desktop' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    });
+    await linkAndDisplay();
+
+    findSetting('Device name').text!.onChange('Renamed Desk');
+    await findButton('Rename device').click();
+
+    const call = fetcher.calls.find((c) => c.url === 'https://w.example/device')!;
+    expect(call.init?.method).toBe('PATCH');
+    expect(JSON.parse(String(call.init?.body))).toEqual({ name: 'Renamed Desk' });
+    expect(plugin.data.deviceName).toBe('Renamed Desk');
+    expect(vault.adapter.files.has('.vaultsyncforagents/device.json')).toBe(true);
+    expect(
+      JSON.parse(
+        new TextDecoder().decode(vault.adapter.files.get('.vaultsyncforagents/device.json')),
+      ),
+    ).toMatchObject({ deviceName: 'Renamed Desk' });
+    // Re-rendered with the persisted name in the field.
+    expect(findLastSetting('Device name').text!.value).toBe('Renamed Desk');
+  });
+
+  // --- the About section --------------------------------------------------------------
+
+  it('About: versions + platform line, README link opens the project home', async () => {
+    const open = vi.fn();
+    vi.stubGlobal('window', { open });
+    try {
+      await linkAndDisplay();
+      const versions = findSetting('Versions');
+      expect(versions.desc).toContain('Plugin unknown'); // manifest {} in tests
+      expect(versions.desc).toContain(`protocol v1`); // core ProtocolVersion
+      expect(versions.desc).toContain('desktop');
+
+      await findButton('Open README').click();
+      expect(open).toHaveBeenCalledWith(
+        'https://github.com/vaultsyncforagents/vaultsyncforagents#readme',
+        '_blank',
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('About: storage line loads from /api/status with the device token', async () => {
+    fetcher.json('GET', '/api/status', 200, {
+      vaultName: 'personal',
+      devices: [{ id: 'dev-1', name: 'Desk', type: 'desktop', online: true, revoked: false }],
+      attachments: { count: 3, bytes: 1024 },
+      storageBytes: 2048,
+    });
+    await linkAndDisplay();
+    expect(findSetting('Vault storage').desc).toContain('Checking the worker');
+    // The fill is fire-and-forget async (fetch + response.json) — poll for it.
+    await vi.waitFor(
+      () => expect(findSetting('Vault storage').desc).toContain('Storage used: 2.0 KB'),
+      { timeout: 2000 },
+    );
+
+    expect(findSetting('Vault storage').desc).toContain('3 attachments');
+    const call = fetcher.calls.find((c) => c.url === 'https://w.example/api/status')!;
+    expect(((call.init?.headers ?? {}) as Record<string, string>)['authorization']).toBe(
+      'Bearer tok-1',
+    );
+  });
+
+  it('About: storage shows the unavailable fallback when the worker is down', async () => {
+    await linkAndDisplay();
+    // Unrouted fetch → null summary → the unavailable line.
+    await vi.waitFor(
+      () => expect(findSetting('Vault storage').desc).toContain('unavailable'),
+      { timeout: 2000 },
+    );
+  });
+
+  it('About (unlinked): storage prompts to pair instead of fetching', async () => {
+    tab.display();
+    expect(findSetting('Vault storage').desc).toContain('Pair this vault');
+    expect(fetcher.calls).toHaveLength(0);
+  });
+
+  // --- persistence across reload -----------------------------------------------------
+
+  it('every setting survives a plugin reload (data.json round-trip)', async () => {
+    // Exercise the real controls so the persisted shape is what the UI writes.
+    tab.display();
+    findSetting('Worker URL').text!.onChange('https://w.example');
+    findSetting('Device name').text!.onChange('MacBook');
+    await flush();
+
+    await linkAndDisplay({ deviceName: 'MacBook' }); // keep the typed name
+    findSetting('Rescan interval').dropdown!.onChange('60');
+    findSetting('Sync .obsidian/ folder').toggle!.onChange(true);
+    findSetting('Sync on startup').toggle!.onChange(false);
+    findSetting('Status bar indicator').dropdown!.onChange('compact');
+    findSetting('Ignore patterns').textarea!.onChange('private/**\n*.tmp');
+    findSetting('Diagnostics log level').dropdown!.onChange('debug');
+    await flush();
+
+    // A "reload": a fresh plugin instance loading the same data.json.
+    const { app: app2 } = makeFakeApp(new FakeVault());
+    const reloaded = new VaultSyncPlugin(app2 as unknown as App, {} as PluginManifest, {
+      fetchImpl: fetcher.fetchImpl,
+      wsFactory: offlineWsFactory,
+    });
+    asMockPlugin(reloaded).store = asMockPlugin(plugin).store;
+    await reloaded.onload();
+
+    expect(reloaded.data).toMatchObject({
+      url: 'https://w.example',
+      deviceName: 'MacBook',
+      settings: {
+        rescanIntervalSec: 60,
+        obsidianSync: true,
+        syncOnStartup: false,
+        statusBarMode: 'compact',
+        ignorePatterns: 'private/**\n*.tmp',
+        logLevel: 'debug',
+      },
+    });
+    reloaded.onunload();
   });
 });

@@ -253,6 +253,166 @@ describe('VaultSyncPlugin lifecycle', () => {
   });
 });
 
+describe('VaultSyncPlugin — "Sync on startup" OFF (manual-only mode)', () => {
+  beforeEach(() => {
+    resetObsidianMock();
+    FakeSocket.opened = [];
+  });
+  afterEach(() => {
+    for (const plugin of created.splice(0)) plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it('loads idle: no client, no dial, no status bar; toggling persists OFF', async () => {
+    vi.useFakeTimers();
+    const { plugin } = makePlugin({
+      store: {
+        ...LINKED,
+        settings: { rescanIntervalSec: 0, obsidianSync: false, syncOnStartup: false },
+      },
+    });
+    await plugin.onload();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(plugin.client).toBeNull(); // never connected
+    expect(FakeSocket.opened).toHaveLength(0); // not even one dial
+    expect(asMockPlugin(plugin).statusBarItems).toHaveLength(0);
+    expect(plugin.data.settings.syncOnStartup).toBe(false); // normalized, persisted
+
+    // Manual start: "Sync now" brings the machinery up (offline worker → the
+    // dial happens and the client settles disconnected, not absent).
+    await plugin.syncNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(plugin.client).not.toBeNull();
+    expect(FakeSocket.opened.length).toBeGreaterThanOrEqual(1);
+    expect(
+      Notice.messages.some(
+        (n) => n.message.includes('offline') || n.message.includes('up to date'),
+      ),
+    ).toBe(true);
+  });
+
+  it('defaults ON: a linked plugin connects on load (the contrast case)', async () => {
+    const { plugin } = makePlugin({
+      store: { ...LINKED, settings: { rescanIntervalSec: 0, obsidianSync: false } },
+    });
+    await plugin.onload();
+    await flush();
+    expect(plugin.data.settings.syncOnStartup).toBe(true);
+    expect(plugin.client).not.toBeNull();
+    expect(FakeSocket.opened.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('VaultSyncPlugin — pause / resume syncing', () => {
+  beforeEach(() => {
+    resetObsidianMock();
+    FakeSocket.opened = [];
+  });
+  afterEach(() => {
+    for (const plugin of created.splice(0)) plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  function statusBarText(plugin: VaultSyncPlugin): string {
+    const items = asMockPlugin(plugin).statusBarItems;
+    const live = items.filter((item) => !(item as { removed?: boolean }).removed);
+    return (live[live.length - 1] as unknown as { textContent: string }).textContent;
+  }
+
+  it('pause closes the transport, stops reconnects, shows "vsa ⏸"; syncNow refuses', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+    const { plugin } = makePlugin({ store: LINKED });
+    await plugin.onload();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(plugin.client!.status().state).toBe('disconnected');
+    await vi.advanceTimersByTimeAsync(1_000); // a reconnect may already be scheduled
+    const dialsAtPause = FakeSocket.opened.length;
+
+    plugin.pauseSyncing();
+
+    expect(plugin.syncingPaused).toBe(true);
+    // Link and client survive (closed to idle, NOT unlinked).
+    expect(plugin.client).not.toBeNull();
+    expect(plugin.client!.status().state).toBe('idle');
+    expect(plugin.linked).toBe(true);
+    // The indicator repaints with the pause glyph.
+    expect(statusBarText(plugin)).toBe('vsa ⏸');
+    expect(Notice.messages.some((n) => n.message.includes('paused'))).toBe(true);
+
+    // No reconnect dials while paused — even minutes later.
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(FakeSocket.opened.length).toBe(dialsAtPause);
+
+    // "Sync now" refuses instead of syncing.
+    await plugin.syncNow();
+    expect(Notice.messages.some((n) => n.message.includes('resume'))).toBe(true);
+    expect(FakeSocket.opened.length).toBe(dialsAtPause);
+
+    // Pause is idempotent.
+    expect(() => plugin.pauseSyncing()).not.toThrow();
+    expect(FakeSocket.opened.length).toBe(dialsAtPause);
+  });
+
+  it('resume clears the pause, reconnects, and re-enters the normal loop', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+    const { plugin } = makePlugin({ store: LINKED });
+    await plugin.onload();
+    await vi.advanceTimersByTimeAsync(0);
+
+    plugin.pauseSyncing();
+    await vi.advanceTimersByTimeAsync(60_000);
+    const dialsWhilePaused = FakeSocket.opened.length;
+
+    await plugin.resumeSyncing();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(plugin.syncingPaused).toBe(false);
+    expect(plugin.client).not.toBeNull();
+    // The catch-up cycle dialed the worker again (offline factory: it fails,
+    // but the DIAL is the proof of reconnection).
+    expect(FakeSocket.opened.length).toBeGreaterThan(dialsWhilePaused);
+    expect(Notice.messages.some((n) => n.message.includes('resuming'))).toBe(true);
+
+    // And reconnect backoff resumes with the resumed client.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(FakeSocket.opened.length).toBeGreaterThan(dialsWhilePaused + 1);
+  });
+});
+
+describe('VaultSyncPlugin — status-bar indicator modes', () => {
+  beforeEach(() => {
+    resetObsidianMock();
+    FakeSocket.opened = [];
+  });
+  afterEach(() => {
+    for (const plugin of created.splice(0)) plugin.onunload();
+    vi.useRealTimers();
+  });
+
+  it('applyStatusBarMode("hidden") removes the item; "compact" mounts a compact one', async () => {
+    vi.useFakeTimers();
+    const { plugin } = makePlugin({ store: LINKED });
+    await plugin.onload();
+    await vi.advanceTimersByTimeAsync(0);
+    const items = asMockPlugin(plugin).statusBarItems;
+    expect(items).toHaveLength(1);
+    expect((items[0] as unknown as { removed: boolean }).removed).toBe(false);
+
+    await plugin.applyStatusBarMode('hidden');
+    expect(plugin.data.settings.statusBarMode).toBe('hidden');
+    expect(asMockPlugin(plugin).store).toMatchObject({ settings: { statusBarMode: 'hidden' } });
+    expect((items[0] as unknown as { removed: boolean }).removed).toBe(true);
+    expect(items).toHaveLength(1); // nothing new was mounted
+
+    await plugin.applyStatusBarMode('compact');
+    expect(items).toHaveLength(2); // a fresh item replaced the removed one
+    const compact = items[1] as unknown as { removed: boolean; textContent: string };
+    expect(compact.removed).toBe(false);
+    expect(compact.textContent).toBe('vsa ✗'); // compact offline line (no "offline")
+  });
+});
+
 describe('fetch seam — detached invocation (real-Obsidian illegal-invocation regression)', () => {
   beforeEach(() => {
     resetObsidianMock();

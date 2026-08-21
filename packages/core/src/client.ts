@@ -284,7 +284,15 @@ export class SyncClient {
         }),
     );
     if (helloAck.type === 'error') throw this.toError(helloAck);
-    this.ignoreSettings = { obsidianSync: helloAck.settings.obsidianSync };
+    // The server's per-vault `obsidianSync` supersedes the local initial
+    // value, but `extraIgnores` is a client-side concern — the worker never
+    // sends it, so the locally configured patterns survive the handshake.
+    this.ignoreSettings = {
+      obsidianSync: helloAck.settings.obsidianSync,
+      ...(this.ignoreSettings.extraIgnores !== undefined
+        ? { extraIgnores: this.ignoreSettings.extraIgnores }
+        : {}),
+    };
 
     this.state = 'syncing';
     await this.runCycle();

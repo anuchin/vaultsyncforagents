@@ -20,7 +20,9 @@ export interface SettingRecord {
   name: string;
   desc: string;
   className: string | null;
+  heading: boolean;
   text: { value: string; placeholder: string; onChange: (value: string) => void } | null;
+  textarea: { value: string; placeholder: string; onChange: (value: string) => void } | null;
   toggle: { value: boolean; onChange: (value: boolean) => void } | null;
   dropdown: { value: string; options: Record<string, string>; onChange: (value: string) => void } | null;
   buttons: ButtonRecord[];
@@ -35,7 +37,9 @@ export class Setting {
       name: '',
       desc: '',
       className: null,
+      heading: false,
       text: null,
+      textarea: null,
       toggle: null,
       dropdown: null,
       buttons: [],
@@ -58,6 +62,12 @@ export class Setting {
     return this;
   }
 
+  /** Section headings (name-only Settings styled as headings). */
+  setHeading(): this {
+    this.record.heading = true;
+    return this;
+  }
+
   // Component methods chain on the *component* in the real API
   // (`text.setPlaceholder(…).setValue(…)`), so each stub returns itself —
   // never the enclosing Setting.
@@ -65,6 +75,28 @@ export class Setting {
   addText(callback: (component: TextComponentStub) => unknown): this {
     const state = { value: '', placeholder: '', onChange: (_value: string) => {} };
     this.record.text = state;
+    const stub: TextComponentStub = {
+      setPlaceholder: (placeholder: string) => {
+        state.placeholder = placeholder;
+        return stub;
+      },
+      setValue: (value: string) => {
+        state.value = value;
+        return stub;
+      },
+      onChange: (fn: (value: string) => void) => {
+        state.onChange = fn;
+        return stub;
+      },
+    };
+    callback(stub);
+    return this;
+  }
+
+  /** Multi-line text (the Ignore patterns setting). Same stub shape as text. */
+  addTextArea(callback: (component: TextComponentStub) => unknown): this {
+    const state = { value: '', placeholder: '', onChange: (_value: string) => {} };
+    this.record.textarea = state;
     const stub: TextComponentStub = {
       setPlaceholder: (placeholder: string) => {
         state.placeholder = placeholder;

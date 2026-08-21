@@ -38,7 +38,7 @@ const SESSION_COOKIE_MAX_AGE = 12 * 60 * 60; // seconds — matches the DO's 12 
  * 421 unclaimed gate (and never fall through to SPA asset serving).
  */
 const API_PATH_PREFIXES = ['/api/', '/blob/', '/admin/'];
-const API_PATH_EXACT = new Set(['/ws', '/sync', '/pair']);
+const API_PATH_EXACT = new Set(['/ws', '/sync', '/pair', '/device']);
 
 function isApiPath(path: string): boolean {
   return API_PATH_EXACT.has(path) || API_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
@@ -54,14 +54,14 @@ function isApiPath(path: string): boolean {
  */
 const PLUGIN_CORS_HEADERS: Record<string, string> = {
   'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
+  'access-control-allow-methods': 'GET, POST, PUT, PATCH, OPTIONS',
   'access-control-allow-headers': 'Authorization, Content-Type',
   'access-control-max-age': '86400',
 };
 
 /** Paths the plugin's cross-origin renderer talks to. */
 function isPluginCorsPath(path: string): boolean {
-  return path === '/health' || path === '/pair' || path.startsWith('/blob/');
+  return path === '/health' || path === '/pair' || path === '/device' || path.startsWith('/blob/');
 }
 
 /** Copy `response` (DO-fetched responses are header-immutable) with CORS. */
@@ -145,6 +145,18 @@ export default {
 
     if (request.method === 'POST' && path === '/pair') {
       return withPluginCors(await roomPost(env, '/pair', await readJsonBody(request), clientIpHeaders(request)));
+    }
+    if (request.method === 'PATCH' && path === '/device') {
+      // Device self-service rename (the settings tab's "Rename device"):
+      // authenticated by the caller's own Bearer device token — an admin
+      // session cookie is deliberately NOT forwarded as authorization.
+      return withPluginCors(
+        await roomFetch(env, '/device', {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json', ...authForwardHeaders(request) },
+          body: JSON.stringify(await readJsonBody(request)),
+        }),
+      );
     }
     if (request.method === 'POST' && path === '/admin/login') {
       return handleAdminLogin(request, env);

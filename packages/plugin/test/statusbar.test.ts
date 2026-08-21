@@ -59,6 +59,45 @@ describe('statusLineFor', () => {
   });
 });
 
+describe('statusLineFor — indicator modes (the "Status bar indicator" setting)', () => {
+  const now = 1_000_000;
+
+  it('compact drops the trailing detail on every line', () => {
+    expect(statusLineFor(status({ lastSyncAt: now - 12_000 }), now, 'compact')).toBe('vsa ✓');
+    expect(statusLineFor(status({ state: 'disconnected' }), now, 'compact')).toBe('vsa ✗');
+    expect(
+      statusLineFor(status({ conflicts: [conflict('/a.md')] }), now, 'compact'),
+    ).toBe('vsa ⚠');
+    expect(statusLineFor(status({ state: 'connecting' }), now, 'compact')).toBe('vsa ⋯');
+  });
+
+  it('detailed is the default (and the explicit mode behaves the same)', () => {
+    expect(statusLineFor(status({ lastSyncAt: now - 12_000 }), now)).toBe('vsa ✓ 12s');
+    expect(statusLineFor(status({ lastSyncAt: now - 12_000 }), now, 'detailed')).toBe('vsa ✓ 12s');
+  });
+
+  it('paused wins over every state: "vsa ⏸" in both detail levels', () => {
+    for (const mode of ['detailed', 'compact'] as const) {
+      expect(statusLineFor(status({ state: 'live' }), now, mode, true)).toBe('vsa ⏸');
+      expect(statusLineFor(status({ state: 'disconnected' }), now, mode, true)).toBe('vsa ⏸');
+      expect(
+        statusLineFor(status({ conflicts: [conflict('/a.md')] }), now, mode, true),
+      ).toBe('vsa ⏸');
+    }
+  });
+});
+
+describe('statusTooltipFor — paused headline', () => {
+  it('leads with "paused" when the context says so', () => {
+    const tooltip = statusTooltipFor(
+      status({ state: 'live' }),
+      { url: 'https://w.example', deviceName: 'D', paused: true },
+      1_000_000,
+    );
+    expect(tooltip).toContain('VaultSync for Agents — paused');
+  });
+});
+
 describe('statusClassFor / tooltip', () => {
   it('maps states to modifier classes', () => {
     expect(statusClassFor(status({ state: 'disconnected' }))).toBe('vsa-error');
@@ -118,5 +157,40 @@ describe('StatusBarIndicator', () => {
     expect(item.textContent).toBe('vsa ✗ offline');
     expect(item.classes.has('vsa-warn')).toBe(false);
     expect(item.classes.has('vsa-error')).toBe(true);
+  });
+
+  it('honors the context mode and paused flag (the settings dropdown / pause button)', () => {
+    const item: StatusItemLike & { classes: Set<string>; attributes: Record<string, string> } = {
+      textContent: '',
+      classes: new Set(),
+      attributes: {},
+      addClass(cls) {
+        this.classes.add(cls);
+      },
+      removeClass(cls) {
+        this.classes.delete(cls);
+      },
+      setAttribute(name, value) {
+        this.attributes[name] = value;
+      },
+    };
+    const indicator = new StatusBarIndicator(item);
+
+    // Compact via the context (what the plugin passes after applyStatusBarMode).
+    indicator.update(
+      status({ lastSyncAt: 988_000 }),
+      { url: 'https://w.example', deviceName: 'D', mode: 'compact' },
+      1_000_000,
+    );
+    expect(item.textContent).toBe('vsa ✓');
+
+    // Paused: the pause glyph, "paused" tooltip headline — state is secondary.
+    indicator.update(
+      status({ state: 'live' }),
+      { url: 'https://w.example', deviceName: 'D', paused: true },
+      1_000_000,
+    );
+    expect(item.textContent).toBe('vsa ⏸');
+    expect(item.attributes['title']).toContain('paused');
   });
 });

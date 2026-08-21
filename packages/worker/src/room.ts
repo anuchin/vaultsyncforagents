@@ -599,6 +599,7 @@ export class VaultRoom extends DurableObject<Env> {
     if (request.method === 'POST' && path === '/admin/pair') return this.httpAdminPair(request);
     if (request.method === 'POST' && path === '/admin/revoke') return this.httpAdminRevoke(request);
     if (request.method === 'POST' && path === '/pair') return this.httpPair(request);
+    if (request.method === 'PATCH' && path === '/device') return this.httpDeviceRename(request);
     if (request.method === 'GET' && path === '/api/status') return this.httpStatus(request);
     if (request.method === 'GET' && path === '/api/history') return this.httpHistory(request, url);
     if (request.method === 'POST' && path === '/internal/auth') return this.httpInternalAuth(request);
@@ -755,6 +756,42 @@ export class VaultRoom extends DurableObject<Env> {
     this.appendEvent(now, deviceId, 'device_paired', body.deviceName.trim(), null);
     this.authFailures.delete(ip);
     return json(200, { ok: true, token, deviceId });
+  }
+
+  /**
+   * `PATCH /device` — device self-service rename (the plugin settings tab's
+   * "Rename device" button). Device tokens ONLY: the Bearer token identifies
+   * the one device being renamed (a `deviceId` in the body is ignored — the
+   * token can never reach another device), and an admin session cookie is
+   * deliberately not accepted here; admin-side renames would be a separate,
+   * admin-scoped route.
+   */
+  private async httpDeviceRename(request: Request): Promise<Response> {
+    const auth = await this.authenticateHttpRequest(request);
+    if (!auth.ok || auth.kind !== 'device') {
+      return json(401, { error: 'device token required (admin sessions cannot rename devices)' });
+    }
+    const body = (await request.json().catch(() => null)) as { name?: unknown } | null;
+    const name = typeof body?.name === 'string' ? body.name.trim() : '';
+    if (name === '' || name.length > 30 || /[\u0000-\u001f\u007f]/.test(name)) {
+      return json(400, { error: 'name must be 1-30 characters, without control characters' });
+    }
+    const now = this.now();
+    const row = this.sql('SELECT name FROM devices WHERE id = ?', auth.deviceId).toArray()[0];
+    const previous = row?.name as string | undefined;
+    this.sql('UPDATE devices SET name = ?, last_seen = ? WHERE id = ?', name, now, auth.deviceId);
+    this.appendEvent(
+      now,
+      auth.deviceId,
+      'device_renamed',
+      null,
+      JSON.stringify({ from: previous ?? null, to: name }),
+    );
+    const device = this.sql('SELECT id, name, type FROM devices WHERE id = ?', auth.deviceId).toArray()[0];
+    return json(200, {
+      ok: true,
+      device: { id: device?.id ?? auth.deviceId, name: device?.name ?? name, type: device?.type ?? 'desktop' },
+    });
   }
 
   /** Status document for the dashboard/CLI (FR-31). */

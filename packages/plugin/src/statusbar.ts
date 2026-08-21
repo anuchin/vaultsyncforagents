@@ -6,11 +6,18 @@
  *   vsa ✓ 12s          live, last completed cycle 12 s ago
  *   vsa ⚠ conflicts: 2 conflicts observed (conflict copies exist in the vault)
  *   vsa ✗ offline      disconnected (reconnect backoff running)
+ *   vsa ⏸              syncing paused (the Pause syncing setting)
+ *
+ * Compact mode drops the trailing detail ("vsa ✓ 12s" → "vsa ✓", etc.);
+ * Hidden mode removes the item entirely (the plugin never mounts it).
  *
  * The tooltip carries the detail: state, worker URL, device, last sync, pending.
  */
 
 import type { SyncClientStatus } from '@vsa/core';
+
+/** How the status-bar indicator renders (the "Status bar indicator" setting). */
+export type StatusBarMode = 'detailed' | 'compact' | 'hidden';
 
 /** The slice of HTMLElement the indicator touches (tests pass a plain object). */
 export interface StatusItemLike {
@@ -25,6 +32,10 @@ export interface StatusContext {
   deviceName: string;
   /** Extra line (e.g. an auth failure note) appended to the tooltip. */
   note?: string;
+  /** Syncing is paused (the Pause syncing button) — shows "vsa ⏸". */
+  paused?: boolean;
+  /** Indicator mode (the plugin's status bar setting); default detailed. */
+  mode?: StatusBarMode;
 }
 
 /** `now - since`, floored: `12s`, `5m`, `3h` — display only. */
@@ -36,17 +47,29 @@ export function formatSince(elapsedMs: number): string {
   return `${Math.floor(minutes / 60)}h`;
 }
 
-/** The one-line status text for a client status at time `now`. */
-export function statusLineFor(status: SyncClientStatus, now: number): string {
+/**
+ * The one-line status text for a client status at time `now`. `mode` shrinks
+ * the line (compact drops the trailing detail); `paused` wins over everything.
+ */
+export function statusLineFor(
+  status: SyncClientStatus,
+  now: number,
+  mode: StatusBarMode = 'detailed',
+  paused = false,
+): string {
+  if (paused) return 'vsa ⏸';
+  const compact = mode === 'compact';
   switch (status.state) {
     case 'connecting':
     case 'syncing':
       return 'vsa ⋯';
     case 'disconnected':
-      return 'vsa ✗ offline';
+      return compact ? 'vsa ✗' : 'vsa ✗ offline';
     case 'live':
-      if (status.conflicts.length > 0) return `vsa ⚠ conflicts: ${status.conflicts.length}`;
-      if (status.lastSyncAt === null) return 'vsa ✓';
+      if (status.conflicts.length > 0) {
+        return compact ? 'vsa ⚠' : `vsa ⚠ conflicts: ${status.conflicts.length}`;
+      }
+      if (status.lastSyncAt === null || compact) return 'vsa ✓';
       return `vsa ✓ ${formatSince(now - status.lastSyncAt)}`;
     case 'idle':
       return 'vsa';
@@ -62,7 +85,8 @@ export function statusTooltipFor(status: SyncClientStatus, context: StatusContex
     live: 'live',
     disconnected: 'offline — reconnecting',
   };
-  const lines = [`VaultSync for Agents — ${stateLabel[status.state]}`];
+  const headline = context.paused === true ? 'paused' : stateLabel[status.state];
+  const lines = [`VaultSync for Agents — ${headline}`];
   if (context.url !== '') lines.push(`Worker: ${context.url}`);
   if (context.deviceName !== '') lines.push(`Device: ${context.deviceName}`);
   lines.push(
@@ -98,7 +122,7 @@ export class StatusBarIndicator {
   constructor(private readonly item: StatusItemLike) {}
 
   update(status: SyncClientStatus, context: StatusContext, now: number): void {
-    this.item.textContent = statusLineFor(status, now);
+    this.item.textContent = statusLineFor(status, now, context.mode ?? 'detailed', context.paused === true);
     this.item.addClass?.(StatusBarIndicator.BASE_CLASS);
     const modifier = statusClassFor(status);
     for (const cls of StatusBarIndicator.MODIFIER_CLASSES) {

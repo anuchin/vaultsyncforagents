@@ -77,4 +77,11 @@ export interface VaultSettings {
   obsidianSync: boolean;
   /** Display name chosen at claim time. */
   displayName: string;
+  /**
+   * Client-side extra ignore patterns (the plugin's "Ignore patterns"
+   * setting). Deliberately NOT worker-authoritative: the server never sets
+   * it in `helloAck`, and `SyncClient` preserves its own value across the
+   * handshake supersede — ignores are a per-device concern.
+   */
+  extraIgnores?: readonly string[];
 }

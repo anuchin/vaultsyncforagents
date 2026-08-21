@@ -76,3 +76,63 @@ describe('isIgnored — ordinary content is never ignored', () => {
     expect(() => isIgnored('../escape.md', SYNC_OFF)).toThrow();
   });
 });
+
+describe('isIgnored — extraIgnores patterns (glob-lite)', () => {
+  const withExtras = (patterns: readonly string[]) => ({
+    obsidianSync: false,
+    extraIgnores: patterns,
+  });
+
+  it('dir/** excludes a folder and everything beneath it', () => {
+    const settings = withExtras(['private/**']);
+    expect(isIgnored('private/secret.md', settings)).toBe(true);
+    expect(isIgnored('/private/deep/nested/x.md', settings)).toBe(true);
+    expect(isIgnored('private', settings)).toBe(true); // the folder itself
+    expect(isIgnored('private/notes', settings)).toBe(true);
+  });
+
+  it('a bare name pattern matches file names at any depth', () => {
+    const settings = withExtras(['*.tmp']);
+    expect(isIgnored('scratch.tmp', settings)).toBe(true);
+    expect(isIgnored('notes/deep/draft.tmp', settings)).toBe(true);
+    expect(isIgnored('scratch.tmpx', settings)).toBe(false); // must anchor the name
+    expect(isIgnored('tmp', settings)).toBe(false); // literal 'tmp' alone
+  });
+
+  it('patterns containing / are anchored at the vault root', () => {
+    const settings = withExtras(['notes/*.md']);
+    expect(isIgnored('notes/a.md', settings)).toBe(true);
+    expect(isIgnored('deep/notes/a.md', settings)).toBe(false); // only the root notes/
+    expect(isIgnored('notes/sub/a.md', settings)).toBe(false); // * stays in one segment
+  });
+
+  it('** spans segments anywhere in the pattern', () => {
+    const drafts = withExtras(['**/drafts/*.md']);
+    expect(isIgnored('drafts/a.md', drafts)).toBe(true);
+    expect(isIgnored('projects/x/drafts/a.md', drafts)).toBe(true);
+    expect(isIgnored('projects/x/notes/a.md', drafts)).toBe(false);
+
+    const mid = withExtras(['a/**/b.md']);
+    expect(isIgnored('a/b.md', mid)).toBe(true); // ** may consume zero segments
+    expect(isIgnored('a/x/y/b.md', mid)).toBe(true);
+    expect(isIgnored('x/a/b.md', mid)).toBe(false); // anchored
+  });
+
+  it('matches case-insensitively and tolerates slashes and blanks', () => {
+    const settings = withExtras(['  Private/**  ', '', '   ', '/Drafts/*.MD']);
+    expect(isIgnored('/PRIVATE/secret.md', settings)).toBe(true);
+    expect(isIgnored('drafts/Note.md', settings)).toBe(true);
+  });
+
+  it('combines with the built-in rules (either can exclude)', () => {
+    const settings = { obsidianSync: true, extraIgnores: ['secrets/**'] };
+    expect(isIgnored('.obsidian/workspace.json', settings)).toBe(true); // built-in wins
+    expect(isIgnored('secrets/key.txt', settings)).toBe(true); // extra wins
+    expect(isIgnored('notes/plain.md', settings)).toBe(false);
+  });
+
+  it('an empty or absent list changes nothing', () => {
+    expect(isIgnored('private/x.md', withExtras([]))).toBe(false);
+    expect(isIgnored('private/x.md', SYNC_OFF)).toBe(false);
+  });
+});
