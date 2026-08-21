@@ -72,6 +72,8 @@ Why this shape (vs alternatives considered — see §15 Decision log):
 
 Admin authentication for the dashboard: passphrase → worker issues a signed session cookie (HMAC with a worker secret). One admin per worker; devices are the only other identity (this is single-user by design).
 
+Guessing is throttled where trust is absent: `POST /pair` and `POST /admin/login` failures are budgeted per client IP (10 failures / 15 min → `429` + `Retry-After`); pairing codes are 40-bit one-time codes with a 10-min TTL.
+
 ## 4. Sync model
 
 **Unit:** the file. Notes and attachments are both whole files; there is no delta sync in v1.
@@ -81,7 +83,7 @@ Admin authentication for the dashboard: passphrase → worker issues a signed se
 **Versioning & LWW:** each file has a version chain in the DO. A commit names its parent version. If the parent is the current head → fast-path apply. If not (concurrent edit happened) → **conflict**:
 
 - Winner = higher logical clock; tie broken by device id (stable, deterministic on every client).
-- Loser content is **never deleted**: per the settled policy, a **conflict copy file** is synthesized server-side as a normal file event — `Note (conflict 2026-08-20 14-23 - from Phone).md` — so every client materializes it identically.
+- Loser content is **never deleted**: per the settled policy, a **conflict copy file** is synthesized server-side as a normal file event — `Note (conflict 2026-08-20 14-23 - from Phone).md` — so every client materializes it identically. Same-note/same-device/same-minute collisions get ` 2`…` 999` suffixes before the extension, synthesized server-side so all clients materialize identical names.
 - Clocks are per-file monotonic versions maintained by the DO, with per-device counters for tie-breaking. Wall-clock time is display-only, never authoritative.
 
 **Deletes:** tombstones in the index (files stay recoverable from history). The daemon moves locally-deleted files to `.trash/` before tombstoning (v1 pattern, carried from RVA); remote deletes land in clients' `.trash/` too.
@@ -115,7 +117,7 @@ Two channels to the worker, both token-authenticated:
 
 **HTTPS routes (worker, streamed)** — content and admin:
 
-- `GET/PUT /blob/:hash` — stream to/from R2; PUT is idempotent (same hash ⇒ same content); enforced size cap ~100 MB (Workers request limit; YAOS capped 10 MB — we're 10× that, chunked uploads later if demanded).
+- `GET/PUT /blob/:hash` — stream to/from R2; PUT is idempotent (same hash ⇒ same content) and verifies the streamed body actually hashes to `:hash` while it flows (DigestStream; mismatch → `422` and the stored object is evicted — R2-side checksums would catch a corrupted put as a second net); enforced size cap ~100 MB (Workers request limit; YAOS capped 10 MB — we're 10× that, chunked uploads later if demanded).
 - `GET /health` — liveness + claimed state (for `vsa doctor` and uptime checks).
 - `GET /api/status` — dashboard/CLI data: engine health, devices with last-seen, last synced edit, attachment count, R2 bytes used, recent events.
 - Claim/pairing endpoints (`POST /claim`, `POST /pair`, admin session login).
@@ -136,7 +138,7 @@ meta     (key, value)                                -- claim state, admin hash,
                                                      -- settings, global seq
 ```
 
-The DO is the only writer; SQLite transactions make commit+conflict-check atomic. DO storage holds *metadata only* (a 100k-file vault is a few MB); content lives in R2.
+The DO is the only writer; SQLite transactions make commit+conflict-check atomic. DO storage holds *metadata only* (a 100k-file vault is a few MB); content lives in R2. `events` is pruned — rows older than 30 days and beyond the newest 10,000, by the weekly GC cron plus opportunistically on writes — while `versions` is kept forever by design (FR-7: history is the product).
 
 ## 7. R2 layout & garbage collection
 
@@ -152,7 +154,7 @@ Every version of every file is kept (FR-7) — CAS makes old versions cost nothi
 
 1. Load persisted local index (`.vaultsyncforagents/state` inside the vault — synced-ignored).
 2. Connect WS (`hello {cursor}`); receive manifest delta since cursor.
-3. Scan local tree; hash each file (blake3, parallel); diff against local index → local changes made while the client was offline (including external edits made with Obsidian closed).
+3. Scan local tree; **mtime+size pre-filter** — files whose recorded size+mtime match the index skip re-hashing; legacy/unknown-mtime entries hash once (sha256 via WebCrypto, parallel) and then go fast; a full re-hash remains available for `vsa doctor`. Diff against local index → local changes made while the client was offline (including external edits made with Obsidian closed).
 4. Three-way resolve against the manifest: local-only change → commit; remote-only change → fetch blob (WS inline or `/blob/:hash`) → write; both changed → conflict path (§4).
 5. Writes go through the platform adapter (Obsidian `vault.modify` / Node fs with atomic write + fsync) — open editors refresh automatically.
 
@@ -238,6 +240,8 @@ Every user self-hosts in their own account, so load is inherently distributed.
 
 - Transport: HTTPS/WSS everywhere. Worker sees plaintext — it lives in the user's own Cloudflare account; threat model excludes the account owner and treats Cloudflare as the host (same trust class as Obsidian Sync's relay, minus the vendor).
 - Device tokens: 256-bit random, stored hashed (SHA-256) in DO; revocation is server-side instant. Pairing codes: one-time, 10-min TTL, hashed, admin-issued only.
+- Guessing surfaces (`POST /pair`, `POST /admin/login`): failures throttled per client IP — 10 failures / 15 min → `429` + `Retry-After`. Codes are 40-bit one-time with a 10-min TTL.
+- Known limitation: path case-collisions across case-insensitive (Windows/macOS) and case-sensitive (Linux daemon) clients are not arbitrated — avoid case-only renames or duplicates in one vault.
 - Admin: argon2 passphrase hash in DO; signed session cookies.
 - Abuse surface is small: unclaimed workers answer `421` on everything except the claim page; claim is a single passphrase set (first-writer-wins, race-guarded by the DO transaction).
 - **E2E later:** encrypt blob payloads + optional filename obfuscation client-side; CAS dedup survives (bucket-scoped keys); dashboard is metadata-only by design, so it is unaffected. No protocol reshape required — this is why content is blobs end-to-end.

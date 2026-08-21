@@ -57,6 +57,28 @@ export const GC_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Blob size cap on the WS channel (the HTTP route enforces its own cap). */
 const WS_BLOB_MAX_BYTES = 100 * 1024 * 1024;
 
+/**
+ * Per-IP throttle on the unauthenticated guessing surfaces — `POST /pair`
+ * and `POST /admin/login` (§3, §14): at most 10 failures per client IP per
+ * 15-minute window, then 429 + `Retry-After` until the window closes.
+ */
+const AUTH_FAILURE_LIMIT = 10;
+const AUTH_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Events pruning policy (§6): the event log is a feed, not a ledger — drop
+ * rows older than 30 days and everything beyond the newest 10,000 (whichever
+ * prunes more). Versions are untouched: history is kept forever (FR-7).
+ */
+const EVENT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const EVENT_KEEP_MAX = 10_000;
+/**
+ * Opportunistic prune cadence: the hourly watermark rides `meta` (one
+ * point-lookup per event write — cheaper than the INSERT it accompanies);
+ * the weekly GC cron prunes unconditionally as the second net.
+ */
+const EVENT_PRUNE_MIN_INTERVAL_MS = 60 * 60 * 1000;
+
 /** argon2id parameters (OWASP Password Storage Cheat Sheet: 19 MiB, t=2, p=1). */
 const ARGON2_PARAMS = { t: 2, m: 19456, p: 1, dkLen: 32 } as const;
 
@@ -132,6 +154,14 @@ function normalizeCode(code: string): string {
   return code.toUpperCase().replace(/[-\s]/g, '');
 }
 
+/**
+ * Client IP of a forwarded request — the worker forwards `CF-Connecting-IP`
+ * so the DO can throttle per IP; anything unattributable shares `'unknown'`.
+ */
+function clientIpOf(request: Request): string {
+  return request.headers.get('cf-connecting-ip') ?? 'unknown';
+}
+
 async function hmacHex(secret: Uint8Array, message: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -180,6 +210,37 @@ export class VaultRoom extends DurableObject<Env> {
   /** Serializes every mutating handler (see module doc). */
   private queueTail: Promise<unknown> = Promise.resolve();
   private schemaReady: Promise<void> | null = null;
+
+  /**
+   * Time seam: the wall clock unless pinned by tests (`setTimeForTests`) —
+   * rate-limit windows, event ages, and conflict stamps stay deterministic
+   * under test. Production always reads `Date.now()`.
+   */
+  private pinnedTime: number | null = null;
+
+  /**
+   * Per-IP auth-failure counters for the guessing surfaces (§3, §14). In
+   * memory by design: isolate lifetime is the right scope, and every access
+   * rides `runExclusive`, so increments are atomic.
+   */
+  private authFailures = new Map<string, { count: number; windowStart: number }>();
+
+  // --- clock ------------------------------------------------------------------------------
+
+  /** The DO's clock: the wall clock unless pinned for tests (see seam). */
+  private now(): number {
+    return this.pinnedTime ?? Date.now();
+  }
+
+  /** Test seam: pin the clock (or release it with `null`) inside the DO. */
+  setTimeForTests(ms: number | null): void {
+    this.pinnedTime = ms;
+  }
+
+  /** Test seam: drop in-memory auth-failure counters (`helpers.resetAll`). */
+  clearAuthFailuresForTests(): void {
+    this.authFailures.clear();
+  }
 
   override async fetch(request: Request): Promise<Response> {
     await this.ensureSchema();
@@ -240,7 +301,7 @@ export class VaultRoom extends DurableObject<Env> {
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     const attachment = this.readAttachment(ws);
     if (attachment.deviceId !== null) {
-      this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', Date.now(), attachment.deviceId);
+      this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', this.now(), attachment.deviceId);
     }
     try {
       ws.close(code, reason);
@@ -276,7 +337,7 @@ export class VaultRoom extends DurableObject<Env> {
       return;
     }
     // Heartbeat: every authenticated message refreshes lastSeen (FR-31).
-    this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', Date.now(), attachment.deviceId);
+    this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', this.now(), attachment.deviceId);
     switch (message.type) {
       case 'getManifest':
         this.handleGetManifest(ws, message.since);
@@ -317,7 +378,7 @@ export class VaultRoom extends DurableObject<Env> {
       this.failWs(ws, 'PROTOCOL', `protocol version ${message.protocolVersion} not supported`);
       return;
     }
-    const now = Date.now();
+    const now = this.now();
     ws.serializeAttachment({ deviceId: device.id } satisfies SocketAttachment);
     this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', now, device.id);
     const vaultName = (await this.getMeta('vault_name')) ?? '';
@@ -372,7 +433,7 @@ export class VaultRoom extends DurableObject<Env> {
     message: CommitMessage,
   ): Promise<void> {
     const deviceId = attachment.deviceId as string;
-    const now = Date.now();
+    const now = this.now();
 
     // 1. Validate the content claim (mirrors InMemorySyncServer exactly).
     const inlineBytes = await this.verifyCommitContent(ws, message);
@@ -488,7 +549,7 @@ export class VaultRoom extends DurableObject<Env> {
       this.failWs(ws, 'NOT_FOUND', `blob ${message.hash} was not uploaded before commit`);
       return null;
     }
-    this.upsertBlob(message.hash, r2obj.size, now());
+    this.upsertBlob(message.hash, r2obj.size, this.now());
     return undefined;
   }
 
@@ -509,7 +570,7 @@ export class VaultRoom extends DurableObject<Env> {
       return;
     }
     await this.env.BUCKET.put(blobKey(hash), bytes);
-    this.upsertBlob(hash, bytes.byteLength, now());
+    this.upsertBlob(hash, bytes.byteLength, this.now());
     this.safeSend(ws, { type: 'blobAck', hash });
   }
 
@@ -544,6 +605,7 @@ export class VaultRoom extends DurableObject<Env> {
     if (request.method === 'POST' && path === '/internal/blob-uploaded') return this.httpBlobUploaded(request);
     if (request.method === 'GET' && path === '/internal/gc') return this.httpGcList();
     if (request.method === 'POST' && path === '/internal/gc-purge') return this.httpGcPurge(request);
+    if (request.method === 'POST' && path === '/internal/events-prune') return this.httpEventsPrune();
     return json(404, { error: 'not found' });
   }
 
@@ -565,7 +627,7 @@ export class VaultRoom extends DurableObject<Env> {
       return json(409, { error: 'this worker has already been claimed' });
     }
 
-    const now = Date.now();
+    const now = this.now();
     const salt = randomBytes(16);
     const hashBytes = argon2id(new TextEncoder().encode(body.passphrase), salt, { ...ARGON2_PARAMS });
     await this.setMeta(
@@ -590,13 +652,18 @@ export class VaultRoom extends DurableObject<Env> {
   }
 
   private async httpAdminLogin(request: Request): Promise<Response> {
+    const ip = clientIpOf(request);
+    const throttled = this.authThrottle(ip);
+    if (throttled !== null) return throttled;
     const body = (await request.json().catch(() => null)) as { passphrase?: unknown } | null;
     if (body === null || typeof body.passphrase !== 'string') {
       return json(400, { error: 'passphrase is required' });
     }
     if (!(await this.verifyAdminPassphrase(body.passphrase))) {
+      this.noteAuthFailure(ip, this.now());
       return json(401, { error: 'invalid passphrase' });
     }
+    this.authFailures.delete(ip);
     const { value, expiresAt } = await this.signSession();
     return json(200, { ok: true, cookie: value, expiresAt });
   }
@@ -610,7 +677,7 @@ export class VaultRoom extends DurableObject<Env> {
       return json(400, { error: 'deviceName is required' });
     }
     const deviceType = isDeviceType(body.deviceType) ? body.deviceType : 'desktop';
-    const now = Date.now();
+    const now = this.now();
     // Mint an unambiguous one-time code, XXXX-XXXX (FR-23).
     let code = '';
     let codeHash = '';
@@ -644,12 +711,15 @@ export class VaultRoom extends DurableObject<Env> {
     const rows = this.sql('SELECT id FROM devices WHERE id = ?', body.deviceId).toArray();
     if (rows.length === 0) return json(404, { error: 'unknown device' });
     this.sql('UPDATE devices SET revoked = 1 WHERE id = ?', body.deviceId);
-    this.appendEvent(Date.now(), body.deviceId, 'device_revoked', body.deviceId, null);
+    this.appendEvent(this.now(), body.deviceId, 'device_revoked', body.deviceId, null);
     return json(200, { ok: true });
   }
 
   /** Redeem a pairing code for a long-lived device token (FR-23). */
   private async httpPair(request: Request): Promise<Response> {
+    const ip = clientIpOf(request);
+    const throttled = this.authThrottle(ip);
+    if (throttled !== null) return throttled;
     const body = (await request.json().catch(() => null)) as
       | { code?: unknown; deviceName?: unknown; deviceType?: unknown }
       | null;
@@ -664,11 +734,14 @@ export class VaultRoom extends DurableObject<Env> {
     if (!(await this.isClaimed())) {
       return json(421, { error: 'worker is not claimed' });
     }
-    const now = Date.now();
+    const now = this.now();
     const codeHash = await sha256Hex(normalizeCode(body.code));
     const rows = this.sql('SELECT * FROM pairs WHERE code_hash = ?', codeHash).toArray() as unknown as PairRow[];
     const pair = rows[0];
     if (pair === undefined || pair.used === 1 || pair.expires_at <= now) {
+      // Invalid, expired, and reused codes are all failed guesses: they
+      // count toward the per-IP budget BEFORE the response goes out.
+      this.noteAuthFailure(ip, now);
       return json(401, { error: 'pairing code is invalid, expired, or already used' });
     }
     // Burn the code (one-time) and mint the device.
@@ -680,6 +753,7 @@ export class VaultRoom extends DurableObject<Env> {
         : 'desktop';
     const { token, deviceId } = await this.registerDevice(body.deviceName.trim(), deviceType, now);
     this.appendEvent(now, deviceId, 'device_paired', body.deviceName.trim(), null);
+    this.authFailures.delete(ip);
     return json(200, { ok: true, token, deviceId });
   }
 
@@ -687,7 +761,7 @@ export class VaultRoom extends DurableObject<Env> {
   private async httpStatus(request: Request): Promise<Response> {
     const auth = await this.authenticateHttpRequest(request);
     if (!auth.ok) return json(401, { error: 'device token or admin session required' });
-    const now = Date.now();
+    const now = this.now();
     const vaultName = (await this.getMeta('vault_name')) ?? '';
 
     const devices = (
@@ -798,13 +872,13 @@ export class VaultRoom extends DurableObject<Env> {
     if (body === null || typeof body.hash !== 'string' || typeof body.size !== 'number') {
       return json(400, { error: 'hash and size are required' });
     }
-    this.upsertBlob(body.hash, body.size, now());
+    this.upsertBlob(body.hash, body.size, this.now());
     return json(200, { ok: true });
   }
 
   /** Orphans: refcount 0 and older than the grace window (§7). */
   private httpGcList(): Response {
-    const cutoff = now() - GC_GRACE_MS;
+    const cutoff = this.now() - GC_GRACE_MS;
     const rows = this.sql('SELECT hash FROM blobs WHERE refcount = 0 AND first_seen_at < ?', cutoff).toArray();
     return json(200, { orphans: rows.map((r) => r.hash as string) });
   }
@@ -823,7 +897,50 @@ export class VaultRoom extends DurableObject<Env> {
     return json(200, { ok: true, purged: body.hashes.length });
   }
 
+  /** Cron-driven events pruning (§6); the opportunistic path covers the gaps. */
+  private httpEventsPrune(): Response {
+    this.pruneEventsNow(this.now());
+    return json(200, { ok: true });
+  }
+
   // --- auth plumbing --------------------------------------------------------------------------
+
+  /**
+   * Per-IP failure budget check for the guessing surfaces (§3, §14). Returns
+   * a 429 (with `Retry-After` seconds and a JSON error) once `ip` has hit the
+   * limit inside the window, else `null` so the caller proceeds.
+   */
+  private authThrottle(ip: string): Response | null {
+    const entry = this.authFailures.get(ip);
+    if (entry === undefined) return null;
+    const ts = this.now();
+    if (ts - entry.windowStart >= AUTH_FAILURE_WINDOW_MS) {
+      this.authFailures.delete(ip); // window closed: fresh budget
+      return null;
+    }
+    if (entry.count < AUTH_FAILURE_LIMIT) return null;
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((entry.windowStart + AUTH_FAILURE_WINDOW_MS - ts) / 1000),
+    );
+    return new Response(JSON.stringify({ error: 'too many failed attempts from this address; retry later' }), {
+      status: 429,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'retry-after': String(retryAfterSeconds),
+      },
+    });
+  }
+
+  /** Count a failed guess; a window that has closed starts a fresh one. */
+  private noteAuthFailure(ip: string, ts: number): void {
+    const entry = this.authFailures.get(ip);
+    if (entry === undefined || ts - entry.windowStart >= AUTH_FAILURE_WINDOW_MS) {
+      this.authFailures.set(ip, { count: 1, windowStart: ts });
+      return;
+    }
+    entry.count += 1;
+  }
 
   private async isClaimed(): Promise<boolean> {
     return (await this.getMeta('claimed_at')) !== null;
@@ -846,7 +963,7 @@ export class VaultRoom extends DurableObject<Env> {
   private async signSession(): Promise<{ value: string; expiresAt: number }> {
     const secretB64 = await this.getMeta('session_secret');
     if (secretB64 === null) throw new Error('worker is not claimed');
-    const expiresAt = now() + SESSION_TTL_MS;
+    const expiresAt = this.now() + SESSION_TTL_MS;
     const mac = await hmacHex(base64UrlToBytes(secretB64), `admin:${expiresAt}`);
     return { value: `${expiresAt}.${mac}`, expiresAt };
   }
@@ -865,7 +982,7 @@ export class VaultRoom extends DurableObject<Env> {
     if (dot <= 0) return false;
     const expiresAt = Number(value.slice(0, dot));
     const mac = value.slice(dot + 1);
-    if (!Number.isFinite(expiresAt) || expiresAt <= now()) return false;
+    if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) return false;
     const secretB64 = await this.getMeta('session_secret');
     if (secretB64 === null) return false;
     const expected = await hmacHex(base64UrlToBytes(secretB64), `admin:${expiresAt}`);
@@ -1025,6 +1142,7 @@ export class VaultRoom extends DurableObject<Env> {
       seq,
       JSON.stringify(change),
     );
+    this.maybePruneEvents();
     this.sql('UPDATE files SET head_seq = ? WHERE path = ?', seq, payload.path);
     if (payload.kind === 'rename' && payload.fromPath !== undefined) {
       this.sql('DELETE FROM files WHERE path = ?', payload.fromPath);
@@ -1078,6 +1196,38 @@ export class VaultRoom extends DurableObject<Env> {
       path,
       detail,
     );
+    this.maybePruneEvents();
+  }
+
+  /**
+   * Prune the event log now and stamp the watermark (§6). Policy: delete
+   * rows older than 30 days AND everything beyond the newest 10,000 — a
+   * single DELETE whose two arms simply union. `versions` is never touched:
+   * history is kept forever by design (FR-7).
+   */
+  private pruneEventsNow(ts: number): void {
+    this.sql(
+      `INSERT INTO meta (key, value) VALUES ('events_last_prune', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      String(ts),
+    );
+    this.sql(
+      'DELETE FROM events WHERE ts < ? OR id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)',
+      ts - EVENT_MAX_AGE_MS,
+      EVENT_KEEP_MAX,
+    );
+  }
+
+  /**
+   * Opportunistic prune gate, checked on every event write: the hourly
+   * watermark rides `meta` (one point-lookup, cheaper than the INSERT it
+   * follows), so the log stays bounded even between weekly cron runs.
+   */
+  private maybePruneEvents(): void {
+    const ts = this.now();
+    const row = this.sql("SELECT value FROM meta WHERE key = 'events_last_prune'").toArray()[0];
+    if (row !== undefined && ts - Number(row.value as string) < EVENT_PRUNE_MIN_INTERVAL_MS) return;
+    this.pruneEventsNow(ts);
   }
 
   private async getMeta(key: string): Promise<string | null> {
@@ -1277,8 +1427,3 @@ CREATE TABLE IF NOT EXISTS blobs (
   first_seen_at INTEGER NOT NULL
 );
 `;
-
-/** `now()` seam: `Date.now()` today; trivially injectable when tests need it. */
-function now(): number {
-  return Date.now();
-}

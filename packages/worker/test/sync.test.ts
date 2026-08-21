@@ -19,6 +19,7 @@ import {
   mintPairingCode,
   pair,
   resetAll,
+  setRoomTime,
 } from './helpers.js';
 import type { ChangeMessage, CommitAckMessage, ConflictMessage, ManifestMessage } from '@vsa/core';
 
@@ -224,6 +225,67 @@ describe('scenario (b): offline edits race -> exactly one conflict copy everywhe
     expect(copies).toHaveLength(1);
     expect(manifest.entries[copies[0]!]!.hash).toBe(loserHash);
     expect(manifest.cursor).toBe(copySeq);
+  });
+});
+
+describe('conflict-copy collisions (§4: ` 2`…` 999` suffixes)', () => {
+  it('two same-minute stale-parent commits from the same loser -> second copy gets the " 2" suffix, both materialize everywhere', async () => {
+    const rigged = await rig();
+    // Common ancestor, then a fast-path edit on top: standing head, clock {2, desktop}.
+    const base = await expectCommitAck(rigged.wsDesktop, '/notes/note.md', null, 'base');
+    expect(base.version).toBe('v1');
+    await expectCommitAck(rigged.wsDesktop, '/notes/note.md', 'v1', 'desktop edit');
+
+    // The device with the LESSER id loses the {2, x} vs {2, y} tie-break
+    // (clock.ts: greater deviceId wins) — so it deterministically loses BOTH
+    // stale commits below, whatever the random device ids happened to be.
+    const loserIsDesktop = rigged.desktop.deviceId < rigged.mobile.deviceId;
+    const loserName = loserIsDesktop ? 'Desktop' : 'Mobile';
+    const loserWs = loserIsDesktop ? rigged.wsDesktop : rigged.wsMobile;
+    const winnerWs = loserIsDesktop ? rigged.wsMobile : rigged.wsDesktop;
+
+    // Pin the DO clock so both conflicts carry the identical UTC minute stamp.
+    const pinned = Date.now();
+    await setRoomTime(pinned);
+    const pad = (n: number): string => String(n).padStart(2, '0');
+    const d = new Date(pinned);
+    const stamp = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}-${pad(d.getUTCMinutes())}`;
+    const copy1Path = `/notes/note (conflict ${stamp} - from ${loserName}).md`;
+    const copy2Path = `/notes/note (conflict ${stamp} - from ${loserName}) 2.md`;
+
+    const stale = async (content: string): Promise<void> => {
+      const bytes = enc(content);
+      const hash = await hashOf(bytes);
+      const reply = loserWs.next((m) => m.type === 'conflict' || m.type === 'error');
+      loserWs.send(inlineCommitMessage('/notes/note.md', 'v1', bytes, hash));
+      const answer = await reply;
+      expect(answer.type, JSON.stringify(answer)).toBe('conflict');
+      expect((answer as ConflictMessage).loserDisposition).toBe('conflictCopy');
+    };
+    await stale('stale edit one');
+    await stale('stale edit two');
+
+    // Conflict-copy broadcasts go to ALL sockets — the loser sees both, in order.
+    const copy1 = (await loserWs.next((m) => m.type === 'change' && m.kind === 'conflictCopy')) as ChangeMessage;
+    const copy2 = (await loserWs.next((m) => m.type === 'change' && m.kind === 'conflictCopy')) as ChangeMessage;
+    expect(copy1.path).toBe(copy1Path);
+    expect(copy2.path).toBe(copy2Path);
+    // The collision rule verbatim: ` 2` before the extension, nothing renamed.
+    expect(copy2.path).toBe(copy1.path.replace(/\.md$/, ' 2.md'));
+    expect(copy1.hash).toBe(await hashOf(enc('stale edit one')));
+    expect(copy2.hash).toBe(await hashOf(enc('stale edit two')));
+
+    // Both copies materialize in manifest state, identically on every client.
+    const loserManifest = await manifestOf(loserWs);
+    expect(Object.keys(loserManifest.entries).sort()).toEqual(['/notes/note.md', copy1Path, copy2Path].sort());
+    expect(loserManifest.entries[copy1Path]!.hash).toBe(copy1.hash);
+    expect(loserManifest.entries[copy2Path]!.hash).toBe(copy2.hash);
+    // The standing head keeps the winning content.
+    expect(loserManifest.entries['/notes/note.md']!.hash).toBe(await hashOf(enc('desktop edit')));
+
+    const winnerManifest = await manifestOf(winnerWs);
+    expect(Object.keys(winnerManifest.entries).sort()).toEqual(Object.keys(loserManifest.entries).sort());
+    expect(winnerManifest.entries[copy2Path]!.hash).toBe(copy2.hash);
   });
 });
 

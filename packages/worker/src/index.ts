@@ -96,7 +96,7 @@ export default {
     }
 
     if (request.method === 'POST' && path === '/pair') {
-      return roomPost(env, '/pair', await readJsonBody(request));
+      return roomPost(env, '/pair', await readJsonBody(request), clientIpHeaders(request));
     }
     if (request.method === 'POST' && path === '/admin/login') {
       return handleAdminLogin(request, env);
@@ -134,14 +134,19 @@ export default {
     return json(404, { error: 'not found' });
   },
 
-  // --- weekly orphan-blob GC (§7) ---------------------------------------------------------
+  // --- weekly GC cron (§7) -----------------------------------------------------------------
   //
-  // Asks the DO for unreferenced hashes (refcount 0, older than the grace
-  // window), deletes them from R2, then tells the DO to drop the bookkeeping
-  // rows. Referenced blobs are never enumerated, so they always survive.
+  // Two jobs ride the same weekly trigger:
+  //  - orphan-blob GC: ask the DO for unreferenced hashes (refcount 0, older
+  //    than the grace window), delete them from R2, then tell the DO to drop
+  //    the bookkeeping rows. Referenced blobs are never enumerated, so they
+  //    always survive.
+  //  - events pruning (§6): the event log is bounded (30 days / newest 10k);
+  //    the DO prunes opportunistically between cron runs as a second net.
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       (async () => {
+        await roomPost(env, '/internal/events-prune', {});
         const list = await roomFetch(env, '/internal/gc');
         const { orphans } = (await list.json()) as { orphans: string[] };
         if (orphans.length === 0) return;
@@ -175,10 +180,18 @@ function authForwardHeaders(request: Request): Record<string, string> {
   return headers;
 }
 
+/**
+ * Forward the client IP to the DO for per-IP auth throttling (§3, §14): the
+ * guessing surfaces (`/pair`, `/admin/login`) budget failures per address.
+ */
+function clientIpHeaders(request: Request): Record<string, string> {
+  return { 'cf-connecting-ip': request.headers.get('cf-connecting-ip') ?? 'unknown' };
+}
+
 /** `POST /admin/login` → verify in the DO, then set the signed session cookie. */
 async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
   const body = await readJsonBody(request);
-  const res = await roomPost(env, '/admin/login', { passphrase: body.passphrase });
+  const res = await roomPost(env, '/admin/login', { passphrase: body.passphrase }, clientIpHeaders(request));
   if (!res.ok) return res;
   const { cookie, expiresAt } = (await res.json()) as { cookie: string; expiresAt: number };
   const response = json(200, { ok: true, expiresAt });

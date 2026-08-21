@@ -119,15 +119,30 @@ export function roomSql<T>(query: string): Promise<T[]> {
   });
 }
 
+/** Pin (or release, with `null`) the DO's clock — the room.ts time seam. */
+export function setRoomTime(ms: number | null): Promise<void> {
+  return inRoom((instance) => {
+    (instance as unknown as { setTimeForTests(t: number | null): void }).setTimeForTests(ms);
+  });
+}
+
 /**
  * Reset the vault to factory state (unclaimed, empty tables, empty bucket).
  *
  * Stands in for the pool's `isolatedStorage` (disabled on Windows — see
  * vitest.workers.config.ts): every test file calls this in `beforeEach`, so
- * each test starts as a freshly deployed worker.
+ * each test starts as a freshly deployed worker. In-memory DO state that
+ * outlives the tables (pinned clock, per-IP auth-failure counters) is reset
+ * through the room's test seams — the single worker is shared by all files.
  */
 export async function resetAll(): Promise<void> {
-  await inRoom((_instance, state) => {
+  await inRoom((instance, state) => {
+    const room = instance as unknown as {
+      setTimeForTests(t: number | null): void;
+      clearAuthFailuresForTests(): void;
+    };
+    room.setTimeForTests(null);
+    room.clearAuthFailuresForTests();
     const sql = state.storage.sql;
     for (const table of ['files', 'versions', 'devices', 'events', 'pairs', 'blobs', 'meta']) {
       try {
