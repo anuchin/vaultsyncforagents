@@ -36,7 +36,7 @@ export const DEPLOY_URL =
   'https://github.com/anuchin/vaultsyncforagents-template';
 
 /** The project README (the About section's link). */
-export const PROJECT_README_URL = 'https://github.com/vaultsyncforagents/vaultsyncforagents#readme';
+export const PROJECT_README_URL = 'https://github.com/anuchin/vaultsyncforagents#readme';
 
 /** Open the deploy page in the system browser (no-op where `window` is absent). */
 export function openDeployPage(): void {
@@ -474,13 +474,17 @@ export class VaultSyncSettingTab extends PluginSettingTab {
         ? 'never'
         : `${formatSince(Date.now() - status.lastSyncAt)} ago`;
     const state = status.state === 'live' ? 'connected' : status.state;
-    return [
-      `State: ${state}`,
-      `Worker: ${data.url}`,
-      `Last sync: ${lastSync}`,
+    const lines = [`State: ${state}`, `Worker: ${data.url}`, `Last sync: ${lastSync}`];
+    // Bulk-phase progress — the same X/Y the status bar shows during a
+    // multi-minute initial sync.
+    if (status.progress !== undefined) {
+      lines.push(`Syncing: ${status.progress.done}/${status.progress.total} (${status.progress.phase})`);
+    }
+    lines.push(
       `Pending changes: ${status.pending}`,
       `Conflicts: ${status.conflicts.length}${status.conflicts.length > 0 ? ' (conflict copies were written into the vault)' : ''}`,
-    ].join('\n');
+    );
+    return lines.join('\n');
   }
 
   private refreshStatus(): void {
