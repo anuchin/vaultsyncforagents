@@ -1,0 +1,57 @@
+# Release the deploy-button worker bundle (ARCHITECTURE.md §12, FR-21).
+#
+# On every `v*` tag this workflow builds the release artifact consumed by the
+# vaultsyncforagents-template repo's CI (and `vsa setup`):
+#
+#   worker-bundle.zip
+#   ├── worker.js       # bundled worker entry (ESM; exports VaultRoom)
+#   └── dashboard/      # built dashboard SPA (served at / via ASSETS)
+#
+# and attaches it to a GitHub Release for the tag. The template downloads
+# `https://github.com/<owner>/<repo>/releases/download/<tag>/worker-bundle.zip`
+# anonymously, so the release must be public-readable — it is, on a public
+# repo. VERSION in the template pins one of these tags.
+name: Release worker bundle
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release, upload the asset
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build the dashboard SPA (embedded into the bundle)
+        run: npm run build --workspace @vsa/dashboard
+
+      - name: Bundle worker + dashboard into worker-bundle.zip
+        run: node scripts/build-release.mjs
+
+      - name: Create the GitHub release with the bundle
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/worker-bundle.zip
+          fail_on_unmatched_files: true
+          body: |
+            Deploy-button release bundle (`worker-bundle.zip`):
+            `worker.js` (bundled ESM worker entry, exports `VaultRoom`) + `dashboard/` (SPA).
+
+            Consumed by [vaultsyncforagents-template](https://github.com/anuchin/vaultsyncforagents-template)
+            CI and `vsa setup` — see ARCHITECTURE.md §3/§12 for the artifact convention.

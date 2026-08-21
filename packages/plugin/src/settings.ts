@@ -33,7 +33,7 @@ import type { VaultSyncPlugin } from './plugin.js';
  */
 export const DEPLOY_URL =
   'https://deploy.workers.cloudflare.com/?url=' +
-  'https://github.com/vaultsyncforagents/vaultsyncforagents-template';
+  'https://github.com/anuchin/vaultsyncforagents-template';
 
 /** The project README (the About section's link). */
 export const PROJECT_README_URL = 'https://github.com/vaultsyncforagents/vaultsyncforagents#readme';
