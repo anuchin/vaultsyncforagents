@@ -214,9 +214,20 @@ describe('simulation — scenario (a): edit converges to every device within a t
       expect(device.client.currentIndex()['/notes/shared.md']).toBeDefined();
     }
     // One head on the server, and every client's index agrees with it.
+    // (`entry.mtime` is a per-device scan cache — the editor recorded its
+    // local stat, pullers have not scanned since their write — so agreement
+    // is asserted on the sync fields: hash, size, versionId, clock.)
     const entry = desktop.client.currentIndex()['/notes/shared.md'];
-    expect(mobile.client.currentIndex()['/notes/shared.md']).toEqual(entry);
-    expect(daemon.client.currentIndex()['/notes/shared.md']).toEqual(entry);
+    const agreesWithHead = (other: typeof entry): void => {
+      expect(other).toMatchObject({
+        hash: entry?.hash,
+        size: entry?.size,
+        versionId: entry?.versionId,
+        clock: entry?.clock,
+      });
+    };
+    agreesWithHead(mobile.client.currentIndex()['/notes/shared.md']);
+    agreesWithHead(daemon.client.currentIndex()['/notes/shared.md']);
     expect(conflictCopies(await desktop.storage.listFiles())).toEqual([]);
     for (const device of [desktop, mobile, daemon]) {
       expect(device.client.status().state).toBe('live');
@@ -284,10 +295,19 @@ describe('simulation — scenario (b): offline edits race → exactly one confli
       expect(text(await device.storage.readFile(copies[0]!))).toBe(loser);
     }
 
-    // The winner head is identical in every index, and the server agrees.
+    // The winner head is identical in every index (sync fields; mtime is a
+    // per-device scan cache), and the server agrees.
     const head = desktop.client.currentIndex()['/notes/note.md'];
-    expect(mobile.client.currentIndex()['/notes/note.md']).toEqual(head);
-    expect(daemon.client.currentIndex()['/notes/note.md']).toEqual(head);
+    const agreesWithHead = (other: typeof head): void => {
+      expect(other).toMatchObject({
+        hash: head?.hash,
+        size: head?.size,
+        versionId: head?.versionId,
+        clock: head?.clock,
+      });
+    };
+    agreesWithHead(mobile.client.currentIndex()['/notes/note.md']);
+    agreesWithHead(daemon.client.currentIndex()['/notes/note.md']);
     const serverFile = server.snapshot().files.find((f) => f.path === '/notes/note.md');
     expect(serverFile?.clock).toEqual(head?.clock);
 

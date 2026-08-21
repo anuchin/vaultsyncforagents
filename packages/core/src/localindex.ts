@@ -18,8 +18,20 @@
 import type { LogicalClock } from './types.js';
 import { ProtocolError } from './errors.js';
 
-/** Current on-disk schema version. Bump + add migration on breaking changes. */
-export const LOCAL_INDEX_SCHEMA_VERSION = 1;
+/**
+ * Current on-disk schema version. Bump + add migration on breaking changes.
+ *
+ * History:
+ *   - 1 — initial shape (hash/size/versionId/clock/deletedAt/isFolder).
+ *   - 2 — adds the optional `mtime` cache field per entry (scan pre-filter,
+ *         see `scan.ts`). Graceful migration: v1 entries simply lack `mtime`,
+ *         which reads back as "unknown" — the next fast scan re-hashes the
+ *         file and records it. Old v1 state files load without error.
+ */
+export const LOCAL_INDEX_SCHEMA_VERSION = 2;
+
+/** Oldest on-disk schema version this build can still read. */
+export const MIN_LOCAL_INDEX_SCHEMA_VERSION = 1;
 
 /** Vault path where the client persists its local index. */
 export const LOCAL_INDEX_STATE_PATH = '/.vaultsyncforagents/state';
@@ -41,6 +53,14 @@ export interface LocalIndexEntry {
    * `hash: ''`, `size: 0`; the clock is that of the placeholder's version.
    */
   isFolder?: boolean;
+  /**
+   * Storage mtime (epoch ms) observed the last time this entry's file was
+   * hashed by a scan. A pure cache for the scan pre-filter (`scan.ts`):
+   * nullish (absent, e.g. legacy v1 state or entries written by pulls)
+   * means "unknown" — the next fast scan hashes the file and records it via
+   * `recordHashedFiles`. Never consulted for sync decisions.
+   */
+  mtime?: number;
 }
 
 /** The whole index: normalized vault path → entry. `{}` is a valid empty index. */
@@ -129,8 +149,10 @@ export function serializeLocalIndex(index: LocalIndex): string {
 /**
  * Parse a serialized index back. Throws `ProtocolError` on non-JSON input,
  * a malformed envelope, entries with wrong field types, or a `schemaVersion`
- * this build does not understand (older or newer). Unknown extra fields are
- * tolerated for forward compatibility.
+ * outside the supported range (older than `MIN_LOCAL_INDEX_SCHEMA_VERSION`
+ * or newer than `LOCAL_INDEX_SCHEMA_VERSION`) — older versions *within* the
+ * range load without error (v1 entries simply deserialize with `mtime`
+ * unknown). Unknown extra fields are tolerated for forward compatibility.
  */
 export function deserializeLocalIndex(json: string): LocalIndex {
   let parsed: unknown;
@@ -146,10 +168,11 @@ export function deserializeLocalIndex(json: string): LocalIndex {
   if (typeof version !== 'number' || !Number.isInteger(version)) {
     throw new ProtocolError('Local index state is missing integer schemaVersion');
   }
-  if (version !== LOCAL_INDEX_SCHEMA_VERSION) {
+  if (version < MIN_LOCAL_INDEX_SCHEMA_VERSION || version > LOCAL_INDEX_SCHEMA_VERSION) {
     throw new ProtocolError(
       `Local index schema version ${version} is not supported by this build ` +
-        `(expected ${LOCAL_INDEX_SCHEMA_VERSION}); a migration is required`,
+        `(expected ${MIN_LOCAL_INDEX_SCHEMA_VERSION}..${LOCAL_INDEX_SCHEMA_VERSION}); ` +
+        'a migration is required',
     );
   }
   const rawEntries = parsed.entries;
@@ -167,7 +190,7 @@ export function deserializeLocalIndex(json: string): LocalIndex {
 function parseEntry(path: string, raw: unknown): LocalIndexEntry {
   const where = `Local index entry ${JSON.stringify(path)}`;
   if (!isPlainObject(raw)) throw new ProtocolError(`${where} is not an object`);
-  const { hash, size, versionId, clock, deletedAt, isFolder } = raw as Record<string, unknown>;
+  const { hash, size, versionId, clock, deletedAt, isFolder, mtime } = raw as Record<string, unknown>;
   if (typeof hash !== 'string') throw new ProtocolError(`${where}: hash must be a string`);
   if (typeof versionId !== 'string') {
     throw new ProtocolError(`${where}: versionId must be a string`);
@@ -184,6 +207,9 @@ function parseEntry(path: string, raw: unknown): LocalIndexEntry {
   if (isFolder !== undefined && typeof isFolder !== 'boolean') {
     throw new ProtocolError(`${where}: isFolder must be a boolean when present`);
   }
+  if (mtime !== undefined && (typeof mtime !== 'number' || !Number.isFinite(mtime))) {
+    throw new ProtocolError(`${where}: mtime must be a finite number when present`);
+  }
   const entry: LocalIndexEntry = {
     hash,
     size,
@@ -192,6 +218,7 @@ function parseEntry(path: string, raw: unknown): LocalIndexEntry {
   };
   if (deletedAt !== undefined) entry.deletedAt = deletedAt as number;
   if (isFolder !== undefined) entry.isFolder = isFolder as boolean;
+  if (mtime !== undefined) entry.mtime = mtime as number;
   return entry;
 }
 

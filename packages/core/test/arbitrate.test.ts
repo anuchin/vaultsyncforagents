@@ -381,6 +381,59 @@ describe('arbitrateCommit — delete-vs-edit (mirrors resolve.ts)', () => {
   });
 });
 
+describe('arbitrateCommit — double conflict in one minute (pins the ` 2` suffix)', () => {
+  it('two sequential stale-parent losses, same path/device/minute → the second copy takes ` 2` via the exists callback', async () => {
+    // Base v1 by dev-A, standing head v2 {2, dev-Z} — dev-Z beats dev-L on
+    // the counter-2 device tiebreak, so every stale edit by dev-L loses.
+    const hashO = await h('base');
+    const hashR = await h('remote edit');
+    const loss1Content = await h('local edit one');
+    const loss2Content = await h('local edit two');
+    const seeded = arbitrateCommit(
+      emptyArbitrationState(),
+      commit({ path: '/notes/todo.md', hash: hashO, size: 4 }),
+      'dev-A',
+      NOW - 3000,
+      DEVICES,
+    );
+    const headed = arbitrateCommit(
+      seeded.state,
+      commit({ path: '/notes/todo.md', parentVersion: seeded.outcome.newVersionId, hash: hashR, size: 11 }),
+      'dev-Z',
+      NOW - 2000,
+      DEVICES,
+    );
+
+    // First stale-parent loss by dev-L, stamped NOW.
+    const loss1 = arbitrateCommit(
+      headed.state,
+      commit({ path: '/notes/todo.md', parentVersion: seeded.outcome.newVersionId, hash: loss1Content, size: 15 }),
+      'dev-L',
+      NOW,
+      DEVICES,
+    );
+    expect(loss1.outcome.result).toBe('conflict');
+    expect(loss1.outcome.conflictCopyPath).toBe(COPY('/notes/todo.md', 'Local'));
+
+    // Second stale-parent loss: same path, same device, same minute. The
+    // first copy already occupies the base name — the exists callback
+    // (preserveLoser → conflictCopyPath) must walk to the ` 2` suffix.
+    const loss2 = arbitrateCommit(
+      loss1.state,
+      commit({ path: '/notes/todo.md', parentVersion: seeded.outcome.newVersionId, hash: loss2Content, size: 15 }),
+      'dev-L',
+      NOW,
+      DEVICES,
+    );
+    expect(loss2.outcome.result).toBe('conflict');
+    expect(loss2.outcome.conflictCopyPath).toBe(COPY('/notes/todo.md', 'Local').replace(/\.md$/, ' 2.md'));
+
+    // Both copies exist as distinct live files with their own content.
+    expect(loss2.state.files.get(COPY('/notes/todo.md', 'Local'))?.head.hash).toBe(loss1Content);
+    expect(loss2.state.files.get(`${COPY('/notes/todo.md', 'Local').slice(0, -3)} 2.md`)?.head.hash).toBe(loss2Content);
+  });
+});
+
 describe('arbitrateCommit — renames (mirrors resolve.ts FR-9)', () => {
   async function seededFile(content: string): Promise<{ state: ArbitrationState; hash: string; v1: string }> {
     const hash = await h(content);
@@ -576,6 +629,7 @@ describe('client/server arbitration agreement (the contract the real DO must sat
       deleted: [],
       renamed: [],
       emptyFolders: [],
+      hashed: [],
     };
     const plan = computeSyncPlan({
       localChanges,
@@ -637,6 +691,7 @@ describe('client/server arbitration agreement (the contract the real DO must sat
           deleted: [],
           renamed: [],
           emptyFolders: [],
+          hashed: [],
         },
         index: {},
         manifest: [

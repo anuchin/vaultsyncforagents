@@ -191,6 +191,49 @@ describe('serializeLocalIndex / deserializeLocalIndex', () => {
   });
 });
 
+describe('schema v1 → v2 migration (the optional mtime cache)', () => {
+  it('deserializes a legacy v1 envelope without error; mtime reads as unknown', () => {
+    const legacy = JSON.stringify({
+      schemaVersion: 1,
+      entries: {
+        '/notes/a.md': { hash: 'aaa', size: 3, versionId: 'v1', clock },
+        '/gone.md': { hash: 'g', size: 1, versionId: 'v2', clock, deletedAt: 9 },
+      },
+    });
+    const index = deserializeLocalIndex(legacy);
+    expect(index).toEqual({
+      '/notes/a.md': { hash: 'aaa', size: 3, versionId: 'v1', clock },
+      '/gone.md': { hash: 'g', size: 1, versionId: 'v2', clock, deletedAt: 9 },
+    });
+    // "Unknown" is the migration's meaning: the next fast scan hashes these
+    // files once and records their mtime.
+    expect(index['/notes/a.md']!.mtime).toBeUndefined();
+  });
+
+  it('round-trips entries carrying mtime and stamps the current schema version', () => {
+    const index: LocalIndex = {
+      '/a.md': { hash: 'h', size: 1, versionId: 'v', clock, mtime: 123_456 },
+    };
+    const json = serializeLocalIndex(index);
+    expect((JSON.parse(json) as { schemaVersion: number }).schemaVersion).toBe(LOCAL_INDEX_SCHEMA_VERSION);
+    expect(deserializeLocalIndex(json)).toEqual(index);
+  });
+
+  it('still rejects schema versions outside the supported range', () => {
+    const at = (version: number): string => JSON.stringify({ schemaVersion: version, entries: {} });
+    expect(() => deserializeLocalIndex(at(0))).toThrow(/not supported/);
+    expect(() => deserializeLocalIndex(at(LOCAL_INDEX_SCHEMA_VERSION + 1))).toThrow(/not supported/);
+  });
+
+  it('throws ProtocolError on a malformed mtime', () => {
+    const bad = JSON.stringify({
+      schemaVersion: LOCAL_INDEX_SCHEMA_VERSION,
+      entries: { '/a.md': { hash: 'h', size: 1, versionId: 'v', clock, mtime: 'yesterday' } },
+    });
+    expect(() => deserializeLocalIndex(bad)).toThrow(ProtocolError);
+  });
+});
+
 describe('constants', () => {
   it('LOCAL_INDEX_STATE_PATH lives inside the sync-ignored state dir', () => {
     expect(LOCAL_INDEX_STATE_PATH).toBe('/.vaultsyncforagents/state');

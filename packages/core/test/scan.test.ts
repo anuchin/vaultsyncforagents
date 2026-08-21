@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   InMemoryStorageAdapter,
   isIgnored,
+  recordHashedFiles,
   sha256Hex,
   scanVault,
   type LocalIndex,
@@ -52,6 +53,33 @@ async function cleanIndex(storage: InMemoryStorageAdapter): Promise<LocalIndex> 
   return indexFrom(spec);
 }
 
+/** Counting hash seam: records how many files a scan actually hashed. */
+function countingHash(): { hash: (bytes: Uint8Array) => Promise<string>; count: () => number } {
+  let calls = 0;
+  return {
+    hash: (bytes) => {
+      calls += 1;
+      return sha256Hex(bytes);
+    },
+    count: () => calls,
+  };
+}
+
+/** The `hashed` observations a fresh (legacy, mtime-less) scan of `storage` produces. */
+async function hashedObservations(storage: InMemoryStorageAdapter) {
+  const observations = [];
+  for (const f of await storage.listFiles()) {
+    if (isIgnored(f.path, SETTINGS)) continue;
+    observations.push({
+      path: f.path,
+      hash: await sha256Hex(await storage.readFile(f.path)),
+      size: f.size,
+      mtime: f.mtime,
+    });
+  }
+  return observations.sort((a, b) => (a.path < b.path ? -1 : 1));
+}
+
 describe('scanVault — clean vault', () => {
   it('reports no changes when storage matches the index exactly', async () => {
     const storage = new InMemoryStorageAdapter({
@@ -69,6 +97,9 @@ describe('scanVault — clean vault', () => {
       deleted: [],
       renamed: [],
       emptyFolders: [],
+      // The clean index is legacy-style (no mtime): fast mode still hashed
+      // every file to establish the stat cache — and found them all unchanged.
+      hashed: await hashedObservations(storage),
     });
   });
 
@@ -350,5 +381,201 @@ describe('scanVault — determinism', () => {
 
     const again = await scanVault(storage, index, SETTINGS, 424242);
     expect(again).toEqual(changes);
+  });
+});
+
+describe('scanVault — mtime+size pre-filter (fast mode)', () => {
+  /** Deterministic ticking storage clock (the adapter's injectable `now`). */
+  const tickingClock = (): { now: () => number } => {
+    let tick = 1000;
+    return { now: () => (tick += 10) };
+  };
+
+  /**
+   * The client loop under test: scan → record observations → scan again.
+   * `recordHashedFiles` is what `SyncClient.runCycle` folds into the index
+   * after a cycle, so this is the on-disk state the NEXT app-open sees.
+   */
+  async function scanAndRecord(
+    storage: InMemoryStorageAdapter,
+    index: LocalIndex,
+    hashed: (bytes: Uint8Array) => Promise<string>,
+  ): Promise<{ changes: Awaited<ReturnType<typeof scanVault>>; index: LocalIndex }> {
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { hash: hashed });
+    return { changes, index: recordHashedFiles(index, changes.hashed) };
+  }
+
+  it('an unchanged vault (stat-cached index) hashes ZERO files', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'a', '/notes/b.md': 'b' });
+    const counter = countingHash();
+    const first = await scanAndRecord(storage, await cleanIndex(storage), counter.hash);
+    expect(counter.count()).toBe(2); // legacy index: mtime unknown ⇒ hash all
+
+    const secondCounter = countingHash();
+    const second = await scanVault(storage, first.index, SETTINGS, NOW, { hash: secondCounter.hash });
+    expect(secondCounter.count()).toBe(0);
+    expect(second.hashed).toEqual([]);
+    expect(second.added).toEqual([]);
+    expect(second.modified).toEqual([]);
+    expect(second.deleted).toEqual([]);
+  });
+
+  it('a mtime-only touch rehashes exactly that file and finds it unchanged', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'aa', '/b.md': 'bb' }, tickingClock());
+    const counter = countingHash();
+    const { index } = await scanAndRecord(storage, await cleanIndex(storage), counter.hash);
+
+    // Same content, new write ⇒ new mtime (size unchanged).
+    await storage.writeFile('/a.md', enc('aa'));
+    const touchCounter = countingHash();
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { hash: touchCounter.hash });
+    expect(touchCounter.count()).toBe(1);
+    expect(changes.hashed.map((h) => h.path)).toEqual(['/a.md']);
+    expect(changes.modified).toEqual([]); // content identical ⇒ not a change
+
+    // Recording the fresh observation re-caches the touched mtime.
+    const third = countingHash();
+    await scanVault(storage, recordHashedFiles(index, changes.hashed), SETTINGS, NOW, { hash: third.hash });
+    expect(third.count()).toBe(0);
+  });
+
+  it('a size change rehashes exactly that file and reports it modified', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'aa', '/b.md': 'bb' }, tickingClock());
+    const { index } = await scanAndRecord(storage, await cleanIndex(storage), countingHash().hash);
+
+    await storage.writeFile('/a.md', enc('aaa'));
+    const counter = countingHash();
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { hash: counter.hash });
+    expect(counter.count()).toBe(1);
+    expect(changes.hashed.map((h) => h.path)).toEqual(['/a.md']);
+    expect(changes.modified).toEqual([
+      { path: '/a.md', hash: await sha256Hex('aaa'), size: 3 },
+    ]);
+  });
+
+  it('legacy index without mtime: first scan hashes all, records, second scan hashes none', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'a', '/b.md': 'b', '/sub/c.md': 'c' });
+    const legacy = await cleanIndex(storage); // no mtime anywhere
+    for (const entry of Object.values(legacy)) expect(entry.mtime).toBeUndefined();
+
+    const first = countingHash();
+    const one = await scanVault(storage, legacy, SETTINGS, NOW, { hash: first.hash });
+    expect(first.count()).toBe(3);
+    expect(one.hashed.map((h) => h.path)).toEqual(['/a.md', '/b.md', '/sub/c.md']);
+
+    const recorded = recordHashedFiles(legacy, one.hashed);
+    for (const [path, entry] of Object.entries(recorded)) {
+      expect(entry.mtime).toBe((await storage.listFiles()).find((f) => f.path === path)!.mtime);
+    }
+
+    const second = countingHash();
+    await scanVault(storage, recorded, SETTINGS, NOW, { hash: second.hash });
+    expect(second.count()).toBe(0);
+  });
+
+  it('full mode rehashes everything regardless of a matching stat cache', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'a', '/b.md': 'b' });
+    const { index } = await scanAndRecord(storage, await cleanIndex(storage), countingHash().hash);
+
+    const counter = countingHash();
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { mode: 'full', hash: counter.hash });
+    expect(counter.count()).toBe(2); // full: the stat cache is ignored
+    expect(changes.hashed.map((h) => h.path)).toEqual(['/a.md', '/b.md']);
+    // ...but an honest vault still reports no changes.
+    expect(changes.modified).toEqual([]);
+    expect(changes.added).toEqual([]);
+  });
+
+  it('documents the tradeoff: fast mode trusts size+mtime, full mode verifies content', async () => {
+    // The index entry's recorded hash is WRONG for the file on disk (content
+    // changed behind the filesystem's back without touching size or mtime —
+    // simulated by mutating the recorded hash expectation).
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'aaaa' });
+    const index = await cleanIndex(storage);
+    const stat = (await storage.listFiles())[0]!;
+    const lied: LocalIndex = {
+      '/a.md': { ...index['/a.md']!, hash: await sha256Hex('bbbb'), size: stat.size, mtime: stat.mtime },
+    };
+
+    // Fast mode: size and mtime match ⇒ trusts the stat, skips the hash,
+    // and the drift goes unnoticed. This is the documented cost of fast
+    // mode; nothing asserts it as correct — the full-mode run below is the
+    // verification that surfaces the drift.
+    const fast = countingHash();
+    const fastChanges = await scanVault(storage, lied, SETTINGS, NOW, { hash: fast.hash });
+    expect(fast.count()).toBe(0);
+    expect(fastChanges.modified).toEqual([]);
+
+    // Full mode exists precisely for this: rehash everything, detect it.
+    const full = countingHash();
+    const fullChanges = await scanVault(storage, lied, SETTINGS, NOW, { mode: 'full', hash: full.hash });
+    expect(full.count()).toBe(1);
+    expect(fullChanges.modified).toEqual([
+      { path: '/a.md', hash: await sha256Hex('aaaa'), size: 4 },
+    ]);
+  });
+
+  it('never stat-skips tombstones or folder placeholders (resurrects always surface)', async () => {
+    // Frozen clock: the resurrect rewrite lands on the SAME mtime the entry
+    // recorded — the adversarial case the tombstone guard must survive.
+    const storage = new InMemoryStorageAdapter({ '/gone.md': 'x' }, { now: () => 5000 });
+    const legacy = await cleanIndex(storage);
+    const index: LocalIndex = {
+      '/gone.md': { ...legacy['/gone.md']!, deletedAt: 5, mtime: (await storage.listFiles())[0]!.mtime },
+    };
+    await storage.deleteFile('/gone.md');
+    await storage.writeFile('/gone.md', enc('x')); // resurrect, mtime identical to the record
+
+    const counter = countingHash();
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { hash: counter.hash });
+    expect(counter.count()).toBe(1);
+    expect(changes.modified).toEqual([{ path: '/gone.md', hash: await sha256Hex('x'), size: 1 }]);
+  });
+
+  it('a rename still hashes the file at its new path (correlation needs the hash)', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'alpha' });
+    const { index } = await scanAndRecord(storage, await cleanIndex(storage), countingHash().hash);
+    await storage.renameFile('/a.md', '/moved.md');
+
+    const counter = countingHash();
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { hash: counter.hash });
+    expect(counter.count()).toBe(1); // /moved.md looks added ⇒ hashed; /a.md is gone
+    expect(changes.renamed).toEqual([
+      { from: '/a.md', to: '/moved.md', hash: await sha256Hex('alpha'), size: 5 },
+    ]);
+  });
+});
+
+describe('recordHashedFiles', () => {
+  it('caches the observed mtime only on entries whose hash still matches', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'a', '/b.md': 'b' });
+    const index = await cleanIndex(storage);
+    const stats = await storage.listFiles();
+    const observations = [
+      { path: '/a.md', hash: index['/a.md']!.hash, size: 1, mtime: stats.find((f) => f.path === '/a.md')!.mtime },
+      // hash drifts from the entry (e.g. a pull overwrote the path mid-cycle)
+      { path: '/b.md', hash: await sha256Hex('not-what-the-entry-says'), size: 1, mtime: 999 },
+    ];
+
+    const next = recordHashedFiles(index, observations);
+    expect(next['/a.md']!.mtime).toBe(stats.find((f) => f.path === '/a.md')!.mtime);
+    expect(next['/b.md']!.mtime).toBeUndefined(); // untouched — hash mismatch
+    expect(next['/b.md']!.hash).toBe(index['/b.md']!.hash);
+  });
+
+  it('skips tombstones and folder placeholders, and is pure', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'a' });
+    const index: LocalIndex = {
+      '/a.md': { hash: await sha256Hex('a'), size: 1, versionId: 'v', clock: { counter: 1, deviceId: 'dev' }, deletedAt: 7 },
+      '/empty': { hash: '', size: 0, versionId: 'vf', clock: { counter: 1, deviceId: 'dev' }, isFolder: true },
+    };
+    const before = JSON.stringify(index);
+    const next = recordHashedFiles(index, [
+      { path: '/a.md', hash: await sha256Hex('a'), size: 1, mtime: 42 },
+      { path: '/empty', hash: '', size: 0, mtime: 42 },
+    ]);
+    expect(next['/a.md']!.mtime).toBeUndefined();
+    expect(next['/empty']!.mtime).toBeUndefined();
+    expect(JSON.stringify(index)).toBe(before); // input never mutated
   });
 });

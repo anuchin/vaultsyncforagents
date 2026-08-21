@@ -38,7 +38,7 @@ function remote(
 }
 
 function noChanges(): LocalChanges {
-  return { scannedAt: NOW, added: [], modified: [], deleted: [], renamed: [], emptyFolders: [] };
+  return { scannedAt: NOW, added: [], modified: [], deleted: [], renamed: [], emptyFolders: [], hashed: [] };
 }
 
 function makeInput(overrides: Partial<SyncPlanInput> = {}): SyncPlanInput {

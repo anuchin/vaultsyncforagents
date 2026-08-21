@@ -2,7 +2,7 @@
  * Local change detection (ARCHITECTURE.md §8 step 3).
  *
  * `scanVault` walks the storage adapter, applies the shared ignore rules,
- * hashes every non-ignored file (sha256 — same as blob addressing) and diffs
+ * hashes non-ignored files (sha256 — same as blob addressing) and diffs
  * the result against the client's `LocalIndex`. The diff classifies:
  *
  *   - `added`    — file present, path unknown to the index;
@@ -21,6 +21,21 @@
  *                  neither by a live folder placeholder in the index nor by
  *                  any file beneath them (FR-10).
  *
+ * ## The mtime+size pre-filter (fast mode, the default)
+ *
+ * Re-hashing a 50k-file vault at every app-open is a real battery cost, so
+ * fast mode skips hashing a file whose `size` AND `mtime` (from the storage
+ * adapter's `FileStat`) exactly match its live index entry — the recorded
+ * hash carries forward as unchanged. A file is hashed when it has no entry,
+ * the entry is a tombstone or folder placeholder, the size differs, or the
+ * mtime differs or is unknown (legacy state, pulls, first scan). Rename
+ * correlation is unaffected: the destination path of a rename always looks
+ * 'added', so it is always hashed — content-preserving moves still pair.
+ *
+ * The tradeoff: fast mode trusts the filesystem not to change content while
+ * preserving both size and mtime. For verification (`vsa doctor`, periodic
+ * integrity checks) pass `{ mode: 'full' }` to re-hash everything.
+ *
  * The function takes `now` and the ignore settings as parameters (no hidden
  * clocks, no ambient config) and returns deterministically ordered results
  * (every bucket sorted by path; renames by `from`).
@@ -29,8 +44,23 @@
 import type { FileStat, StorageAdapter } from './adapters.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
-import type { LocalIndex } from './localindex.js';
+import type { LocalIndex, LocalIndexEntry } from './localindex.js';
 import { parentPath } from './paths.js';
+
+/** Injectable content hash (the default is sha256, same as blob addressing). */
+export type HashFn = (bytes: Uint8Array) => Promise<string>;
+
+/** Options for `scanVault`. */
+export interface ScanVaultOptions {
+  /**
+   * `'fast'` (default): files whose size+mtime exactly match their live index
+   * entry skip re-hashing. `'full'`: hash everything regardless — integrity
+   * verification (`vsa doctor`, periodic checks).
+   */
+  mode?: 'fast' | 'full';
+  /** Content hash override (tests count/inspect hashing). Default: sha256Hex. */
+  hash?: HashFn;
+}
 
 /** A local content change for a path that exists in storage. */
 export interface ScanCandidate {
@@ -57,6 +87,20 @@ export interface RenameCandidate {
   size: number;
 }
 
+/**
+ * A file this scan actually read and hashed, with the stat observed at hash
+ * time. Feeds `recordHashedFiles` so the NEXT fast scan can skip these files
+ * (the mtime cache on the index entry). Files skipped by the pre-filter are,
+ * by definition, not hashed and do not appear here.
+ */
+export interface HashedFile {
+  path: string;
+  hash: string;
+  size: number;
+  /** Epoch ms — the storage stat at hash time (`FileStat.mtime`). */
+  mtime: number;
+}
+
 /** The full result of one local scan. All buckets sorted by path. */
 export interface LocalChanges {
   /** The `now` passed in — when this scan conceptually happened. */
@@ -67,21 +111,28 @@ export interface LocalChanges {
   renamed: RenameCandidate[];
   /** Empty-folder paths to push as placeholder entries (FR-10). */
   emptyFolders: string[];
+  /** Every file the scan hashed (fast mode's skipped files are absent), sorted by path. */
+  hashed: HashedFile[];
 }
 
 /**
  * Scan the vault and diff it against the index.
  *
- * Every non-ignored file is read and hashed on every scan in v1; using
- * size/mtime as a hash shortcut is a later optimization (correctness first:
- * external edits can preserve mtime).
+ * In fast mode (the default) a file whose size and mtime both exactly match
+ * its live index entry is NOT re-hashed — the recorded hash carries forward
+ * as unchanged (see the module doc for the tradeoff and the `full` escape
+ * hatch).
  */
 export async function scanVault(
   storage: StorageAdapter,
   index: LocalIndex,
   settings: IgnoreSettings,
   now: number,
+  options: ScanVaultOptions = {},
 ): Promise<LocalChanges> {
+  const hashFn = options.hash ?? sha256Hex;
+  const mode = options.mode ?? 'fast';
+
   const files = await storage.listFiles();
 
   const kept: FileStat[] = [];
@@ -92,10 +143,15 @@ export async function scanVault(
 
   const added: ScanCandidate[] = [];
   const modified: ScanCandidate[] = [];
+  const hashed: HashedFile[] = [];
 
   for (const file of kept) {
     const entry = index[file.path];
-    const hash = await sha256Hex(await storage.readFile(file.path));
+    if (mode === 'fast' && statMatchesEntry(entry, file)) {
+      continue; // size+mtime unchanged since the recorded hash — trust it
+    }
+    const hash = await hashFn(await storage.readFile(file.path));
+    hashed.push({ path: file.path, hash, size: file.size, mtime: file.mtime });
     if (entry === undefined) {
       added.push({ path: file.path, hash, size: file.size });
       continue;
@@ -134,7 +190,52 @@ export async function scanVault(
     deleted: [...unmatchedDeleted].sort(byPath),
     renamed: [...renamed].sort((a, b) => byPath(a, b)),
     emptyFolders,
+    hashed: [...hashed].sort(byPath),
   };
+}
+
+/**
+ * Whether the file's stat exactly matches its live index entry — the fast
+ * mode pre-filter. Requires a known recorded `mtime` (legacy entries and
+ * pull-written entries have none ⇒ hashed, then recorded) and never fires
+ * for tombstones (a resurrect must always surface) or folder placeholders.
+ */
+function statMatchesEntry(entry: LocalIndexEntry | undefined, file: FileStat): boolean {
+  return (
+    entry !== undefined &&
+    entry.deletedAt === undefined &&
+    entry.isFolder !== true &&
+    entry.mtime !== undefined &&
+    entry.mtime === file.mtime &&
+    entry.size === file.size
+  );
+}
+
+/**
+ * Record a scan's hash observations into the index: for every live file
+ * entry whose content hash matches what the scan hashed, cache the observed
+ * mtime so the next fast scan can skip re-hashing it.
+ *
+ * Pure: returns a new index (or the input when nothing changes), never
+ * mutates. The hash-match guard keeps the cache honest — an entry whose
+ * hash no longer reflects the observation (e.g. a pull overwrote the path
+ * mid-cycle) is left untouched and simply gets re-hashed next scan.
+ * Entries never demote: `deletedAt`/`isFolder` entries are never patched.
+ */
+export function recordHashedFiles(
+  index: LocalIndex,
+  hashed: readonly HashedFile[],
+): LocalIndex {
+  let next: Record<string, LocalIndexEntry> | undefined;
+  for (const observed of hashed) {
+    const entry = index[observed.path];
+    if (entry === undefined || entry.isFolder || entry.deletedAt !== undefined) continue;
+    if (entry.hash !== observed.hash) continue;
+    if (entry.mtime === observed.mtime) continue;
+    next ??= { ...index };
+    next[observed.path] = { ...entry, mtime: observed.mtime };
+  }
+  return next ?? index;
 }
 
 /**

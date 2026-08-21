@@ -58,7 +58,7 @@ import {
   type RemoteFile,
   type SyncPlan,
 } from './resolve.js';
-import { scanVault } from './scan.js';
+import { recordHashedFiles, scanVault } from './scan.js';
 import type { Transport } from './transport.js';
 import type { LogicalClock } from './types.js';
 
@@ -518,6 +518,12 @@ export class SyncClient {
           isFolder: true,
         });
       }
+
+      // Cache the scan's hash observations (mtime) onto entries whose hash
+      // still matches, so the next fast scan can skip those files. Runs
+      // after pulls/pushes so freshly-acked entries benefit immediately;
+      // `recordHashedFiles` skips anything the cycle changed underneath us.
+      this.index = recordHashedFiles(this.index, localChanges.hashed);
 
       this.lastSyncAt = this.now();
       this.pending = 0;
