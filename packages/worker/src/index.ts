@@ -17,14 +17,14 @@
  * only explicitly delegates non-API GET/HEAD requests to asset serving.
  *
  * CORS: split policy. The plugin-facing routes (GET /health, POST /pair,
- * GET/PUT /blob/:hash) answer preflights and carry permissive CORS headers:
- * the Obsidian plugin's renderer calls the worker cross-origin
- * (`app://obsidian.md` on desktop, `capacitor://` origins on mobile), and
- * those routes authenticate by Bearer device token or one-time pairing code —
- * no cookies — so a wildcard ACAO adds no exposure. Everything the dashboard
- * uses (/admin/*, /api/*, /claim, /ws) stays same-origin only: no CORS
- * headers are ever emitted there, keeping the session-cookie CSRF surface at
- * zero.
+ * PATCH /device, GET /api/status with the device token, GET/PUT /blob/:hash)
+ * answer preflights and carry permissive CORS headers: the Obsidian plugin's
+ * renderer calls the worker cross-origin (`app://obsidian.md` on desktop,
+ * `capacitor://` origins on mobile), and those routes authenticate by Bearer
+ * device token or one-time pairing code — no cookies — so a wildcard ACAO adds
+ * no exposure. Everything else the dashboard uses (/admin/*, the rest of
+ * /api/*, /claim, /ws) stays same-origin only: no CORS headers are ever
+ * emitted there, keeping the session-cookie CSRF surface at zero.
  */
 
 import { ADMIN_COOKIE_NAME, blobKey, type VaultRoom } from './room.js';
@@ -59,9 +59,22 @@ const PLUGIN_CORS_HEADERS: Record<string, string> = {
   'access-control-max-age': '86400',
 };
 
-/** Paths the plugin's cross-origin renderer talks to. */
+/**
+ * Paths the plugin's cross-origin renderer talks to. `/api/status` is here
+ * deliberately: the plugin's About section reads the storage summary with the
+ * device's Bearer token from the renderer — token-authenticated, no cookies
+ * involved, so a wildcard ACAO adds no exposure. The admin dashboard calls the
+ * same route same-origin and is unaffected (the headers are additive);
+ * every OTHER /api/* route (/api/history included) stays same-origin only.
+ */
 function isPluginCorsPath(path: string): boolean {
-  return path === '/health' || path === '/pair' || path === '/device' || path.startsWith('/blob/');
+  return (
+    path === '/health' ||
+    path === '/pair' ||
+    path === '/device' ||
+    path === '/api/status' ||
+    path.startsWith('/blob/')
+  );
 }
 
 /** Copy `response` (DO-fetched responses are header-immutable) with CORS. */
@@ -171,7 +184,10 @@ export default {
       return roomPost(env, '/admin/revoke', await readJsonBody(request), cookieHeader(request));
     }
     if (request.method === 'GET' && path === '/api/status') {
-      return roomFetch(env, '/api/status', { headers: authForwardHeaders(request) });
+      // Plugin-CORS route: the About section fetches this cross-origin with
+      // the device token (see `isPluginCorsPath`). Auth is unchanged — the
+      // room still accepts the device Bearer token OR the admin cookie.
+      return withPluginCors(await roomFetch(env, '/api/status', { headers: authForwardHeaders(request) }));
     }
     if (request.method === 'GET' && path === '/api/history') {
       // Read-only version-chain lookup for `vsa history` / `vsa restore`

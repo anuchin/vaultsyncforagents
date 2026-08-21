@@ -331,16 +331,64 @@ describe('scanVault — empty folders (FR-10)', () => {
     expect(changes.emptyFolders).toEqual([]);
   });
 
-  it('re-reports a folder whose placeholder was tombstoned (re-created folder)', async () => {
+  it('treats a REMOTE-tombstoned placeholder with an EMPTY dir on disk as a stale leftover, never a resurrection', async () => {
+    // F-1 ping-pong shape: a remote folder tombstone was applied record-only
+    // (adapter without removeDir / raced removal), leaving the empty dir on
+    // disk over a tombstoned entry authored by the OTHER device. The leftover
+    // is CONSISTENT with that deletion — it must not surface as an
+    // empty-folder placeholder ("local wins"), which would resurrect the
+    // deleted folder on the deleting peer and ping-pong forever.
+    const storage = new InMemoryStorageAdapter({ '/notes/a.md': 'alpha' });
+    await storage.ensureDir('/tempfolder');
+    const index = await indexFrom({
+      '/notes/a.md': { content: 'alpha' },
+      '/tempfolder': { content: '', isFolder: true, deletedAt: 5 }, // authored by 'dev' ≠ local
+    });
+
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { thisDeviceId: 'dev-local' });
+    expect(changes.emptyFolders).toEqual([]);
+    expect(changes.staleDirs).toEqual(['/tempfolder']);
+    // Nothing else moved: no folder deletion (already tombstoned), no file change.
+    expect(changes.folderDeletions).toEqual([]);
+    expect(changes.added).toEqual([]);
+    expect(changes.modified).toEqual([]);
+    expect(changes.deleted).toEqual([]);
+  });
+
+  it('restores a placeholder over an OWN-tombstoned entry when the user re-created the EMPTY folder', async () => {
+    // The deleting device itself: its own tombstone + a dir present again can
+    // only mean local recreation — restoring ("local wins") is correct even
+    // though the dir is empty.
     const storage = new InMemoryStorageAdapter({ '/notes/a.md': 'alpha' });
     await storage.ensureDir('/back-again');
+    const index = await indexFrom({
+      '/notes/a.md': { content: 'alpha' },
+      '/back-again': { content: '', isFolder: true, deletedAt: 5 }, // authored by 'dev'
+    });
+
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { thisDeviceId: 'dev' });
+    expect(changes.staleDirs).toBeUndefined(); // omitted when empty
+    expect(changes.emptyFolders).toEqual(['/back-again']);
+  });
+
+  it('restores a tombstoned placeholder when content was recreated beneath (local wins)', async () => {
+    // The non-empty branch: the user genuinely recreated the folder after the
+    // deletion, so the placeholder must be restored (it lands back in
+    // `emptyFolders` → folderPushes) while the recreated FILES surface as adds.
+    const storage = new InMemoryStorageAdapter({ '/notes/a.md': 'alpha' });
+    await storage.ensureDir('/back-again');
+    await storage.writeFile('/back-again/keep.md', enc('real content'));
     const index = await indexFrom({
       '/notes/a.md': { content: 'alpha' },
       '/back-again': { content: '', isFolder: true, deletedAt: 5 },
     });
 
-    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    const changes = await scanVault(storage, index, SETTINGS, NOW, { thisDeviceId: 'dev-local' });
+    expect(changes.staleDirs).toBeUndefined(); // omitted when empty
     expect(changes.emptyFolders).toEqual(['/back-again']);
+    expect(changes.added).toEqual([
+      { path: '/back-again/keep.md', hash: await sha256Hex('real content'), size: 12 },
+    ]);
   });
 
   it('never reports the root, non-empty folders, ignored dirs, or dirs holding only ignored files', async () => {

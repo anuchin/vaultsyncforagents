@@ -30,10 +30,22 @@ interface AdapterStat {
 
 export interface ObsidianStorageAdapterOptions {
   adapter: DataAdapter;
+  /**
+   * Desktop and mobile Obsidian's `DataAdapter.rmdir` is fs.rm-based and
+   * refuses EVERY directory (`ERR_FS_EISDIR`) — it cannot remove even an
+   * empty folder, which silently degraded every folder-tombstone application
+   * to record-only (the F-1 ping-pong). When provided, `removeDir` performs
+   * the empty-folder removal through this callback instead — the plugin wires
+   * it to `fileManager.trashFile` on the vault's TFolder, which works and
+   * never destroys data (system trash; core pre-checks emptiness anyway).
+   * Receives the ADAPTER path (no leading slash).
+   */
+  removeEmptyDir?: (adapterPath: string) => Promise<void>;
 }
 
 export class ObsidianStorageAdapter implements StorageAdapter {
   private readonly adapter: DataAdapter;
+  private readonly removeEmptyDir?: (adapterPath: string) => Promise<void>;
   /**
    * Latched when a temp+rename attempt fails: every later write goes straight
    * to `writeBinary` instead of paying the failing-rename penalty again.
@@ -43,6 +55,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
 
   constructor(options: ObsidianStorageAdapterOptions) {
     this.adapter = options.adapter;
+    this.removeEmptyDir = options.removeEmptyDir;
   }
 
   // --- path mapping ----------------------------------------------------------
@@ -137,6 +150,27 @@ export class ObsidianStorageAdapter implements StorageAdapter {
       current = current === '' ? segment : `${current}/${segment}`;
       if (!(await this.adapter.exists(current))) await this.adapter.mkdir(current);
     }
+  }
+
+  /**
+   * Remove an EMPTY directory (the `StorageAdapter.removeDir` contract).
+   * Prefers the vault-API callback (`removeEmptyDir` — see the option's doc
+   * for why `DataAdapter.rmdir` cannot do this); falls back to `rmdir` for
+   * bare adapters (tests). Missing path ⇒ no-op (idempotent); the vault root
+   * is never removable; a non-empty refusal propagates (core treats it as
+   * record-only — never data loss).
+   */
+  async removeDir(path: string): Promise<void> {
+    const normalized = normalizeVaultPath(path);
+    if (normalized === '/') return; // never touch the vault root
+    const target = this.toAdapterPath(normalized);
+    // Idempotent per the adapter contract.
+    if (!(await this.adapter.exists(target))) return;
+    if (this.removeEmptyDir !== undefined) {
+      await this.removeEmptyDir(target);
+      return;
+    }
+    await this.adapter.rmdir(target, false);
   }
 
   async exists(path: string): Promise<boolean> {

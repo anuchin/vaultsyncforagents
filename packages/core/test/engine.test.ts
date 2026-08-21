@@ -12,6 +12,7 @@ import {
   type LocalIndexEntry,
   type PullFileOp,
   type PullRenameOp,
+  type StorageAdapter,
   type SyncPlan,
 } from '../src/index.js';
 
@@ -273,5 +274,223 @@ describe('applyPull — empty plans', () => {
     const next = await applyPull(storage, index, planOf([]), fetchBlob, { now: NOW });
     expect(next).toEqual(index);
     expect(await loadLocalIndex(storage)).toEqual(index);
+  });
+});
+
+// --- folder lifecycle: tombstone application (B) + prune-on-delete (C) ----------------------
+//
+// These pin the REAL invocation path — applyPull → applyOnePull → removeDir —
+// because the F-1/F-2 E2E failure (index tombstoned while the directory
+// lingered forever) was invisible to tests that only asserted index state.
+
+/** Seed a live folder placeholder entry (FR-10 constants: hash '', size 0). */
+function placeholder(path: string, version = 'v1'): LocalIndexEntry {
+  return { hash: '', size: 0, versionId: version, clock: { counter: 1, deviceId: 'dev-remote' }, isFolder: true };
+}
+/** Wrap `storage.removeDir` so every invocation is recorded (delegation preserved). */
+function spyRemoveDir(storage: InMemoryStorageAdapter): { storage: InMemoryStorageAdapter; calls: string[] } {
+  const calls: string[] = [];
+  const inner = storage.removeDir.bind(storage);
+  storage.removeDir = async (path: string): Promise<void> => {
+    calls.push(path);
+    await inner(path);
+  };
+  return { storage, calls };
+}
+
+/** The exact E2E failure shape: the deployed adapter's removeDir always threw. */
+function withoutRemoveDir(storage: InMemoryStorageAdapter): StorageAdapter {
+  return {
+    readFile: (p) => storage.readFile(p),
+    writeFile: (p, d) => storage.writeFile(p, d),
+    deleteFile: (p) => storage.deleteFile(p),
+    renameFile: (from, to) => storage.renameFile(from, to),
+    listFiles: () => storage.listFiles(),
+    listDirs: () => storage.listDirs(),
+    ensureDir: (p) => storage.ensureDir(p),
+    exists: (p) => storage.exists(p),
+  };
+}
+
+function folderTombstonePull(path: string): PullFileOp {
+  return {
+    kind: 'delete',
+    path,
+    hash: '',
+    size: 0,
+    version: 'v2',
+    clock: { counter: 2, deviceId: 'dev-remote' },
+    deleted: true,
+    isFolder: true,
+  };
+}
+
+describe('applyPull — folder tombstone application (B)', () => {
+  it('invokes adapter.removeDir with the tombstoned path and removes the local EMPTY directory', async () => {
+    const plain = new InMemoryStorageAdapter({});
+    await plain.ensureDir('/tempfolder');
+    const { storage, calls } = spyRemoveDir(plain);
+    const index: LocalIndex = { '/tempfolder': placeholder('/tempfolder') };
+    const { fetchBlob } = blobTransport({});
+
+    const next = await applyPull(storage, index, planOf([folderTombstonePull('/tempfolder')]), fetchBlob, {
+      now: NOW,
+    });
+
+    // THE assertion the old suite never made: removeDir WAS called, with the
+    // exact vault path, and the directory actually left the disk.
+    expect(calls).toEqual(['/tempfolder']);
+    expect(await storage.exists('/tempfolder')).toBe(false);
+    expect(next['/tempfolder']).toEqual({
+      hash: '',
+      size: 0,
+      versionId: 'v2',
+      clock: { counter: 2, deviceId: 'dev-remote' },
+      deletedAt: NOW,
+      isFolder: true,
+    });
+  });
+
+  it('never calls removeDir while content remains beneath the directory (record-only)', async () => {
+    const plain = new InMemoryStorageAdapter({ '/tempfolder/keep.md': 'precious' });
+    const { storage, calls } = spyRemoveDir(plain);
+    const index: LocalIndex = {
+      '/tempfolder': placeholder('/tempfolder'),
+      '/tempfolder/keep.md': { hash: 'h', size: 8, versionId: 'v1', clock: { counter: 1, deviceId: 'dev' } },
+    };
+    const { fetchBlob } = blobTransport({});
+
+    const next = await applyPull(storage, index, planOf([folderTombstonePull('/tempfolder')]), fetchBlob, {
+      now: NOW,
+    });
+
+    expect(calls).toEqual([]); // non-empty ⇒ the hook is never even attempted
+    expect(text(await storage.readFile('/tempfolder/keep.md'))).toBe('precious'); // never lose content
+    expect(next['/tempfolder']?.deletedAt).toBe(NOW); // tombstone still recorded — converges later
+  });
+
+  it('records a tombstone for a directory that does not exist locally (no removal attempt)', async () => {
+    const { storage, calls } = spyRemoveDir(new InMemoryStorageAdapter({}));
+    const { fetchBlob } = blobTransport({});
+
+    const next = await applyPull(storage, {}, planOf([folderTombstonePull('/never-synced')]), fetchBlob, {
+      now: NOW,
+    });
+
+    expect(calls).toEqual([]);
+    expect(await storage.exists('/never-synced')).toBe(false);
+    expect(next['/never-synced']?.deletedAt).toBe(NOW);
+  });
+
+  it('skips removal gracefully when the adapter lacks the removeDir hook (record-only)', async () => {
+    const inner = new InMemoryStorageAdapter({});
+    await inner.ensureDir('/tempfolder');
+    const storage = withoutRemoveDir(inner);
+    const index: LocalIndex = { '/tempfolder': placeholder('/tempfolder') };
+    const { fetchBlob } = blobTransport({});
+
+    const next = await applyPull(storage, index, planOf([folderTombstonePull('/tempfolder')]), fetchBlob, {
+      now: NOW,
+    });
+
+    expect(await inner.exists('/tempfolder')).toBe(true); // dir lingers — pre-hook adapter
+    expect(next['/tempfolder']?.deletedAt).toBe(NOW); // …but the tombstone is honest
+  });
+});
+
+describe('applyPull — prune-on-delete (C)', () => {
+  it('removes the emptied parent of a deleted file — exactly ONE level, no cascade', async () => {
+    const plain = new InMemoryStorageAdapter({ '/a/b/c/f.md': 'content' });
+    const { storage, calls } = spyRemoveDir(plain);
+    const index: LocalIndex = {
+      '/a': placeholder('/a'),
+      '/a/b': placeholder('/a/b'),
+      '/a/b/c': placeholder('/a/b/c'),
+      '/a/b/c/f.md': { hash: 'h', size: 7, versionId: 'v1', clock: { counter: 1, deviceId: 'dev' } },
+    };
+    const { fetchBlob } = blobTransport({});
+
+    const next = await applyPull(
+      storage,
+      index,
+      planOf([
+        pullFile({
+          kind: 'delete',
+          path: '/a/b/c/f.md',
+          hash: 'h',
+          size: 7,
+          version: 'v2',
+          clock,
+          deleted: true,
+        }),
+      ]),
+      fetchBlob,
+      { now: NOW },
+    );
+
+    expect(calls).toEqual(['/a/b/c']); // the immediate parent only
+    expect(await storage.exists('/a/b/c')).toBe(false);
+    expect(await storage.exists('/a/b')).toBe(true); // ancestors converge over successive cycles
+    expect(await storage.exists('/a')).toBe(true);
+    expect(next['/a/b/c/f.md']?.deletedAt).toBe(NOW);
+  });
+
+  it('leaves a parent that still holds content (removeDir never invoked)', async () => {
+    const plain = new InMemoryStorageAdapter({ '/dir/a.md': 'a', '/dir/b.md': 'b' });
+    const { storage, calls } = spyRemoveDir(plain);
+    const index = await seededIndex(plain);
+    const hA = index['/dir/a.md']!.hash;
+    const { fetchBlob } = blobTransport({});
+
+    const next = await applyPull(
+      storage,
+      index,
+      planOf([
+        pullFile({
+          kind: 'delete',
+          path: '/dir/a.md',
+          hash: hA,
+          size: 1,
+          version: 'v2',
+          clock,
+          deleted: true,
+        }),
+      ]),
+      fetchBlob,
+      { now: NOW },
+    );
+
+    expect(calls).toEqual([]);
+    expect(await storage.exists('/dir')).toBe(true);
+    expect(text(await storage.readFile('/dir/b.md'))).toBe('b');
+    expect(next['/dir/a.md']?.deletedAt).toBe(NOW);
+  });
+
+  it('never attempts a removal for a root-level deletion (parent is the vault root)', async () => {
+    const plain = new InMemoryStorageAdapter({ '/root.md': 'root' });
+    const { storage, calls } = spyRemoveDir(plain);
+    const index = await seededIndex(plain);
+    const { fetchBlob } = blobTransport({});
+
+    await applyPull(
+      storage,
+      index,
+      planOf([
+        pullFile({
+          kind: 'delete',
+          path: '/root.md',
+          hash: index['/root.md']!.hash,
+          size: 4,
+          version: 'v2',
+          clock,
+          deleted: true,
+        }),
+      ]),
+      fetchBlob,
+      { now: NOW },
+    );
+
+    expect(calls).toEqual([]); // '/' is never deletable
+    expect(await storage.exists('/')).toBe(true);
   });
 });

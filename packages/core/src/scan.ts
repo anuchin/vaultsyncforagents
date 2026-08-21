@@ -30,6 +30,22 @@
  *                  (`isFolder`) downstream. A placeholder that merely became
  *                  ignored (settings change) is NOT a deletion — it is
  *                  skipped, exactly like ignored files.
+ *   - `staleDirs` — directories whose index entry is a TOMBSTONED folder
+ *                  placeholder while an EMPTY directory still exists on disk
+ *                  AND the tombstone was authored by ANOTHER device: the
+ *                  residue of a record-only tombstone application (an adapter
+ *                  without `removeDir`, or a removal that lost a race). The
+ *                  leftover is CONSISTENT with the (remote) deletion, so it
+ *                  must NOT resurrect as "local wins": re-pushing it as an
+ *                  empty-folder placeholder would undo a deletion the user
+ *                  made and ping-pong it between devices forever (observed
+ *                  end-to-end: A deletes → B records-only → B re-pushes →
+ *                  A re-pulls). The entry stays tombstoned; the client retries
+ *                  `removeDir` for these dirs each cycle (client.ts). If the
+ *                  tombstone was authored by THIS device, or content exists
+ *                  beneath the directory, this is genuine local recreation:
+ *                  the dir lands in `emptyFolders` instead, restoring the
+ *                  placeholder — local wins is correct there.
  *
  * ## The mtime+size pre-filter (fast mode, the default)
  *
@@ -76,6 +92,15 @@ export interface ScanVaultOptions {
    * Pure reporting — never affects the scan's decisions.
    */
   onProgress?: (done: number, total: number) => void;
+  /**
+   * This device's id, when the caller is a syncing client. Sharpens the
+   * tombstoned-placeholder rule (`staleDirs`): an EMPTY directory over a
+   * tombstoned placeholder is the record-only residue of a REMOTE deletion
+   * (never resurrected), but over a tombstone THIS device authored it means
+   * the user re-created the folder here — restore it (push the placeholder).
+   * Omitted (or non-folder scans): only the content test decides.
+   */
+  thisDeviceId?: string;
 }
 
 /** A local content change for a path that exists in storage. */
@@ -145,6 +170,13 @@ export interface LocalChanges {
    * folder deletions to push as tombstones (kind `'delete'`, `isFolder`).
    */
   folderDeletions: FolderDeletionCandidate[];
+  /**
+   * Directories whose index entry is a TOMBSTONED folder placeholder while an
+   * EMPTY directory still exists on disk (record-only tombstone application —
+   * see the module doc). Omitted (not merely empty) when there are none, so
+   * whole-object comparisons of `LocalChanges` stay stable for clean scans.
+   */
+  staleDirs?: string[];
   /** Every file the scan hashed (fast mode's skipped files are absent), sorted by path. */
   hashed: HashedFile[];
 }
@@ -167,6 +199,7 @@ export async function scanVault(
   const hashFn = options.hash ?? sha256Hex;
   const mode = options.mode ?? 'fast';
   const onProgress = options.onProgress;
+  const thisDeviceId = options.thisDeviceId;
 
   const files = await storage.listFiles();
 
@@ -223,7 +256,7 @@ export async function scanVault(
 
   const { renamed, deleted: unmatchedDeleted, added: unmatchedAdded } = detectRenames(deleted, added);
   const dirs = await storage.listDirs();
-  const emptyFolders = detectEmptyFolders(index, settings, files, dirs);
+  const { emptyFolders, staleDirs } = detectEmptyFolders(index, settings, files, dirs, thisDeviceId);
   const folderDeletions = detectFolderDeletions(index, settings, dirs);
 
   return {
@@ -234,6 +267,8 @@ export async function scanVault(
     renamed: [...renamed].sort((a, b) => byPath(a, b)),
     emptyFolders,
     folderDeletions,
+    // Omitted when empty (not `[]`) — see the field's doc.
+    ...(staleDirs.length > 0 ? { staleDirs } : {}),
     hashed: [...hashed].sort(byPath),
   };
 }
@@ -340,15 +375,33 @@ function detectRenames(
 /**
  * Directories that exist in storage but are represented neither by a live
  * folder placeholder in the index nor by any file (ignored or not) beneath
- * them. A directory containing only ignored files is therefore *not* empty —
- * it is represented by those files as far as the local machine is concerned.
+ * them — plus the tombstoned-placeholder special cases that make the
+ * empty-folder lifecycle deletion-safe:
+ *
+ *   - TOMBSTONED placeholder + content beneath → `emptyFolders`: the user
+ *     recreated the folder; restoring the placeholder ("local wins") is
+ *     correct. The recreated FILES beneath surface through `added`/`modified`
+ *     independently.
+ *   - TOMBSTONED placeholder + EMPTY dir on disk:
+ *       · tombstone authored by ANOTHER device (or author unknown) →
+ *         `staleDirs`: the record-only residue of a remote deletion,
+ *         consistent with the tombstone — never resurrected (re-pushing it as
+ *         an empty folder is what made a peer-side deletion ping-pong
+ *         forever). The client retries `removeDir` on these dirs.
+ *       · tombstone authored by THIS device (`thisDeviceId`) →
+ *         `emptyFolders`: my own deletion, yet a dir exists here now — the
+ *         user re-created it locally; restore the placeholder.
+ *
+ * A directory containing only ignored files is *not* empty — it is
+ * represented by those files as far as the local machine is concerned.
  */
 function detectEmptyFolders(
   index: LocalIndex,
   settings: IgnoreSettings,
   files: readonly FileStat[],
   dirs: readonly string[],
-): string[] {
+  thisDeviceId?: string,
+): { emptyFolders: string[]; staleDirs: string[] } {
   const representedDirs = new Set<string>();
   for (const file of files) {
     for (let dir = parentPath(file.path); dir !== '/'; dir = parentPath(dir)) {
@@ -357,15 +410,31 @@ function detectEmptyFolders(
   }
 
   const emptyFolders: string[] = [];
+  const staleDirs: string[] = [];
   for (const dir of dirs) {
     if (dir === '/') continue;
-    if (representedDirs.has(dir)) continue;
     if (isIgnored(dir, settings)) continue;
     const entry = index[dir];
-    if (entry?.isFolder && entry.deletedAt === undefined) continue; // already synced as placeholder
+    if (entry?.isFolder && entry.deletedAt === undefined) continue; // live placeholder — already synced
+    if (entry?.isFolder && entry.deletedAt !== undefined) {
+      // Tombstoned placeholder whose directory still exists. Content beneath
+      // ⇒ genuine recreation. Empty ⇒ stale leftover of a record-only
+      // tombstone application — UNLESS this device authored the tombstone
+      // itself, in which case a present dir can only be local recreation.
+      if (representedDirs.has(dir) || entry.clock.deviceId === thisDeviceId) {
+        emptyFolders.push(dir);
+      } else {
+        staleDirs.push(dir);
+      }
+      continue;
+    }
+    if (representedDirs.has(dir)) continue; // represented by its files
     emptyFolders.push(dir);
   }
-  return emptyFolders.sort();
+  return {
+    emptyFolders: emptyFolders.sort(),
+    staleDirs: staleDirs.sort(),
+  };
 }
 
 /**

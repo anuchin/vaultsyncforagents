@@ -1,0 +1,153 @@
+{
+  "startedAt": "2026-08-21T11:05:28.894Z",
+  "worker": "http://127.0.0.1:8797",
+  "purpose": "acceptance re-run for F-1 (empty-folder tombstone ping-pong) and F-2 (About /api/status CORS) after the fix build",
+  "steps": [
+    {
+      "id": "prep",
+      "name": "/health; live OPTIONS /api/status preflight must carry ACAO (F-2 fix, hot-reloaded worker); fixed plugin bundle freshness in BOTH vaults",
+      "status": "PASS",
+      "t0": 1787310328895,
+      "ms": 54,
+      "detail": {
+        "health": {
+          "ok": true,
+          "claimed": true
+        },
+        "liveApiStatusPreflight": {
+          "status": 204,
+          "acao": "*",
+          "ok": true
+        },
+        "pluginBundles": {
+          "TestVault4": {
+            "built": "2026-08-21T10:58:01.570Z",
+            "removeDirOccurrences": 7
+          },
+          "TestVault5": {
+            "built": "2026-08-21T10:58:01.623Z",
+            "removeDirOccurrences": 7
+          }
+        }
+      }
+    },
+    {
+      "id": "launch",
+      "name": "launch both instances (throwaway profiles, NO --disable-web-security) — pairing auto-reconnects live; leftover empty folders from the prior run tombstone cleanly on startup",
+      "status": "PASS",
+      "t0": 1787310328949,
+      "ms": 10694,
+      "detail": {
+        "headline": "both clients reconnected live with untouched tokens",
+        "pids": {
+          "vault4": 35836,
+          "vault5": 29564
+        },
+        "vaults": {
+          "vault4": {
+            "statusBar": "vsa ✓ 0s",
+            "state": "live",
+            "deviceId": "dev-f11db1bdf72d",
+            "deviceName": "e2e-vault4"
+          },
+          "vault5": {
+            "statusBar": "vsa ✓ 0s",
+            "state": "live",
+            "deviceId": "dev-4b179dc45512",
+            "deviceName": "e2e-vault5-renamed"
+          }
+        },
+        "postSettle": {
+          "vault4": {
+            "state": "live",
+            "pending": 0
+          },
+          "vault5": {
+            "state": "live",
+            "pending": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "S6a",
+      "name": "FIXED F-1: create EMPTY 'tempfolder' in vault4 → placeholder reaches vault5 → delete the EMPTY folder in vault4 (fileManager.trashFile) → placeholder gone from vault5 AND vault5's local dir REMOVED ≤40s; NO ping-pong: /api/history has NO edit-after-delete, deleting side stays deleted across two rescan cycles",
+      "status": "FAIL",
+      "t0": 1787310339643,
+      "ms": 25197,
+      "detail": {
+        "error": "createFolder in vault4: {\"ok\":true,\"value\":\"Error: Folder already exists.\"}",
+        "firstError": "waitFor(placeholder reaches vault5) timed out after 25000 ms"
+      }
+    },
+    {
+      "id": "S6b",
+      "name": "FIXED prune-on-delete: 'resurrect/keep.md' synced; delete FILE in vault4 → file gone in vault5 AND the emptied 'resurrect' folder prunes on BOTH sides, never resurrects across 40s (two rescan cycles)",
+      "status": "FAIL",
+      "t0": 1787310364840,
+      "ms": 89029,
+      "detail": {
+        "error": "empty 'resurrect' folder still present in vault5 ≥40s: [{\"t_s\":0,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":5,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":10,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":15,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":20,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":25,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":30,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":35,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":40,\"v4Folder\":true,\"v5Folder\":true}]",
+        "firstError": "empty 'resurrect' folder still present in vault5 ≥40s: [{\"t_s\":0,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":5,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":10,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":15,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":20,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":25,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":30,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":35,\"v4Folder\":true,\"v5Folder\":true},{\"t_s\":40,\"v4Folder\":true,\"v5Folder\":true}]"
+      }
+    },
+    {
+      "id": "about-fix",
+      "name": "open vault5 plugin settings About section → \"Vault storage\" line loads real data (\"Storage used: …\") with ZERO CORS/console errors (F-2 fix)",
+      "status": "FAIL",
+      "t0": 1787310453869,
+      "ms": 10347,
+      "detail": "waitFor(About storage line renders) timed out after 10000 ms"
+    },
+    {
+      "id": "sanity",
+      "name": "final sanity: both plugins live/pending 0/conflicts 0; zero console errors on BOTH sessions (the old build dropped CORS errors on every settings open)",
+      "status": "PASS",
+      "t0": 1787310464216,
+      "ms": 2008,
+      "detail": {
+        "vault4": {
+          "state": "live",
+          "pending": 0,
+          "statusBar": "vsa ✓ 12s"
+        },
+        "vault5": {
+          "state": "live",
+          "pending": 0,
+          "statusBar": "vsa ✓ 12s",
+          "deviceName": "e2e-vault5-renamed"
+        },
+        "conflictFiles": {
+          "vault4": [],
+          "vault5": []
+        },
+        "sessionErrorEntries": 0,
+        "verdict": "all green — zero console errors across both sessions"
+      }
+    }
+  ],
+  "decisions": [],
+  "pids": {
+    "obsidianVault4": 35836,
+    "obsidianVault5": 29564
+  },
+  "consoleProblems": {
+    "vault4": [],
+    "vault5": []
+  },
+  "workerLeftRunning": {
+    "url": "http://127.0.0.1:8797",
+    "listeningPids": [
+      "23528"
+    ],
+    "note": "wrangler dev --port 8797 --persist-to .wrangler/devstate-testvault (user dogfood room) — LEFT RUNNING"
+  },
+  "finishedAt": "2026-08-21T11:07:46.248Z",
+  "overall": "FAIL",
+  "overallNotes": [
+    "Acceptance for the F-1/F-2 fix build against the live dogfood room.",
+    "S6a = the exact E2E ping-pong scenario from report-hardened.json (now must show: peer dir removed, no edit-after-delete in /api/history, deleting side stays deleted).",
+    "S6b = emptied folder must prune on BOTH sides (the deleting side previously kept it).",
+    "about-fix = About \"Vault storage\" must render real data with zero console errors (previously CORS-blocked deterministically)."
+  ]
+}

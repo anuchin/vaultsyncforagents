@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NodeStorageAdapter } from '../src/storage.js';
@@ -111,6 +111,39 @@ describe('NodeStorageAdapter', () => {
     await adapter.ensureDir('/x/y/z');
     expect(await adapter.exists('/x/y/z')).toBe(true);
     expect(await adapter.exists('/x/y')).toBe(true);
+  });
+
+  it('removeDir removes an EMPTY directory (fs level), leaving ancestors intact', async () => {
+    const root = await tempRoot();
+    const adapter = new NodeStorageAdapter({ root });
+    await adapter.ensureDir('/a/tempfolder');
+
+    await adapter.removeDir('/a/tempfolder');
+
+    const stats = await stat(join(root, 'a'));
+    expect(stats.isDirectory()).toBe(true); // parent survives
+    expect(await adapter.exists('/a/tempfolder')).toBe(false);
+    await expect(stat(join(root, 'a', 'tempfolder'))).rejects.toThrow();
+  });
+
+  it('removeDir is idempotent for missing directories', async () => {
+    const adapter = new NodeStorageAdapter({ root: await tempRoot() });
+    await expect(adapter.removeDir('/never-was')).resolves.toBeUndefined();
+    await adapter.ensureDir('/gone');
+    await adapter.removeDir('/gone');
+    await expect(adapter.removeDir('/gone')).resolves.toBeUndefined(); // already gone
+  });
+
+  it('removeDir refuses a non-empty directory without deleting anything', async () => {
+    const root = await tempRoot();
+    const adapter = new NodeStorageAdapter({ root });
+    await adapter.writeFile('/full/keep.md', enc('precious'));
+
+    await expect(adapter.removeDir('/full')).rejects.toThrow();
+
+    // Nothing cascaded: content and directory both survive the refusal.
+    expect(new TextDecoder().decode(await readFile(join(root, 'full', 'keep.md')))).toBe('precious');
+    expect(await adapter.exists('/full')).toBe(true);
   });
 
   it('exists distinguishes files, dirs, and missing paths', async () => {

@@ -52,6 +52,31 @@ export class FakeDataAdapter {
     this.folders.add(path);
   }
 
+  /** Recorded rmdir calls (for asserting empty-folder tombstone application). */
+  readonly rmdirs: string[] = [];
+
+  /**
+   * Mirrors the real `DataAdapter.rmdir(path, recursive)`: `recursive: false`
+   * refuses non-empty folders (throws) instead of cascading; a missing folder
+   * is a no-op; a file at the path throws.
+   */
+  async rmdir(path: string, recursive: boolean): Promise<void> {
+    this.rmdirs.push(path);
+    if (this.files.has(path)) throw new Error(`not a folder: ${path}`);
+    if (!this.folders.has(path)) return; // already gone — idempotent
+    const childFile = [...this.files.keys()].some((p) => p.startsWith(`${path}/`));
+    const childFolder = [...this.folders].some((f) => f !== path && f.startsWith(`${path}/`));
+    if (!recursive && (childFile || childFolder)) {
+      throw new Error(`folder not empty: ${path}`);
+    }
+    if (recursive) {
+      for (const p of [...this.files.keys()]) if (p.startsWith(`${path}/`)) this.files.delete(p);
+      for (const f of [...this.folders]) if (f === path || f.startsWith(`${path}/`)) this.folders.delete(f);
+      return;
+    }
+    this.folders.delete(path);
+  }
+
   async readBinary(path: string): Promise<ArrayBuffer> {
     const file = this.files.get(path);
     if (file === undefined) throw new Error(`no such file: ${path}`);

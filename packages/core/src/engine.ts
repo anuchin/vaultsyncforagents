@@ -254,7 +254,7 @@ async function dirIsVacant(
 }
 
 /** Remove `dir` through the adapter when it is vacant. Missing/non-empty/unsupported ⇒ false. */
-async function removeDirIfVacant(
+export async function removeDirIfVacant(
   storage: StorageAdapter,
   index: LocalIndex,
   dir: string,

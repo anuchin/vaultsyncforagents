@@ -555,3 +555,223 @@ describe('simulation — reconnection and status', () => {
     expect(commits.filter((m) => m.path === '/notes/burst.md')).toHaveLength(1);
   });
 });
+
+// --- F-1 regression: the empty-folder tombstone ping-pong --------------------------------
+
+/**
+ * Storage double WITHOUT the optional `removeDir` hook — exactly the shape
+ * the real Obsidian plugin adapter had when the E2E finding was recorded
+ * (record-only tombstone application leaves the empty dir on disk).
+ */
+function withoutRemoveDir(inner: StorageAdapter): StorageAdapter {
+  return {
+    readFile: (p) => inner.readFile(p),
+    writeFile: (p, d) => inner.writeFile(p, d),
+    deleteFile: (p) => inner.deleteFile(p),
+    renameFile: (from, to) => inner.renameFile(from, to),
+    listFiles: () => inner.listFiles(),
+    listDirs: () => inner.listDirs(),
+    ensureDir: (p) => inner.ensureDir(p),
+    exists: (p) => inner.exists(p),
+  };
+}
+
+const FOLDER = '/tempfolder';
+
+/** Create an empty folder on a device (dirs produce no watcher events — a scan discovers them). */
+async function createEmptyFolder(device: Device): Promise<void> {
+  await device.storage.ensureDir(FOLDER);
+  await device.client.triggerSync();
+}
+
+/** Delete an empty folder on a device through the watcher path. */
+async function deleteEmptyFolder(device: Device): Promise<void> {
+  await device.storage.removeDir(FOLDER);
+  device.watch.emit([{ kind: 'delete', path: FOLDER }]);
+  device.scheduler.flush();
+}
+
+/** Commits `client` sent for the ping-ponged folder after `marker`. */
+function commitsFor(sent: ReadonlyArray<Message>, marker: number): Message[] {
+  return sent
+    .slice(marker)
+    .filter((m) => m.type === 'commit' && (m as { path?: string }).path === FOLDER);
+}
+
+/**
+ * Re-seat a device on a fresh client whose sends keep flowing into the
+ * device's recorded `sent` log (same pattern as the rig's transport factory).
+ */
+function recordingTransport(
+  server: InMemorySyncServer,
+  sent: Message[],
+): () => Transport {
+  return () => {
+    const pair = server.connectPair('tok-dev-mobile');
+    return {
+      send: (message) => {
+        sent.push(message);
+        pair.client.send(message);
+      },
+      onMessage: (cb) => pair.client.onMessage(cb),
+      onClose: (cb) => pair.client.onClose(cb),
+      close: () => pair.client.close(),
+    };
+  };
+}
+
+describe('simulation — scenario (g): empty-folder deletion never ping-pongs (F-1)', () => {
+  it('A deletes an empty folder → B applies AND removes its dir → B pushes NOTHING → A stays deleted', async () => {
+    const { server, desktop: a, mobile: b, settle } = await makeRig();
+    await connectAll(a, b);
+
+    // Placeholder created on A propagates to B as a directory.
+    await createEmptyFolder(a);
+    await settle();
+    expect(await b.storage.exists(FOLDER)).toBe(true);
+    expect(b.client.currentIndex()[FOLDER]?.isFolder).toBe(true);
+
+    const marker = b.sent.length; // everything B sends from here on is suspect
+
+    // A deletes the empty folder (the E2E used fileManager.trashFile).
+    await deleteEmptyFolder(a);
+    await settle();
+
+    // The tombstone reached B and REMOVED B's local empty dir (adapter removeDir).
+    expect(await a.storage.exists(FOLDER)).toBe(false);
+    expect(await b.storage.exists(FOLDER)).toBe(false);
+    expect(b.client.currentIndex()[FOLDER]?.deletedAt).toBeDefined();
+    expect(a.client.currentIndex()[FOLDER]?.deletedAt).toBeDefined();
+
+    // Several more full cycles on both sides: B's scans must push NOTHING…
+    await b.client.triggerSync();
+    await a.client.triggerSync();
+    await settle();
+    expect(commitsFor(b.sent, marker)).toEqual([]);
+
+    // …and history shows no edit-after-delete: the head is still A's delete.
+    const head = server.snapshot().files.find((f) => f.path === FOLDER);
+    expect(head?.deleted).toBe(true);
+    expect(head?.clock.deviceId).toBe('dev-desktop'); // authored by the DELETING side
+  });
+
+  it('the exact E2E shape: B lacks removeDir → record-only apply, dir lingers, STILL no re-push and A never re-pulls', async () => {
+    const rig = await makeRig();
+    const { server, desktop: a, settle } = rig;
+    const b = rig.mobile;
+    await connectAll(a, b);
+    await createEmptyFolder(a);
+    await settle();
+    expect(await b.storage.exists(FOLDER)).toBe(true);
+
+    // Re-seat B on a removeDir-less storage adapter (persisted state carries over).
+    b.client.close();
+    let t = 8_000_000;
+    const stripped = new SyncClient({
+      deviceId: 'dev-mobile',
+      deviceName: 'Mobile',
+      token: 'tok-dev-mobile',
+      transport: recordingTransport(server, b.sent),
+      blobStore: b.blobStore,
+      storage: withoutRemoveDir(b.storage),
+      now: () => ++t,
+      schedule: b.scheduler.schedule,
+    });
+    await stripped.connect();
+    stripped.startWatching(b.watch);
+    const settleBoth = async (): Promise<void> => {
+      for (let round = 0; round < 4; round++) {
+        await a.client.waitIdle();
+        await stripped.waitIdle();
+      }
+    };
+    await settleBoth();
+
+    const marker = b.sent.length;
+    await deleteEmptyFolder(a); // A deletes; B is connected via the stripped client
+    await settleBoth();
+
+    // Record-only application: B's index is tombstoned but its dir lingers.
+    expect(stripped.currentIndex()[FOLDER]?.deletedAt).toBeDefined();
+    expect(await b.storage.exists(FOLDER)).toBe(true);
+
+    // Repeated scan cycles on B (the old build re-pushed the placeholder HERE):
+    // the stale-leftover rule keeps the entry tombstoned and pushes nothing.
+    await stripped.triggerSync();
+    await stripped.triggerSync();
+    await settleBoth();
+    expect(commitsFor(b.sent, marker)).toEqual([]);
+
+    // The head is untouched (still A's delete), and A NEVER re-pulls its own
+    // deletion back — the deleting side stays deleted across extra cycles.
+    const head = server.snapshot().files.find((f) => f.path === FOLDER);
+    expect(head?.deleted).toBe(true);
+    expect(head?.clock.deviceId).toBe('dev-desktop');
+    await a.client.triggerSync();
+    await settleBoth();
+    expect(await a.storage.exists(FOLDER)).toBe(false);
+  });
+
+  it('stale-leftover cleanup: a later cycle retries removeDir on the lingering empty dir (still pushing nothing)', async () => {
+    const rig = await makeRig();
+    const { server, desktop: a } = rig;
+    const b = rig.mobile;
+    await connectAll(a, b);
+    await createEmptyFolder(a);
+    for (let round = 0; round < 4; round++) {
+      await a.client.waitIdle();
+      await b.client.waitIdle();
+    }
+
+    // B goes record-only (no removeDir), receives the tombstone, dir lingers.
+    b.client.close();
+    let t = 8_500_000;
+    const stripped = new SyncClient({
+      deviceId: 'dev-mobile',
+      deviceName: 'Mobile',
+      token: 'tok-dev-mobile',
+      transport: recordingTransport(server, b.sent),
+      blobStore: b.blobStore,
+      storage: withoutRemoveDir(b.storage),
+      now: () => ++t,
+      schedule: b.scheduler.schedule,
+    });
+    await stripped.connect();
+    stripped.startWatching(b.watch);
+    const deleteMarker = b.sent.length;
+    await deleteEmptyFolder(a);
+    for (let round = 0; round < 4; round++) {
+      await a.client.waitIdle();
+      await stripped.waitIdle();
+    }
+    expect(stripped.currentIndex()[FOLDER]?.deletedAt).toBeDefined();
+    expect(await b.storage.exists(FOLDER)).toBe(true);
+    expect(commitsFor(b.sent, deleteMarker)).toEqual([]);
+
+    // Re-seat B with the FULL adapter (removeDir available): the next cycle
+    // classifies the leftover as stale and retries the removal — converging
+    // storage onto the tombstone without ever re-pushing the placeholder.
+    stripped.close();
+    const healed = new SyncClient({
+      deviceId: 'dev-mobile',
+      deviceName: 'Mobile',
+      token: 'tok-dev-mobile',
+      transport: recordingTransport(server, b.sent),
+      blobStore: b.blobStore,
+      storage: b.storage,
+      now: () => ++t,
+      schedule: b.scheduler.schedule,
+    });
+    await healed.connect();
+    await healed.triggerSync();
+    for (let round = 0; round < 4; round++) {
+      await a.client.waitIdle();
+      await healed.waitIdle();
+    }
+
+    expect(await b.storage.exists(FOLDER)).toBe(false); // retried removal landed
+    expect(commitsFor(b.sent, deleteMarker)).toEqual([]); // …and still no re-push
+    const head = server.snapshot().files.find((f) => f.path === FOLDER);
+    expect(head?.deleted).toBe(true);
+  });
+});

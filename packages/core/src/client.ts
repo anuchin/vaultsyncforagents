@@ -29,7 +29,7 @@
 
 import type { LogAdapter, StorageAdapter, WatchAdapter } from './adapters.js';
 import { compareClocks } from './clock.js';
-import { applyPull, loadLocalState, pruneParentOnDelete, type FetchBlob } from './engine.js';
+import { applyPull, loadLocalState, pruneParentOnDelete, removeDirIfVacant, type FetchBlob } from './engine.js';
 import { NetworkError, ProtocolError, RevokedError, UnauthorizedError } from './errors.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
@@ -670,7 +670,12 @@ export class SyncClient {
         this.index,
         this.ignoreSettings,
         this.now(),
-        { onProgress: (done, total) => this.emitProgress('scanning', done, total) },
+        {
+          onProgress: (done, total) => this.emitProgress('scanning', done, total),
+          // Sharpens the staleDirs rule: an empty dir over a tombstone THIS
+          // device authored is a local recreation, not a deletion residue.
+          thisDeviceId: this.options.deviceId,
+        },
       );
       const plan = computeSyncPlan({
         localChanges,
@@ -729,6 +734,18 @@ export class SyncClient {
           // scan again so the placeholder is tombstoned and propagates.
           this.scheduleReconcile();
         }
+      }
+
+      // Stale-leftover cleanup (F-1): a tombstoned folder placeholder whose
+      // EMPTY directory still exists on disk — the residue of a record-only
+      // tombstone application (an adapter without `removeDir`, or a removal
+      // that lost a race). The scan deliberately classifies these as
+      // `staleDirs` instead of `emptyFolders`, so nothing below re-pushes
+      // them as placeholders (that re-push resurrected deleted folders and
+      // ping-ponged the deletion between devices). Retrying the removal here
+      // converges storage onto the tombstone.
+      for (const dir of localChanges.staleDirs ?? []) {
+        await removeDirIfVacant(this.options.storage, this.index, dir);
       }
 
       const folderCommits: StagedCommit[] = [];

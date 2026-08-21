@@ -15,7 +15,7 @@
 
 import type { FileStat, StorageAdapter } from '@vsa/core';
 import { normalizeVaultPath } from '@vsa/core';
-import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, rmdir, stat } from 'node:fs/promises';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { writeFileAtomic } from './util.js';
 
@@ -108,6 +108,23 @@ export class NodeStorageAdapter implements StorageAdapter {
 
   async ensureDir(path: string): Promise<void> {
     await mkdir(this.toHostPath(path), { recursive: true });
+  }
+
+  /**
+   * Remove an EMPTY directory (the `StorageAdapter.removeDir` contract):
+   * `rmdir` removes empty directories only — a non-empty one fails with
+   * ENOTEMPTY rather than cascading (core pre-checks emptiness and treats
+   * the refusal as record-only). ENOENT is swallowed, making the removal
+   * idempotent. (`fs.rm` with `recursive: false` is not usable here — it
+   * refuses EVERY directory with EISDIR on Windows.)
+   */
+  async removeDir(path: string): Promise<void> {
+    try {
+      await rmdir(this.toHostPath(path));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+      throw error;
+    }
   }
 
   async exists(path: string): Promise<boolean> {

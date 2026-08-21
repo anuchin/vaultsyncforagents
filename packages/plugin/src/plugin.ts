@@ -195,10 +195,28 @@ export class VaultSyncPlugin extends Plugin {
     return typed !== '' ? typed : defaultDeviceName();
   }
 
+  /**
+   * The vault-backed storage adapter every sync surface uses. Wires the
+   * empty-folder removal through `fileManager.trashFile` — Obsidian's
+   * `DataAdapter.rmdir` refuses EVERY directory (`ERR_FS_EISDIR`), which
+   * silently degraded folder-tombstone application to record-only (F-1).
+   * Trash (not delete) because an empty folder is trivially recoverable.
+   */
+  private createStorageAdapter(): ObsidianStorageAdapter {
+    return new ObsidianStorageAdapter({
+      adapter: this.app.vault.adapter,
+      removeEmptyDir: async (adapterPath) => {
+        const folder = this.app.vault.getAbstractFileByPath(adapterPath);
+        if (folder === null) return; // raced away / tree not caught up — idempotent
+        await this.app.fileManager.trashFile(folder);
+      },
+    });
+  }
+
   /** Write the FR-44 marker the CLI/daemon read to detect double-clients. */
   private async writeDeviceMarker(): Promise<void> {
     if (!this.linked) return;
-    const storage = new ObsidianStorageAdapter({ adapter: this.app.vault.adapter });
+    const storage = this.createStorageAdapter();
     const marker = {
       deviceId: this.data.deviceId,
       deviceName: this.resolveDeviceName(),
@@ -257,7 +275,7 @@ export class VaultSyncPlugin extends Plugin {
 
     const { url, token, deviceId } = this.data;
     const deviceName = this.resolveDeviceName();
-    const storage = new ObsidianStorageAdapter({ adapter: this.app.vault.adapter });
+    const storage = this.createStorageAdapter();
     await this.warnIfForeignStateDir(storage);
 
     const client = new SyncClient({
@@ -502,7 +520,7 @@ export class VaultSyncPlugin extends Plugin {
     // Clear local sync state (device marker + index) so a future client —
     // this plugin after a re-pair, the daemon, the CLI — starts clean
     // (FR-44: stale state would make it refuse or mis-sync).
-    const storage = new ObsidianStorageAdapter({ adapter: this.app.vault.adapter });
+    const storage = this.createStorageAdapter();
     await storage.deleteFile(DEVICE_MARKER_VAULT_PATH);
     await storage.deleteFile(LOCAL_INDEX_VAULT_PATH);
     this.data = {

@@ -1,11 +1,12 @@
 /**
  * CORS policy (src/index.ts module comment): the plugin-facing routes
- * (GET /health, POST /pair, GET/PUT /blob/:hash) are reachable from the
- * Obsidian plugin's cross-origin renderer (`app://obsidian.md` desktop,
- * `capacitor://` origins mobile) — preflights answer 204 + the full header
- * set in BOTH claim states, and actual responses carry the same headers.
- * Dashboard surface (/admin/*, /api/*, /claim, /ws) stays same-origin only:
- * no Access-Control-* headers, ever.
+ * (GET /health, POST /pair, PATCH /device, GET /api/status with the device
+ * token, GET/PUT /blob/:hash) are reachable from the Obsidian plugin's
+ * cross-origin renderer (`app://obsidian.md` desktop, `capacitor://` origins
+ * mobile) — preflights answer 204 + the full header set in BOTH claim states,
+ * and actual responses carry the same headers. Dashboard surface (/admin/*,
+ * every OTHER /api/* route incl. /api/history, /claim, /ws) stays same-origin
+ * only: no Access-Control-* headers, ever.
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -58,17 +59,17 @@ beforeEach(async () => {
 });
 
 describe('plugin-facing routes: preflights (both claim states)', () => {
-  it('OPTIONS on /health, /pair and /blob/:hash answers 204 with the full header set (unclaimed)', async () => {
-    for (const path of ['/health', '/pair', '/blob/' + 'a'.repeat(64)]) {
+  it('OPTIONS on /health, /pair, /api/status and /blob/:hash answers 204 with the full header set (unclaimed)', async () => {
+    for (const path of ['/health', '/pair', '/api/status', '/blob/' + 'a'.repeat(64)]) {
       const res = await preflight(path);
       expect(res.status, path).toBe(204);
       expectCorsHeaders(res);
     }
   });
 
-  it('OPTIONS on /health, /pair and /blob/:hash still answers 204 after claim', async () => {
+  it('OPTIONS on /health, /pair, /api/status and /blob/:hash still answers 204 after claim', async () => {
     await claim({ passphrase: 'pppp' });
-    for (const path of ['/health', '/pair', '/blob/' + 'b'.repeat(64)]) {
+    for (const path of ['/health', '/pair', '/api/status', '/blob/' + 'b'.repeat(64)]) {
       const res = await preflight(path);
       expect(res.status, path).toBe(204);
       expectCorsHeaders(res);
@@ -131,6 +132,24 @@ describe('plugin-facing routes: actual responses carry the headers', () => {
     expect(new Uint8Array(await getRes.arrayBuffer())).toEqual(bytes);
   });
 
+  it('GET /api/status with the device token carries the headers (the About section reads it cross-origin)', async () => {
+    const claimed = await claim();
+    const res = await get('/api/status', {
+      origin: PLUGIN_ORIGIN,
+      authorization: `Bearer ${claimed.token}`,
+    });
+    expect(res.status).toBe(200);
+    expectCorsHeaders(res);
+    const body = (await res.json()) as { storageBytes?: number };
+    expect(typeof body.storageBytes).toBe('number');
+  });
+
+  it('the 421 unclaimed gate for /api/status is CORS-readable too', async () => {
+    const res = await get('/api/status', { origin: PLUGIN_ORIGIN });
+    expect(res.status).toBe(421);
+    expectCorsHeaders(res);
+  });
+
   it('unauthenticated plugin calls still get 401 WITH the headers (errors stay readable)', async () => {
     await claim();
     const hash = await hashOf(enc('locked bytes'));
@@ -152,14 +171,22 @@ describe('plugin-facing routes: actual responses carry the headers', () => {
 });
 
 describe('dashboard surface stays same-origin (no CORS headers)', () => {
-  it('GET /api/status responses contain no Access-Control-* headers', async () => {
+  it('GET /api/history responses contain no Access-Control-* headers (only /api/status is plugin-CORS)', async () => {
     const claimed = await claim();
-    const res = await get('/api/status', {
+    const res = await get('/api/history?path=%2Fnote.md', {
       origin: PLUGIN_ORIGIN,
       authorization: `Bearer ${claimed.token}`,
     });
-    expect(res.status).toBe(200);
     expectNoCorsHeaders(res);
+  });
+
+  it('OPTIONS on /api/history and /ws do not get permissive CORS', async () => {
+    await claim({ passphrase: 'pppp' });
+    for (const path of ['/api/history', '/ws']) {
+      const res = await preflight(path);
+      expect(res.status, path).not.toBe(204); // falls through the router: no preflight there
+      expectNoCorsHeaders(res);
+    }
   });
 
   it('POST /admin/login responses contain no Access-Control-* headers', async () => {

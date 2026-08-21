@@ -395,3 +395,155 @@ describe('SyncClient — dropped-edit hardening (edit between hash and ack)', ()
     }
   });
 });
+
+// --- folder lifecycle through the LIVE change-application path ------------------------------
+//
+// The F-1/F-2 real-Obsidian E2E failed with index-tombstoned-but-dir-lingers
+// (40s+ observation, both the folder-tombstone and prune-on-delete flows)
+// while every unit test stayed green: nothing asserted that the client's
+// change-application path (handleChange → applyPull → applyOnePull, and the
+// cycle's prune loop) actually INVOKES adapter.removeDir. The deployed
+// adapter's hook threw on every call and the engine's deliberate record-only
+// fallback swallowed it silently. These tests enter where the plugin enters —
+// the server's change fan-out and the watcher-driven cycle — and assert the
+// hook itself: called with the right path, never on non-empty dirs, and
+// skipped gracefully when the capability is absent.
+
+/** Record every removeDir call on a rig's storage (delegation preserved). */
+function spyRemoveDir(storage: InMemoryStorageAdapter): string[] {
+  const calls: string[] = [];
+  const inner = storage.removeDir.bind(storage);
+  storage.removeDir = async (path: string): Promise<void> => {
+    calls.push(path);
+    await inner(path);
+  };
+  return calls;
+}
+
+describe('SyncClient — folder lifecycle via change application (removeDir invocation)', () => {
+  it('remote folder tombstone: the receiving device invokes removeDir with the folder path and removes the directory', async () => {
+    const { make } = rig();
+    const a = make('dev-a', 'Alpha');
+    const b = make('dev-b', 'Beta');
+    await a.client.connect();
+    await b.client.connect();
+    await settle(a, b);
+
+    // Empty folder created on A propagates as a placeholder to B (FR-10).
+    await a.storage.ensureDir('/tempfolder');
+    await a.client.triggerSync();
+    await settle(a, b);
+    expect(await b.storage.exists('/tempfolder')).toBe(true);
+    expect(b.client.currentIndex()['/tempfolder']?.isFolder).toBe(true);
+
+    const bCalls = spyRemoveDir(b.storage);
+    const marker = b.sent.length;
+
+    // A deletes the empty folder; B receives the tombstone as a live change.
+    await a.storage.removeDir('/tempfolder');
+    await a.client.triggerSync();
+    await settle(a, b);
+
+    // The assertion the E2E proved missing in the wild: the hook ran, with
+    // the exact vault path, and the directory actually left B's disk.
+    expect(bCalls).toEqual(['/tempfolder']);
+    expect(await b.storage.exists('/tempfolder')).toBe(false);
+    expect(b.client.currentIndex()['/tempfolder']?.deletedAt).toBeDefined();
+    // No resurrection: B never re-pushes the deleted folder.
+    expect(
+      b.sent
+        .slice(marker)
+        .filter((m) => m.type === 'commit' && (m as { path?: string }).path === '/tempfolder'),
+    ).toEqual([]);
+  });
+
+  it('prune-on-delete: a remote file deletion that empties a folder invokes removeDir on BOTH sides', async () => {
+    const { make } = rig();
+    const a = make('dev-a', 'Alpha');
+    const b = make('dev-b', 'Beta');
+    await a.client.connect();
+    await b.client.connect();
+    await settle(a, b);
+
+    await a.storage.writeFile('/prunedir/keep.md', enc('content'));
+    await a.client.triggerSync();
+    await settle(a, b);
+    expect(await b.storage.exists('/prunedir/keep.md')).toBe(true);
+
+    const aCalls = spyRemoveDir(a.storage);
+    const bCalls = spyRemoveDir(b.storage);
+
+    await a.storage.deleteFile('/prunedir/keep.md');
+    await a.client.triggerSync();
+    await settle(a, b);
+
+    // Deleter side (the cycle's prune-on-delete loop)…
+    expect(aCalls).toEqual(['/prunedir']);
+    expect(await a.storage.exists('/prunedir')).toBe(false);
+    // …and receiving side (applyOnePull's delete branch) — the E2E's broken half.
+    expect(bCalls).toEqual(['/prunedir']);
+    expect(await b.storage.exists('/prunedir')).toBe(false);
+    expect(await b.storage.exists('/prunedir/keep.md')).toBe(false);
+    // The emptied folder was never re-pushed as a placeholder on either side.
+    expect(a.client.currentIndex()['/prunedir']).toBeUndefined();
+    expect(b.client.currentIndex()['/prunedir']).toBeUndefined();
+  });
+
+  it('non-empty parent: a remote file deletion never invokes removeDir', async () => {
+    const { make } = rig();
+    const a = make('dev-a', 'Alpha');
+    const b = make('dev-b', 'Beta');
+    await a.client.connect();
+    await b.client.connect();
+    await settle(a, b);
+
+    await a.storage.writeFile('/full/a.md', enc('a'));
+    await a.storage.writeFile('/full/b.md', enc('b'));
+    await a.client.triggerSync();
+    await settle(a, b);
+
+    const bCalls = spyRemoveDir(b.storage);
+
+    await a.storage.deleteFile('/full/a.md');
+    await a.client.triggerSync();
+    await settle(a, b);
+
+    expect(bCalls).toEqual([]); // '/full' still holds b.md — the hook is never attempted
+    expect(await b.storage.exists('/full')).toBe(true);
+    expect(text(await b.storage.readFile('/full/b.md'))).toBe('b');
+    expect(b.client.currentIndex()['/full/a.md']?.deletedAt).toBeDefined();
+  });
+
+  it('an adapter without the removeDir hook applies the tombstone record-only and never crashes', async () => {
+    const { make } = rig();
+    const a = make('dev-a', 'Alpha');
+    const b = make('dev-b', 'Beta');
+    await a.client.connect();
+    await b.client.connect();
+    await settle(a, b);
+
+    await a.storage.ensureDir('/tempfolder');
+    await a.client.triggerSync();
+    await settle(a, b);
+    expect(await b.storage.exists('/tempfolder')).toBe(true);
+
+    // The pre-hook adapter shape (the deployed bundle's rmdir-only removeDir
+    // was effectively this: unusable for directories on the real vault).
+    (b.storage as unknown as { removeDir?: unknown }).removeDir = undefined;
+
+    await a.storage.removeDir('/tempfolder');
+    await a.client.triggerSync();
+    await settle(a, b);
+
+    // Record-only: no throw, index tombstoned, directory lingers.
+    expect(await b.storage.exists('/tempfolder')).toBe(true);
+    expect(b.client.currentIndex()['/tempfolder']?.deletedAt).toBeDefined();
+    // The stale-leftover rule keeps B from re-pushing it (no resurrection);
+    // the per-cycle removeDir retry degrades to a graceful no-op.
+    await b.client.triggerSync();
+    await settle(a, b);
+    expect(
+      b.sent.filter((m) => m.type === 'commit' && (m as { path?: string }).path === '/tempfolder'),
+    ).toEqual([]);
+  });
+});
