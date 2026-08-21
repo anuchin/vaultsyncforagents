@@ -1,0 +1,1178 @@
+{
+  "startedAt": "2026-08-21T09:57:12.008Z",
+  "resumedAt": "2026-08-21T10:12:04.501Z",
+  "worker": "http://127.0.0.1:8797",
+  "cleanMode": {
+    "webSecurityDisabled": false,
+    "overridesInjected": false,
+    "pairFromSettingsCalled": false
+  },
+  "steps": [
+    {
+      "id": "prep",
+      "name": "kill Obsidian; /health; refresh plugin main.js/manifest/styles into BOTH vaults; write throwaway dual-vault profiles",
+      "status": "PASS",
+      "t0": 1787306232009,
+      "ms": 1699,
+      "detail": {
+        "health": {
+          "ok": true,
+          "claimed": true
+        },
+        "pluginRefresh": {
+          "TestVault4": {
+            "copied": [
+              "main.js",
+              "manifest.json",
+              "styles.css"
+            ],
+            "pairing": {
+              "deviceId": "dev-f11db1bdf72d",
+              "tokenLen": 43,
+              "deviceName": "e2e-vault4",
+              "url": "http://127.0.0.1:8797"
+            }
+          },
+          "TestVault5": {
+            "copied": [
+              "main.js",
+              "manifest.json",
+              "styles.css"
+            ],
+            "pairing": {
+              "deviceId": "dev-4b179dc45512",
+              "tokenLen": 43,
+              "deviceName": "e2e-vault5",
+              "url": "http://127.0.0.1:8797"
+            }
+          }
+        },
+        "profileA": "written Z:/Projects/TestVaults/e2e-hardened-profile/obsidian.json (2 vault(s), open: Z:/Projects/TestVaults/TestVault4)",
+        "profileB": "written Z:/Projects/TestVaults/e2e-hardened-profile-b/obsidian.json (2 vault(s), open: Z:/Projects/TestVaults/TestVault5)",
+        "cdpPorts": {
+          "vault4": 9222,
+          "vault5": 9223
+        },
+        "launchFlags": [
+          "--user-data-dir=…",
+          "--remote-debugging-port=…",
+          "NO --disable-web-security"
+        ]
+      }
+    },
+    {
+      "id": "S1",
+      "name": "launch both instances (NO pairFromSettings) — existing pairing auto-reconnects: state live, tokens intact, vsa ✓, both devices online",
+      "status": "PASS",
+      "t0": 1787306233708,
+      "ms": 4373,
+      "detail": {
+        "headline": "PAIRING PERSISTED ACROSS PLUGIN UPGRADE — both clients auto-reconnected live with untouched tokens",
+        "pids": {
+          "vault4": 20612,
+          "vault5": 12604
+        },
+        "vaults": {
+          "vault4": {
+            "statusBar": "vsa ✓ 1s",
+            "state": "live",
+            "deviceId": "dev-f11db1bdf72d",
+            "tokenLen": 43,
+            "readyMs": 4165,
+            "dialogs": [
+              "Trust author and enable plugins"
+            ]
+          },
+          "vault5": {
+            "statusBar": "vsa ✓ 1s",
+            "state": "live",
+            "deviceId": "dev-4b179dc45512",
+            "tokenLen": 43,
+            "readyMs": 4165,
+            "dialogs": [
+              "Trust author and enable plugins"
+            ]
+          }
+        },
+        "devicesOnline": [
+          "e2e-vault4",
+          "e2e-vault5"
+        ]
+      }
+    },
+    {
+      "id": "S2",
+      "name": "X/Y progress: burst of 30 notes in vault4 (loop app.vault.create); capture {phase,done,total}; all arrive byte-identical in vault5",
+      "status": "FAIL",
+      "t0": 1787306238081,
+      "ms": 5678,
+      "detail": {
+        "evidencePath": "pause→edit-30→resume catch-up cycle (live burst split its cycles)",
+        "latencyAllArrivedMs": 2524,
+        "spotChecks": {
+          "e2e-h-01.md": {
+            "identical": true,
+            "len": 41
+          },
+          "e2e-h-15.md": {
+            "identical": true,
+            "len": 42
+          },
+          "e2e-h-30.md": {
+            "identical": true,
+            "len": 42
+          }
+        },
+        "vault4Progress": {
+          "count": 4,
+          "phases": [
+            "pushing"
+          ],
+          "maxTotal": 31,
+          "completeSeen": false,
+          "lastComplete": null,
+          "capturesHead": [
+            {
+              "t": 1787306238635,
+              "phase": "pushing",
+              "done": 0,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            },
+            {
+              "t": 1787306238687,
+              "phase": "pushing",
+              "done": 2,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            },
+            {
+              "t": 1787306238732,
+              "phase": "pushing",
+              "done": 2,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            },
+            {
+              "t": 1787306238782,
+              "phase": "pushing",
+              "done": 10,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            }
+          ],
+          "capturesTail": [
+            {
+              "t": 1787306238635,
+              "phase": "pushing",
+              "done": 0,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            },
+            {
+              "t": 1787306238687,
+              "phase": "pushing",
+              "done": 2,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            },
+            {
+              "t": 1787306238732,
+              "phase": "pushing",
+              "done": 2,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            },
+            {
+              "t": 1787306238782,
+              "phase": "pushing",
+              "done": 10,
+              "total": 31,
+              "sb": "vsa ✓ 2s"
+            }
+          ]
+        },
+        "vault5Progress": {
+          "count": 0,
+          "phases": [],
+          "maxTotal": 0,
+          "completeSeen": false,
+          "lastComplete": null
+        },
+        "softProblems": [
+          "vault4: never captured done >= total"
+        ],
+        "fallbackPauseResume": {
+          "pausedWas": false,
+          "state": "live"
+        },
+        "fallbackLatencyMs": 1048,
+        "fallbackProgress": {
+          "count": 4,
+          "phases": [
+            "scanning",
+            "pushing"
+          ],
+          "maxTotal": 33,
+          "completeSeen": false,
+          "lastComplete": null,
+          "capturesTail": [
+            {
+              "t": 1787306241013,
+              "phase": "scanning",
+              "done": 0,
+              "total": 33,
+              "sb": null
+            },
+            {
+              "t": 1787306241064,
+              "phase": "pushing",
+              "done": 0,
+              "total": 30,
+              "sb": null
+            },
+            {
+              "t": 1787306241115,
+              "phase": "pushing",
+              "done": 5,
+              "total": 30,
+              "sb": null
+            },
+            {
+              "t": 1787306241163,
+              "phase": "pushing",
+              "done": 14,
+              "total": 30,
+              "sb": null
+            }
+          ]
+        },
+        "verdict": "progress feature still not demonstrated: maxTotal=33 completeSeen=false"
+      }
+    },
+    {
+      "id": "relaunch",
+      "name": "relaunch both instances after external kill (throwaway profiles, NO --disable-web-security) — pairing auto-reconnects: state live, tokens intact, vsa ✓, both devices online",
+      "status": "PASS",
+      "t0": 1787307124530,
+      "ms": 3791,
+      "detail": {
+        "headline": "RELAUNCH AFTER EXTERNAL KILL — both clients auto-reconnected live with untouched tokens",
+        "pids": {
+          "vault4": 8072,
+          "vault5": 18580
+        },
+        "vaults": {
+          "vault4": {
+            "statusBar": "vsa ✓ 0s",
+            "state": "live",
+            "deviceId": "dev-f11db1bdf72d",
+            "tokenLen": 43,
+            "deviceName": "e2e-vault4",
+            "readyMs": 1026,
+            "dialogs": []
+          },
+          "vault5": {
+            "statusBar": "vsa ✓ 0s",
+            "state": "live",
+            "deviceId": "dev-4b179dc45512",
+            "tokenLen": 43,
+            "deviceName": "e2e-vault5",
+            "readyMs": 1025,
+            "dialogs": []
+          }
+        },
+        "devicesOnline": [
+          "e2e-vault4",
+          "e2e-vault5"
+        ]
+      }
+    },
+    {
+      "id": "S3",
+      "name": "pause vault5 → vault4 edit must NOT arrive (~10s) → resume → edit arrives ≤25s (catch-up through reconnect)",
+      "status": "PASS",
+      "t0": 1787307128321,
+      "ms": 10513,
+      "detail": {
+        "pausedUi": {
+          "paused": true,
+          "hasClient": true,
+          "statusState": "idle",
+          "statusBar": "vsa ⏸"
+        },
+        "statusBarWhilePaused": "vsa ⏸",
+        "whilePausedSamples": [
+          {
+            "t_s": 2,
+            "content": "v1(unchanged)"
+          },
+          {
+            "t_s": 4,
+            "content": "v1(unchanged)"
+          },
+          {
+            "t_s": 6,
+            "content": "v1(unchanged)"
+          },
+          {
+            "t_s": 8,
+            "content": "v1(unchanged)"
+          },
+          {
+            "t_s": 10,
+            "content": "v1(unchanged)"
+          }
+        ],
+        "resumeState": {
+          "paused": false,
+          "hasClient": true,
+          "state": "live",
+          "statusBar": "vsa ✓ 0s"
+        },
+        "catchUpLatencyMs": 6,
+        "totalPausedMs": 10054,
+        "statusBarAfter": "vsa ✓ 0s"
+      }
+    },
+    {
+      "id": "S4",
+      "name": "rename vault5 device \"e2e-vault5\" → \"e2e-vault5-renamed\" via plugin renameDevice (PATCH /device); admin /api/status lists new name, old gone; vault5's own state reflects it",
+      "status": "PASS",
+      "t0": 1787307138834,
+      "ms": 29,
+      "detail": {
+        "pluginResult": {
+          "ok": true,
+          "deviceName": "e2e-vault5-renamed"
+        },
+        "livePluginDeviceName": "e2e-vault5-renamed",
+        "markerDeviceName": "e2e-vault5-renamed",
+        "devicesAfter": [
+          {
+            "id": "dev-d4262190a978",
+            "name": "e2e-admin",
+            "online": false
+          },
+          {
+            "id": "dev-f11db1bdf72d",
+            "name": "e2e-vault4",
+            "online": true
+          },
+          {
+            "id": "dev-4b179dc45512",
+            "name": "e2e-vault5-renamed",
+            "online": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "S5",
+      "name": "ignore \"private/**\" on vault4 (applyIgnorePatterns): public-ok.md ARRIVES in vault5; private/secret.md absent ≥15s AND absent from worker history",
+      "status": "PASS",
+      "t0": 1787307138863,
+      "ms": 15719,
+      "detail": {
+        "applied": {
+          "ignorePatterns": "private/**",
+          "state": "live"
+        },
+        "publicOkLatencyMs": 412,
+        "secretAbsenceSamples": [
+          {
+            "t_s": 3,
+            "secretInVault5": false
+          },
+          {
+            "t_s": 6,
+            "secretInVault5": false
+          },
+          {
+            "t_s": 9,
+            "secretInVault5": false
+          },
+          {
+            "t_s": 12,
+            "secretInVault5": false
+          },
+          {
+            "t_s": 15,
+            "secretInVault5": false
+          }
+        ],
+        "workerHistory": {
+          "status": 200,
+          "body": {
+            "path": "/private/secret.md",
+            "head": null,
+            "versions": []
+          }
+        },
+        "privateFolderPlaceholderInVault5": false,
+        "cleanup": "cleaned",
+        "ignoreRevertedTo": ""
+      }
+    },
+    {
+      "id": "S6a",
+      "name": "empty-folder tombstone fix (a): 'tempfolder' placeholder reaches vault5 → delete EMPTY folder in vault4 → placeholder DISAPPEARS from vault5 ≤40s",
+      "status": "FAIL",
+      "t0": 1787308372336,
+      "ms": 171,
+      "detail": {
+        "headline": "REAL FINDING — empty-folder tombstone does not propagate; the folder RESURRECTS on the deleting side within ~1 rescan cycle",
+        "attempts": 2,
+        "bothAttemptsError": "tempfolder placeholder STILL PRESENT in vault5 after 40s (deleteMethod=fileManager.trashFile, v4StillHasIt=true) — tombstone fix NOT working",
+        "attemptWindowMs": 83000,
+        "deleteMethodUsed": "fileManager.trashFile (returned without error both times)",
+        "postMortem": {
+          "vault4DirMtime": "2026-08-21T10:13:48.856Z",
+          "vault5DirMtime": "2026-08-21T10:12:34.908Z",
+          "vault5DirNeverRemoved": "mtime unchanged from placeholder creation → vault5 never applied the deletion locally",
+          "vault4DirResurrected": "mtime ~26s after the retry delete (one 30s rescan cycle later) → vault4 got the folder BACK",
+          "indexTempfolderBothVaults": {
+            "TestVault4": "/tempfolder\":{\"hash\":\"\",\"size\":0,\"versionId\":\"v91\",\"clock\":{\"counter\":5,\"deviceId\":\"dev-4b179dc45512\"},\"isFolder\":true},\"/to-delete\":{\"hash\":\"\",\"size\":0,\"versio",
+            "TestVault5": "/tempfolder\":{\"hash\":\"\",\"size\":0,\"versionId\":\"v91\",\"clock\":{\"counter\":5,\"deviceId\":\"dev-4b179dc45512\"},\"isFolder\":true},\"/to-delete\":{\"hash\":\"\",\"size\":0,\"versio"
+          },
+          "survivingPlaceholderAuthoredBy": "dev-4b179dc45512 (VAULT5) clock counter 5 → vault5 re-pushed the placeholder after vault4 tombstoned it; a vault4-side retry create would have been authored by dev-f11db1bdf72d",
+          "trashFolders": "no .trash/ in either vault (system-trash move; delete event did fire)",
+          "workerHistory": {
+            "status": 200,
+            "body": {
+              "path": "/tempfolder",
+              "head": {
+                "versionId": "v91",
+                "deleted": false
+              },
+              "versions": [
+                {
+                  "id": "v91",
+                  "hash": "",
+                  "size": 0,
+                  "deviceId": "dev-4b179dc45512",
+                  "clock": {
+                    "counter": 5,
+                    "deviceId": "dev-4b179dc45512"
+                  },
+                  "ts": 1787307228854,
+                  "kind": "edit",
+                  "current": true
+                },
+                {
+                  "id": "v90",
+                  "hash": "",
+                  "size": 0,
+                  "deviceId": "dev-f11db1bdf72d",
+                  "clock": {
+                    "counter": 4,
+                    "deviceId": "dev-f11db1bdf72d"
+                  },
+                  "ts": 1787307202427,
+                  "kind": "delete",
+                  "current": false
+                },
+                {
+                  "id": "v84",
+                  "hash": "",
+                  "size": 0,
+                  "deviceId": "dev-4b179dc45512",
+                  "clock": {
+                    "counter": 3,
+                    "deviceId": "dev-4b179dc45512"
+                  },
+                  "ts": 1787307168861,
+                  "kind": "edit",
+                  "current": false
+                },
+                {
+                  "id": "v83",
+                  "hash": "",
+                  "size": 0,
+                  "deviceId": "dev-f11db1bdf72d",
+                  "clock": {
+                    "counter": 2,
+                    "deviceId": "dev-f11db1bdf72d"
+                  },
+                  "ts": 1787307158970,
+                  "kind": "delete",
+                  "current": false
+                },
+                {
+                  "id": "v82",
+                  "hash": "",
+                  "size": 0,
+                  "deviceId": "dev-f11db1bdf72d",
+                  "clock": {
+                    "counter": 1,
+                    "deviceId": "dev-f11db1bdf72d"
+                  },
+                  "ts": 1787307154906,
+                  "kind": "edit",
+                  "current": false
+                }
+              ]
+            }
+          },
+          "buildFreshness": {
+            "mainJsBuilt": "2026-08-21T08:56:36Z (14:26:36 IST)",
+            "newestCoreSrc": "packages/core/src/client.ts 2026-08-21T08:05:41Z (13:35 IST)",
+            "fixPresentInBundle": "emptiedDirs ×3 in main.js (comments stripped by minifier; variable survives)"
+          }
+        },
+        "mechanism": "consistent with: vault5 receives the folder tombstone but never removes its local empty dir (record-only path or failed removeDir); a later vault5 scan resolves \"local dir present vs tombstoned/live entry\" as local-wins and RE-PUSHES the placeholder (v91@5), which vault4 then pulls — the source-side delete is permanently lost",
+        "priorBaseline": "pre-fix run (report-2vault.json F5, KNOWN-GAP-CONFIRMED): placeholder stuck remotely but the deleting side STAYED deleted — the current build additionally resurrects the folder on the deleting side"
+      }
+    },
+    {
+      "id": "relaunch2",
+      "name": "relaunch both instances (previous teardown killed them) — pairing auto-reconnects live, tokens intact",
+      "status": "PASS",
+      "t0": 1787308372507,
+      "ms": 2721,
+      "detail": {
+        "headline": "both clients reconnected live with untouched tokens",
+        "pids": {
+          "vault4": 3416,
+          "vault5": 17892
+        },
+        "vaults": {
+          "vault4": {
+            "statusBar": "vsa ✓ 0s",
+            "state": "live",
+            "deviceId": "dev-f11db1bdf72d",
+            "tokenLen": 43,
+            "deviceName": "e2e-vault4"
+          },
+          "vault5": {
+            "statusBar": "vsa ✓ 0s",
+            "state": "live",
+            "deviceId": "dev-4b179dc45512",
+            "tokenLen": 43,
+            "deviceName": "e2e-vault5-renamed"
+          }
+        }
+      }
+    },
+    {
+      "id": "cors-repro",
+      "name": "deterministic repro: open vault5 plugin settings (About section renders → GET /api/status cross-origin) — CORS preflight must NOT fail but does",
+      "status": "FAIL",
+      "t0": 1787308375228,
+      "ms": 3161,
+      "detail": {
+        "headline": "CORS tripwire REPRODUCED on demand — plugin About section can never load storage summary in stock Obsidian",
+        "captured": [
+          {
+            "ts": "2026-08-21T10:32:55.406Z",
+            "source": "javascript",
+            "level": "error",
+            "text": "Access to fetch at 'http://127.0.0.1:8797/api/status' from origin 'app://obsidian.md' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource. (app://obsidian.md/index.html:?)"
+          },
+          {
+            "ts": "2026-08-21T10:32:55.406Z",
+            "source": "network",
+            "level": "error",
+            "text": "Failed to load resource: net::ERR_FAILED (http://127.0.0.1:8797/api/status:?)"
+          }
+        ],
+        "rootCause": {
+          "pluginSide": "workerapi.ts fetchWorkerStatus() calls GET {origin}/api/status with an Authorization header from the RENDERER (globalThis.fetch; overrides.fetchImpl undefined in clean/stock mode) → cross-origin from app://obsidian.md → preflight",
+          "workerSide": "worker index.ts isPluginCorsPath(): CORS headers are deliberately emitted ONLY for /health, /pair, /device, /blob/* — \"/api/* stays same-origin only\" (anti-CSRF for the dashboard cookie) → /api/status preflight always fails",
+          "consequence": "the About \"Vault storage\" line always degrades to \"Storage usage is currently unavailable (the worker is unreachable)\" and every settings open drops a console error; PATCH /device works because /device IS a plugin-CORS path",
+          "fix": "move the device-token status read off /api/* (e.g., plugin-CORS path like /device/status) or carry it over the existing WS transport"
+        }
+      }
+    },
+    {
+      "id": "S6b",
+      "name": "empty-folder tombstone fix (b): 'resurrect/keep.md' synced; delete FILE in vault4 → file gone in vault5 AND empty 'resurrect' does NOT resurrect across 40s (two rescan cycles)",
+      "status": "FAIL",
+      "t0": 1787308378389,
+      "ms": 87812,
+      "detail": {
+        "error": "empty 'resurrect' folder RESURRECTED in vault5 and stayed ≥40s: [{\"t_s\":0,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":5,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":10,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":15,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":20,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":25,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":30,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":35,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":40,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true}]",
+        "firstError": "empty 'resurrect' folder RESURRECTED in vault5 and stayed ≥40s: [{\"t_s\":0,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":5,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":10,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":15,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":20,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":25,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":30,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":35,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true},{\"t_s\":40,\"v5Folder\":true,\"v5File\":false,\"v4Folder\":true}]"
+      }
+    },
+    {
+      "id": "S7",
+      "name": "final sanity: both plugins live/pending 0/conflicts 0; /api/status shows e2e-vault4 + e2e-vault5-renamed online; zero console errors across the whole run",
+      "status": "FAIL",
+      "t0": 1787308466201,
+      "ms": 3017,
+      "detail": {
+        "vault4": {
+          "state": "live",
+          "pending": 0,
+          "statusBar": "vsa ✓ 3s",
+          "lastSyncAt": 1787308465007
+        },
+        "vault5": {
+          "state": "live",
+          "pending": 0,
+          "statusBar": "vsa ✓ 3s",
+          "lastSyncAt": 1787308465007,
+          "deviceName": "e2e-vault5-renamed"
+        },
+        "conflictFiles": {
+          "vault4": [],
+          "vault5": []
+        },
+        "devices": [
+          {
+            "name": "e2e-admin",
+            "online": false,
+            "revoked": false
+          },
+          {
+            "name": "e2e-vault4",
+            "online": true,
+            "revoked": false
+          },
+          {
+            "name": "e2e-vault5-renamed",
+            "online": true,
+            "revoked": false
+          }
+        ],
+        "storageSummary": {
+          "storageBytes": 617319,
+          "attachments": {
+            "count": 1,
+            "bytes": 614400
+          }
+        },
+        "storageSane": true,
+        "consoleTripwire": {
+          "sessionErrorEntries": 2,
+          "sessionTripwireHits": [
+            {
+              "ts": "2026-08-21T10:32:55.406Z",
+              "source": "javascript",
+              "level": "error",
+              "text": "Access to fetch at 'http://127.0.0.1:8797/api/status' from origin 'app://obsidian.md' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource. (app://obsidian.md/index.html:?)"
+            }
+          ],
+          "wholeRunNote": "the same CORS pair also occurred spontaneously at 2026-08-21T10:13:29Z (vault5) and is deterministically reproduced by the cors-repro step — see the finding"
+        },
+        "verdict": "sync sanity itself ALL GREEN — but the zero-console-errors criterion FAILS: 1 CORS tripwire hit(s) this session (root-caused product defect: About /api/status vs worker's same-origin-only /api/* policy)"
+      }
+    }
+  ],
+  "decisions": [
+    "S2 live burst did not show total>=30 (vault4: never captured done >= total) — running deterministic fallback: pause vault4, edit the same 30 notes, resume so one catch-up cycle carries them",
+    "RESUMED RUN: prep/S1/S2 completed in the interrupted run and are preserved verbatim; stale RUNNING S3 dropped (Obsidian was killed externally before its assertions ran).",
+    "S2 verdict note (per brief, NOT re-litigated): FAIL is a polling-resolution artifact — progress WAS captured live (vault4 frames pushing 0→10/31 during the burst) but the terminal {done>=total} frame lives <50 ms, shorter than the sampler interval. S2's substantive assertions passed: all 30 notes arrived byte-identical in vault5 (2524 ms) and X/Y frames were captured.",
+    "device stays renamed to \"e2e-vault5-renamed\" after teardown (per brief; old name intentionally gone from the room)",
+    "S5: ignore pattern reverted to \"\" after assertions (dogfood config restored); secret file was shredded BEFORE the revert so it can never sync",
+    "S6a FAIL is a REAL FINDING against the F5 gap-fix build (fix code verified present in the bundle): source-side empty-folder delete is lost and the folder resurrects on the deleting side, re-authored by the receiving client. Left tempfolder in place during S6b/S7 so the state stayed live for evidence.",
+    "cors-repro: the S7 \"zero console errors\" criterion is failed by this deterministic product defect (also occurred spontaneously at 2026-08-21T10:13:29Z during S6a). Recorded as a FINDING, not run contamination."
+  ],
+  "priorInterruptedRun": {
+    "fatal": "waitFor(arrival pause-probe.md) timed out after 25000 ms",
+    "finishedAt": "2026-08-21T09:57:49.376Z",
+    "overall": "FAIL",
+    "note": "Obsidian was killed externally mid-S3 (seed arrival wait); prep/S1/S2 evidence preserved above verbatim.",
+    "consoleProblems": {
+      "vault4": [
+        {
+          "ts": "2026-08-21T09:57:20.816Z",
+          "source": "console:warning",
+          "level": "warning",
+          "text": "[vsa] transport closed Object"
+        }
+      ],
+      "vault5": [
+        {
+          "ts": "2026-08-21T09:57:24.181Z",
+          "source": "console:warning",
+          "level": "warning",
+          "text": "[vsa] transport closed Object"
+        }
+      ]
+    }
+  },
+  "pids": {
+    "obsidianVault4": 3416,
+    "obsidianVault5": 17892
+  },
+  "consoleProblems": {
+    "vault4": [
+      {
+        "ts": "2026-08-21T10:12:18.866Z",
+        "source": "console:warning",
+        "level": "warning",
+        "text": "[vsa] transport closed Object"
+      },
+      {
+        "ts": "2026-08-21T10:12:34.529Z",
+        "source": "console:warning",
+        "level": "warning",
+        "text": "[vsa] transport closed Object"
+      }
+    ],
+    "vault5": [
+      {
+        "ts": "2026-08-21T10:12:08.737Z",
+        "source": "console:warning",
+        "level": "warning",
+        "text": "[vsa] transport closed Object"
+      },
+      {
+        "ts": "2026-08-21T10:13:29.377Z",
+        "source": "javascript",
+        "level": "error",
+        "text": "Access to fetch at 'http://127.0.0.1:8797/api/status' from origin 'app://obsidian.md' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource. (app://obsidian.md/index.html:?)"
+      },
+      {
+        "ts": "2026-08-21T10:13:29.378Z",
+        "source": "network",
+        "level": "error",
+        "text": "Failed to load resource: net::ERR_FAILED (http://127.0.0.1:8797/api/status:?)"
+      },
+      {
+        "ts": "2026-08-21T10:32:55.406Z",
+        "source": "javascript",
+        "level": "error",
+        "text": "Access to fetch at 'http://127.0.0.1:8797/api/status' from origin 'app://obsidian.md' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource. (app://obsidian.md/index.html:?)"
+      },
+      {
+        "ts": "2026-08-21T10:32:55.406Z",
+        "source": "network",
+        "level": "error",
+        "text": "Failed to load resource: net::ERR_FAILED (http://127.0.0.1:8797/api/status:?)"
+      }
+    ]
+  },
+  "workerLeftRunning": {
+    "url": "http://127.0.0.1:8797",
+    "listeningPids": [
+      "23528"
+    ],
+    "note": "wrangler dev --port 8797 --persist-to .wrangler/devstate-testvault (user dogfood room) — LEFT RUNNING"
+  },
+  "finishedAt": "2026-08-21T10:34:29.240Z",
+  "overall": "FAIL",
+  "overallNotes": [
+    "overall judges every completed step except S2, whose recorded FAIL is a polling-resolution artifact per brief (progress WAS captured live, all 30 notes arrived byte-identical).",
+    "S6a FAIL = real product finding F-1 (empty-folder tombstone lost + deleting-side resurrection).",
+    "S7 FAIL = real product finding F-2 (About /api/status CORS defect trips the console tripwire); sync sanity itself (live/pending 0/conflicts 0/devices/storage) was all green."
+  ],
+  "finalWorkerStatus": {
+    "vaultName": "two-vault-test",
+    "claimed": true,
+    "health": "ok",
+    "devices": [
+      {
+        "id": "dev-d4262190a978",
+        "name": "e2e-admin",
+        "type": "desktop",
+        "lastSeen": 0,
+        "revoked": false,
+        "online": false
+      },
+      {
+        "id": "dev-f11db1bdf72d",
+        "name": "e2e-vault4",
+        "type": "desktop",
+        "lastSeen": 1787308464988,
+        "revoked": false,
+        "online": true
+      },
+      {
+        "id": "dev-4b179dc45512",
+        "name": "e2e-vault5-renamed",
+        "type": "desktop",
+        "lastSeen": 1787308464990,
+        "revoked": false,
+        "online": true
+      }
+    ],
+    "lastEdit": {
+      "ts": 1787308426046,
+      "deviceId": "dev-f11db1bdf72d",
+      "path": "/resurrect/keep.md"
+    },
+    "attachments": {
+      "count": 1,
+      "bytes": 614400
+    },
+    "storageBytes": 617319,
+    "recentEvents": [
+      {
+        "seq": 96,
+        "ts": 1787308426046,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/resurrect/keep.md"
+      },
+      {
+        "seq": 95,
+        "ts": 1787308422637,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/resurrect/keep.md"
+      },
+      {
+        "seq": 94,
+        "ts": 1787308382482,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/resurrect"
+      },
+      {
+        "seq": 93,
+        "ts": 1787308382160,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/resurrect/keep.md"
+      },
+      {
+        "seq": 92,
+        "ts": 1787308378715,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/resurrect/keep.md"
+      },
+      {
+        "seq": 91,
+        "ts": 1787307228854,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/tempfolder"
+      },
+      {
+        "seq": 90,
+        "ts": 1787307202427,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/tempfolder"
+      },
+      {
+        "seq": 89,
+        "ts": 1787307201247,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/humantest.md"
+      },
+      {
+        "seq": 88,
+        "ts": 1787307198214,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/humantest.md"
+      },
+      {
+        "seq": 87,
+        "ts": 1787307196167,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/humantest.md"
+      },
+      {
+        "seq": 86,
+        "ts": 1787307190310,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/humantest.md"
+      },
+      {
+        "seq": 85,
+        "ts": 1787307186965,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/Untitled.md"
+      },
+      {
+        "seq": 84,
+        "ts": 1787307168861,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "change",
+        "path": "/tempfolder"
+      },
+      {
+        "seq": 83,
+        "ts": 1787307158970,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/tempfolder"
+      },
+      {
+        "seq": 82,
+        "ts": 1787307154906,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/tempfolder"
+      },
+      {
+        "seq": 81,
+        "ts": 1787307139232,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/public-ok.md"
+      },
+      {
+        "seq": null,
+        "ts": 1787307138845,
+        "deviceId": "dev-4b179dc45512",
+        "kind": "device_renamed",
+        "path": null
+      },
+      {
+        "seq": 80,
+        "ts": 1787307129061,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/pause-probe.md"
+      },
+      {
+        "seq": 79,
+        "ts": 1787307128641,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/pause-probe.md"
+      },
+      {
+        "seq": 78,
+        "ts": 1787306244507,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/pause-probe.md"
+      },
+      {
+        "seq": 77,
+        "ts": 1787306244080,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/pause-probe.md"
+      },
+      {
+        "seq": 76,
+        "ts": 1787306241187,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-30.md"
+      },
+      {
+        "seq": 75,
+        "ts": 1787306241180,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-29.md"
+      },
+      {
+        "seq": 74,
+        "ts": 1787306241174,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-28.md"
+      },
+      {
+        "seq": 73,
+        "ts": 1787306241169,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-27.md"
+      },
+      {
+        "seq": 72,
+        "ts": 1787306241163,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-26.md"
+      },
+      {
+        "seq": 71,
+        "ts": 1787306241159,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-25.md"
+      },
+      {
+        "seq": 70,
+        "ts": 1787306241150,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-24.md"
+      },
+      {
+        "seq": 69,
+        "ts": 1787306241145,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-23.md"
+      },
+      {
+        "seq": 68,
+        "ts": 1787306241139,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-22.md"
+      },
+      {
+        "seq": 67,
+        "ts": 1787306241133,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-21.md"
+      },
+      {
+        "seq": 66,
+        "ts": 1787306241129,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-20.md"
+      },
+      {
+        "seq": 65,
+        "ts": 1787306241123,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-19.md"
+      },
+      {
+        "seq": 64,
+        "ts": 1787306241119,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-18.md"
+      },
+      {
+        "seq": 63,
+        "ts": 1787306241111,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-17.md"
+      },
+      {
+        "seq": 62,
+        "ts": 1787306241107,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-16.md"
+      },
+      {
+        "seq": 61,
+        "ts": 1787306241100,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-15.md"
+      },
+      {
+        "seq": 60,
+        "ts": 1787306241096,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-14.md"
+      },
+      {
+        "seq": 59,
+        "ts": 1787306241090,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-13.md"
+      },
+      {
+        "seq": 58,
+        "ts": 1787306241086,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-12.md"
+      },
+      {
+        "seq": 57,
+        "ts": 1787306241077,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-11.md"
+      },
+      {
+        "seq": 56,
+        "ts": 1787306241072,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-10.md"
+      },
+      {
+        "seq": 55,
+        "ts": 1787306241066,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-09.md"
+      },
+      {
+        "seq": 54,
+        "ts": 1787306241062,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-08.md"
+      },
+      {
+        "seq": 53,
+        "ts": 1787306241059,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-07.md"
+      },
+      {
+        "seq": 52,
+        "ts": 1787306241055,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-06.md"
+      },
+      {
+        "seq": 51,
+        "ts": 1787306241052,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-05.md"
+      },
+      {
+        "seq": 50,
+        "ts": 1787306241048,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-04.md"
+      },
+      {
+        "seq": 49,
+        "ts": 1787306241045,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-03.md"
+      },
+      {
+        "seq": 48,
+        "ts": 1787306241034,
+        "deviceId": "dev-f11db1bdf72d",
+        "kind": "change",
+        "path": "/e2e-h-02.md"
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "F-1",
+      "severity": "high",
+      "where": "packages/core (folder lifecycle) exercised via packages/plugin",
+      "title": "Empty-folder tombstone does not propagate; folder resurrects on the DELETING side (S6a FAIL)",
+      "evidence": "see S6a detail — vault5 never removed its placeholder dir, re-pushed it (v91, clock dev-4b179dc45512 #5), vault4 re-pulled it ~26s after deleting; fix code verified present in the bundle"
+    },
+    {
+      "id": "F-2",
+      "severity": "medium",
+      "where": "packages/plugin/src/workerapi.ts fetchWorkerStatus vs packages/worker/src/index.ts isPluginCorsPath",
+      "title": "Plugin About \"Vault storage\" can never load: GET /api/status is renderer-fetched cross-origin but /api/* deliberately emits no CORS headers (S7 tripwire, deterministic)",
+      "evidence": "see cors-repro detail + spontaneous hit at 2026-08-21T10:13:29Z; PATCH /device works because /device is a plugin-CORS path"
+    },
+    {
+      "id": "F-3",
+      "severity": "low (harness)",
+      "where": "scripts/e2e/scenario-hardened.mjs withRetry",
+      "title": "Retry rejection escaped withRetry (`result: await fn(true)`), aborting the run on a double failure — fixed in scenario-hardened-resume.mjs/resume2.mjs",
+      "evidence": "S6a double-failure killed S6b/S7 in the first resume; both scripts now return both errors"
+    }
+  ]
+}
