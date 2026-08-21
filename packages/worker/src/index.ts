@@ -16,8 +16,15 @@
  * `run_worker_first: true`: this router stays the single decision point, and
  * only explicitly delegates non-API GET/HEAD requests to asset serving.
  *
- * CORS: none — same-origin by design; the dashboard is served by this same
- * worker, so no cross-origin headers are ever emitted.
+ * CORS: split policy. The plugin-facing routes (GET /health, POST /pair,
+ * GET/PUT /blob/:hash) answer preflights and carry permissive CORS headers:
+ * the Obsidian plugin's renderer calls the worker cross-origin
+ * (`app://obsidian.md` on desktop, `capacitor://` origins on mobile), and
+ * those routes authenticate by Bearer device token or one-time pairing code —
+ * no cookies — so a wildcard ACAO adds no exposure. Everything the dashboard
+ * uses (/admin/*, /api/*, /claim, /ws) stays same-origin only: no CORS
+ * headers are ever emitted there, keeping the session-cookie CSRF surface at
+ * zero.
  */
 
 import { ADMIN_COOKIE_NAME, blobKey, type VaultRoom } from './room.js';
@@ -35,6 +42,37 @@ const API_PATH_EXACT = new Set(['/ws', '/sync', '/pair']);
 
 function isApiPath(path: string): boolean {
   return API_PATH_EXACT.has(path) || API_PATH_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+// --- plugin CORS ---------------------------------------------------------------------------
+
+/**
+ * CORS headers for the plugin-facing routes (see the module comment): the
+ * Obsidian plugin's renderer cannot rely on cookies cross-origin, and these
+ * routes authenticate by Bearer device token or one-time pairing code, so a
+ * wildcard ACAO is safe. Dashboard routes NEVER emit these.
+ */
+const PLUGIN_CORS_HEADERS: Record<string, string> = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
+  'access-control-allow-headers': 'Authorization, Content-Type',
+  'access-control-max-age': '86400',
+};
+
+/** Paths the plugin's cross-origin renderer talks to. */
+function isPluginCorsPath(path: string): boolean {
+  return path === '/health' || path === '/pair' || path.startsWith('/blob/');
+}
+
+/** Copy `response` (DO-fetched responses are header-immutable) with CORS. */
+function withPluginCors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [name, value] of Object.entries(PLUGIN_CORS_HEADERS)) headers.set(name, value);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 export { VaultRoom } from './room.js';
@@ -83,20 +121,30 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // CORS preflights for the plugin-facing routes answer BEFORE the 421
+    // gate: an unclaimed worker must stay reachable from the plugin's
+    // cross-origin renderer (/health probe, /pair flow) even pre-claim.
+    if (request.method === 'OPTIONS' && isPluginCorsPath(path)) {
+      return new Response(null, { status: 204, headers: PLUGIN_CORS_HEADERS });
+    }
+
     // The two endpoints that work on an unclaimed worker (§3).
     if (request.method === 'GET' && path === '/health') {
-      return json(200, { ok: true, claimed: await isClaimed(env) });
+      return withPluginCors(json(200, { ok: true, claimed: await isClaimed(env) }));
     }
     if (path === '/claim') {
       if (request.method !== 'POST') return json(405, { error: 'POST required' });
       return roomFetch(env, '/claim', { method: 'POST', body: request.body, headers: request.headers });
     }
     if (!(await isClaimed(env)) && isApiPath(path)) {
-      return json(421, { error: 'unclaimed', hint: 'POST /claim first' });
+      // Plugin paths get the CORS headers even on the 421 so the renderer
+      // can read the error; the gate itself stays.
+      const gate = json(421, { error: 'unclaimed', hint: 'POST /claim first' });
+      return isPluginCorsPath(path) ? withPluginCors(gate) : gate;
     }
 
     if (request.method === 'POST' && path === '/pair') {
-      return roomPost(env, '/pair', await readJsonBody(request), clientIpHeaders(request));
+      return withPluginCors(await roomPost(env, '/pair', await readJsonBody(request), clientIpHeaders(request)));
     }
     if (request.method === 'POST' && path === '/admin/login') {
       return handleAdminLogin(request, env);
@@ -120,9 +168,9 @@ export default {
     }
     if (path.startsWith('/blob/')) {
       const hash = path.slice('/blob/'.length);
-      if (request.method === 'PUT') return handleBlobPut(request, env, hash);
-      if (request.method === 'GET') return handleBlobGet(request, env, hash);
-      return json(405, { error: 'GET or PUT required' });
+      if (request.method === 'PUT') return withPluginCors(await handleBlobPut(request, env, hash));
+      if (request.method === 'GET') return withPluginCors(await handleBlobGet(request, env, hash));
+      return withPluginCors(json(405, { error: 'GET or PUT required' }));
     }
     // Everything else is dashboard surface (§10): delegate to the static
     // assets binding in BOTH claim states. With `not_found_handling:
