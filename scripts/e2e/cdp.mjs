@@ -25,9 +25,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const CONSOLE_LOG_FILE = join(HERE, 'console.log');
 const CDP_HTTP = process.env.CDP_HTTP ?? 'http://127.0.0.1:9222';
 
-async function listTargets() {
-  const res = await fetch(`${CDP_HTTP}/json`);
-  if (!res.ok) throw new Error(`GET ${CDP_HTTP}/json -> HTTP ${res.status}`);
+/** List page/browser targets on a CDP endpoint (default: CDP_HTTP env). */
+export async function listTargets(http = CDP_HTTP) {
+  const res = await fetch(`${http}/json`);
+  if (!res.ok) throw new Error(`GET ${http}/json -> HTTP ${res.status}`);
   return res.json();
 }
 
@@ -153,9 +154,14 @@ export class Cdp {
   }
 }
 
-/** Connect a CDP session to the first page target whose eval matches `match`. */
-export async function connectPage({ match } = {}) {
-  const targets = (await listTargets()).filter((t) => t.type === 'page');
+/**
+ * Connect a CDP session to the first page target whose eval matches `match`.
+ * `http` overrides the CDP endpoint (two simultaneous Obsidian instances use
+ * one remote-debugging port each: pass http: 'http://127.0.0.1:9223' etc).
+ */
+export async function connectPage({ match, http } = {}) {
+  const base = http ?? CDP_HTTP;
+  const targets = (await listTargets(base)).filter((t) => t.type === 'page');
   for (const t of targets) {
     const ws = new WebSocket(t.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
@@ -190,16 +196,20 @@ if (process.argv[1] && process.argv[1].endsWith('cdp.mjs')) {
     }
     process.exit(0);
   }
+  if (args[0] === '--cdp-http') {
+    process.env.CDP_HTTP = args[1];
+    args.splice(0, 2);
+  }
   if (args[0] === '--match') {
     match = args[1];
     args.splice(0, 2);
   }
   const expr = args.join(' ');
   if (expr === '') {
-    console.error('usage: cdp.mjs [--match substr] "<expression>" | --list');
+    console.error('usage: cdp.mjs [--cdp-http URL] [--match substr] "<expression>" | --list');
     process.exit(2);
   }
-  const cdp = await connectPage({ match });
+  const cdp = await connectPage({ match, http: process.env.CDP_HTTP });
   const started = Date.now();
   const result = await cdp.eval(expr);
   console.log(JSON.stringify({ target: cdp.targetTitle, ms: Date.now() - started, ...result }, null, 2));
