@@ -1,27 +1,30 @@
 /**
- * TWO-REAL-VAULT bidirectional sync E2E — CLEAN MODE (no workarounds).
+ * CLOUD E2E RESUME — continues scenario-cloud.mjs from step 4 after run #1.
  *
- *   • worker: the user's dev worker on http://127.0.0.1:8797 (claimed by this
- *     scenario with passphrase "two-vault-test"; left running afterwards)
- *   • vaults: Z:/Projects/TestVaults/TestVault4 + TestVault5, REAL plugin,
- *     REAL Obsidian — TWO simultaneous instances, one per vault, each with its
- *     own throwaway --user-data-dir profile and CDP port (9222 / 9223)
- *   • CLEAN: launched WITHOUT --disable-web-security, pairing runs the
- *     plugin's own code path (pairFromSettings) with NO overrides.fetchImpl
- *     injection. If pairing works, that is the headline PASS of this run.
+ * Run #1 (report-cloud.json) PASSED prep/claim/pairing and bidirectional
+ * 4a-4e against the deployed worker, then hit a REAL finding at step 3/4f:
+ * pairing the SECOND vault whose content already exists in the room (empty
+ * local index after unlink) records one add-vs-add conflict per file even
+ * for byte-identical content — status bar stayed "vsa ⚠ conflicts: 33".
+ * A harness bug (withRetry letting the retry throw escape) then aborted the
+ * run before steps 4f/5/6/F1-F6 could execute.
  *
- * Phases: claim/mint → pair both → bidirectional file sync (create/edit/
- * rename/delete) → >256KB binary blob smoke → history/conflict audit →
- * folder-operations phase (F1-F6, coordinator extension).
+ * This script resumes with the pairing run #1 established (NO unlink, NO
+ * re-claim): it re-launches both instances, asserts the persisted pairing
+ * auto-reconnects live with ZERO conflicts (also proving the run-#1 conflict
+ * records were session-scoped, not persisted), then runs the remaining
+ * steps verbatim: 4a-4f, blob smoke 5, history audit 6, folder ops F1-F6.
  *
- * Usage: node scripts/e2e/scenario-2vault.mjs
- * Exit 0 iff every step passed (KNOWN-GAP-CONFIRMED passes with a note).
- * Report: scripts/e2e/report-2vault.json + stdout.
+ * Usage: node scripts/e2e/scenario-cloud-resume.mjs
+ *   VSA_E2E_WORKER      worker base URL (default http://127.0.0.1:8797)
+ *   VSA_E2E_PASSPHRASE  admin passphrase (default two-vault-test — LOCAL
+ *                       wrangler-dev rooms only; set this for a deployed room)
+ * Report: scripts/e2e/report-cloud-resume.json
  */
 
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -32,15 +35,18 @@ const HERE = join(fileURLToPath(import.meta.url), '..');
 
 // --- constants ---------------------------------------------------------------------------------
 
-const WORKER = 'http://127.0.0.1:8797'; // ALWAYS 127.0.0.1 (localhost stalls on IPv6 here)
-const PASSPHRASE = 'two-vault-test';
+// Target worker + admin passphrase come from the env (see header) — no
+// deployed URL or live passphrase is hardcoded here.
+const WORKER = process.env.VSA_E2E_WORKER ?? 'http://127.0.0.1:8797';
+const PASSPHRASE = process.env.VSA_E2E_PASSPHRASE ?? 'two-vault-test';
 const VAULT_NAME = 'two-vault-test';
 
-const OBSIDIAN_EXE = 'C:\\Program Files\\Obsidian\\Obsidian.exe'; // verified present (AppData/Local has only the updater)
+const OBSIDIAN_EXE = 'C:\\Program Files\\Obsidian\\Obsidian.exe';
+const PLUGIN_PKG = 'Z:/Projects/syncv2/packages/plugin';
 const V4_DIR = 'Z:/Projects/TestVaults/TestVault4';
 const V5_DIR = 'Z:/Projects/TestVaults/TestVault5';
-const PROFILE_A = 'Z:/Projects/TestVaults/e2e-2vault-profile'; // opens TestVault4
-const PROFILE_B = 'Z:/Projects/TestVaults/e2e-2vault-profile-b'; // opens TestVault5
+const PROFILE_A = 'Z:/Projects/TestVaults/e2e-2vault-profile';
+const PROFILE_B = 'Z:/Projects/TestVaults/e2e-2vault-profile-b';
 const PORT_A = 9222;
 const PORT_B = 9223;
 const CDP_A = `http://127.0.0.1:${PORT_A}`;
@@ -48,7 +54,20 @@ const CDP_B = `http://127.0.0.1:${PORT_B}`;
 
 const DEVICE4 = 'e2e-vault4';
 const DEVICE5 = 'e2e-vault5';
-const SYNC_TIMEOUT_MS = 25_000; // per the brief: 25s propagation budgets
+const SYNC_TIMEOUT_MS = 40_000;
+
+// Same artifact list as scenario-cloud.mjs (v4-note.md exists from run #1's 4a;
+// everything else was consumed/deleted by run #1's steps).
+const SCENARIO_ARTIFACTS = [
+  'v4-note.md',
+  'v5-note.md',
+  'renamed-from-v4.md',
+  'blob-smoke.bin',
+  'projects',
+  'archive',
+  'renamed-projects',
+  'to-delete',
+];
 
 const jstr = JSON.stringify;
 
@@ -57,6 +76,8 @@ const jstr = JSON.stringify;
 const report = {
   startedAt: new Date().toISOString(),
   worker: WORKER,
+  resumeOf: 'scenario-cloud.mjs run #1 (report-cloud.json)',
+  cloudMode: { realNetwork: true, devServerSpawned: false },
   cleanMode: { webSecurityDisabled: false, overridesInjected: false },
   steps: [],
 };
@@ -113,11 +134,7 @@ async function waitFor(fn, timeoutMs, everyMs = 500, label = '') {
   }
 }
 
-/**
- * Run a step body once; on throw, retry once (evidence rule), then give up.
- * BOTH attempts are caught — letting the retry's throw escape aborted whole
- * runs on the first double-failing step (cloud run #1, step 4f).
- */
+/** Both attempts caught (fixed version — see this file's header note). */
 async function withRetry(fn) {
   try {
     return { ok: true, result: await fn(false) };
@@ -127,7 +144,7 @@ async function withRetry(fn) {
       return { ok: true, result: await fn(true) };
     } catch (second) {
       log(`  retry-also-failed: ${String(second.message ?? second).slice(0, 300)}`);
-      return { ok: false, error: second, firstError: first };
+      return { ok: false, error: second };
     }
   }
 }
@@ -135,7 +152,7 @@ async function withRetry(fn) {
 // --- worker HTTP -----------------------------------------------------------------------------------
 
 async function wk(path, init = {}) {
-  const res = await fetch(`${WORKER}${path}`, { signal: AbortSignal.timeout(10_000), ...init });
+  const res = await fetch(`${WORKER}${path}`, { signal: AbortSignal.timeout(15_000), ...init });
   const text = await res.text();
   let body;
   try {
@@ -144,6 +161,18 @@ async function wk(path, init = {}) {
     body = text;
   }
   return { status: res.status, body, headers: res.headers };
+}
+
+async function adminLogin() {
+  const login = await wk('/admin/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ passphrase: PASSPHRASE }),
+  });
+  if (login.status !== 200) throw new Error(`admin login HTTP ${login.status}: ${fmt(login.body)}`);
+  const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+  if (!cookie.startsWith('vsa_admin=')) throw new Error(`unexpected cookie: ${cookie.slice(0, 30)}`);
+  return cookie;
 }
 
 // --- vault helpers (via CDP) ------------------------------------------------------------------------
@@ -208,7 +237,6 @@ function launchObsidian(profileDir, port) {
   return child.pid;
 }
 
-/** Click "Trust author and enable plugins" style first-run buttons. Returns labels clicked. */
 async function driveFirstRunDialogs(cdp) {
   const r = await cdp.eval(`(() => {
     const clicked = [];
@@ -221,21 +249,6 @@ async function driveFirstRunDialogs(cdp) {
   return r.ok ? r.value : [];
 }
 
-async function domEvidence(cdp) {
-  const r = await cdp.eval(`(() => ({
-    hasApp: typeof app !== 'undefined',
-    vault: (typeof app !== 'undefined' && app.vault?.adapter?.basePath) || null,
-    pluginLoaded: !!app.plugins?.plugins?.vaultsyncforagents,
-    modals: [...document.querySelectorAll('.modal')].map(m => (m.textContent || '').trim().slice(0, 200)),
-    buttons: [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean).slice(0, 40),
-  }))()`);
-  return r.ok ? r.value : { evalError: r.error };
-}
-
-/**
- * Bring one Obsidian instance to "vault open, plugin loaded, console captured".
- * Returns a connected Cdp. Drives the trust-author dialog when it appears.
- */
 async function awaitInstanceReady({ http, match, label }) {
   const t0 = Date.now();
   await waitFor(async () => {
@@ -254,8 +267,6 @@ async function awaitInstanceReady({ http, match, label }) {
       try {
         cdp = await connectPage({ match, http });
       } catch {
-        // window may exist before app/vault is ready — keep polling; also poke
-        // dialogs on whatever page is there via a throwaway connection.
         try {
           const tmp = await connectPage({ http });
           dialogsClicked.push(...(await driveFirstRunDialogs(tmp)));
@@ -272,7 +283,7 @@ async function awaitInstanceReady({ http, match, label }) {
   return { cdp, dialogsClicked: [...new Set(dialogsClicked)], readyMs: Date.now() - t0 };
 }
 
-// --- CORS / Illegal-invocation tripwire (headline) ---------------------------------------------------
+// --- CORS / Illegal-invocation tripwire ------------------------------------------------------------
 
 const FATAL_PATTERNS = [
   /blocked by CORS policy/i,
@@ -283,7 +294,7 @@ const FATAL_PATTERNS = [
 function fatalConsoleHits(cdps) {
   const hits = [];
   for (const [name, cdp] of Object.entries(cdps)) {
-    if (!cdp) continue; // instance may never have launched
+    if (!cdp) continue;
     for (const entry of cdp.consoleLog) {
       if (FATAL_PATTERNS.some((re) => re.test(entry.text))) hits.push({ vault: name, ...entry });
     }
@@ -298,7 +309,6 @@ let cdp4 = null;
 let cdp5 = null;
 let exitCode = 0;
 let fatalStop = false;
-const pairCodes = {};
 const deviceIds = {};
 
 process.on('uncaughtException', (e) => {
@@ -307,24 +317,50 @@ process.on('uncaughtException', (e) => {
 });
 
 try {
-  // ---- step 0: kill any running Obsidian, verify worker unclaimed, write profiles ----------
+  // ---- step 0: kill Obsidian, verify CLAIMED cloud room + persisted pairing, refresh plugin, clean artifacts, profiles
   {
-    const s = step('prep', 'kill Obsidian, verify worker unclaimed, write throwaway profiles');
+    const s = step('prep', 'kill Obsidian; /health claimed; data.json paired to CLOUD (tokens intact); refresh plugin build; clear scenario artifacts; write profiles');
     try {
-      await execFileP('taskkill', ['/F', '/IM', 'Obsidian.exe']).catch((e) => String(e)); // authorized; fine if none running
+      await execFileP('taskkill', ['/F', '/IM', 'Obsidian.exe']).catch((e) => String(e));
       await sleep(1500);
       const health = await wk('/health');
       if (health.status !== 200 || health.body.ok !== true) throw new Error(`unexpected /health: ${fmt(health.body)}`);
-      // NB: claimed:true is tolerated on re-runs — step 1 proves the room is OURS
-      // (admin login + /api/status vaultName) before using it.
+      if (health.body.claimed !== true) throw new Error(`worker not claimed — run scenario-cloud.mjs first: ${fmt(health.body)}`);
+      cookie = await adminLogin();
+      const st = await wk('/api/status', { headers: { cookie } });
+      if (st.body?.vaultName !== VAULT_NAME) throw new Error(`room vaultName ${st.body?.vaultName} != ${VAULT_NAME} — not our room`);
+
+      const pairing = {};
+      for (const [name, dir] of [['TestVault4', V4_DIR], ['TestVault5', V5_DIR]]) {
+        // refresh plugin build (upgrade-in-place like scenario-hardened)
+        const dest = join(dir, '.obsidian/plugins/vaultsyncforagents');
+        mkdirSync(dest, { recursive: true });
+        for (const f of ['main.js', 'manifest.json', 'styles.css']) copyFileSync(join(PLUGIN_PKG, f), join(dest, f));
+        const d = JSON.parse(readFileSync(join(dest, 'data.json'), 'utf8'));
+        if (d.url !== WORKER || (d.token || '').length < 10 || !d.deviceId) {
+          throw new Error(`${name} not paired to the cloud worker: url=${d.url} tokenLen=${(d.token || '').length} deviceId=${d.deviceId}`);
+        }
+        pairing[name] = { url: d.url, deviceId: d.deviceId, deviceName: d.deviceName, tokenLen: (d.token || '').length };
+        if (name === 'TestVault4') deviceIds.vault4 = d.deviceId;
+        if (name === 'TestVault5') deviceIds.vault5 = d.deviceId;
+        // rerun hygiene: v4-note.md etc. exist from run #1 — remove from BOTH
+        // vaults while the apps are dead (normal "deleted while closed" flow;
+        // tombstones sync on reconnect, then 4a recreates fresh)
+        for (const art of SCENARIO_ARTIFACTS) {
+          const p = join(dir, art);
+          if (existsSync(p)) rmSync(p, { recursive: true, force: true });
+        }
+      }
       const { stdout: pa } = await execFileP(process.execPath, [join(HERE, 'write-profile.mjs'), PROFILE_A, V4_DIR, V5_DIR]);
       const { stdout: pb } = await execFileP(process.execPath, [join(HERE, 'write-profile.mjs'), PROFILE_B, V5_DIR, V4_DIR]);
       s.pass({
         health: health.body,
+        roomVaultName: st.body?.vaultName,
+        persistedPairing: pairing,
+        pluginRefreshedFrom: PLUGIN_PKG,
         profileA: pa.trim(),
         profileB: pb.trim(),
         cdpPorts: { vault4: PORT_A, vault5: PORT_B },
-        launchFlags: ['--user-data-dir=…', '--remote-debugging-port=…', 'NO --disable-web-security'],
       });
     } catch (e) {
       s.fail(String(e.message ?? e));
@@ -332,203 +368,56 @@ try {
     }
   }
 
-  // ---- step 1: claim + admin login + TWO pairing codes --------------------------------------
+  // ---- step R1: launch both; persisted pairing auto-reconnects; live; ZERO conflicts (run-#1 records were session-scoped)
   {
-    const s = step('1', 'claim 8797 worker (POST /claim), admin login, mint TWO pairing codes');
+    const s = step('R1', 'launch both instances (NO re-pair) — persisted CLOUD pairing auto-reconnects: both live ✓, pending 0, conflicts 0 (proves run-#1 conflict records were session-scoped)');
     try {
       if (fatalStop) throw new Error('skipped (prep failed)');
-      let claimNote = 'fresh claim';
-      let claimDeviceId = null;
-      const claim = await wk('/claim', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ passphrase: PASSPHRASE, vaultName: VAULT_NAME, deviceName: 'e2e-admin', deviceType: 'desktop' }),
-      });
-      if (claim.status !== 200) {
-        // re-run tolerance: worker may already be claimed by a previous run of
-        // THIS scenario — proceed only if it is our own room.
-        const probe = await wk('/admin/login', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ passphrase: PASSPHRASE }),
-        });
-        const probeCookie = (probe.headers.get('set-cookie') ?? '').split(';')[0];
-        const st = probeCookie ? await wk('/api/status', { headers: { cookie: probeCookie } }) : { body: null };
-        if (probe.status !== 200 || st.body?.vaultName !== VAULT_NAME) {
-          throw new Error(`claim HTTP ${claim.status}: ${fmt(claim.body)} — and not our room (login=${probe.status}, vaultName=${st.body?.vaultName})`);
+      const pidA = launchObsidian(PROFILE_A, PORT_A);
+      const pidB = launchObsidian(PROFILE_B, PORT_B);
+      const [a, b] = await Promise.all([
+        awaitInstanceReady({ http: CDP_A, match: 'TestVault4', label: 'vault4' }),
+        awaitInstanceReady({ http: CDP_B, match: 'TestVault5', label: 'vault5' }),
+      ]);
+      cdp4 = a.cdp;
+      cdp5 = b.cdp;
+      report.pids = { obsidianVault4: pidA, obsidianVault5: pidB };
+      const live = {};
+      for (const [name, cdp] of [['vault4', cdp4], ['vault5', cdp5]]) {
+        // settle: tombstones from prep's artifact removal + full reconciliation
+        await sleep(3000);
+        const st = await waitFor(async () => {
+          const ps = await pluginStatus(cdp);
+          return ps?.statusBar?.startsWith('vsa ✓') && ps?.status?.state === 'live' && ps?.status?.pending === 0 ? ps : null;
+        }, 60_000, 1000, `${name} live+✓+pending0`);
+        if ((st.value.status?.conflicts ?? []).length !== 0) {
+          throw new Error(`${name} conflicts=${st.value.status.conflicts.length} after fresh session — records DID persist: ${fmt(st.value.status.conflicts.slice(0, 2))}`);
         }
-        claimNote = `already claimed by this scenario (claim HTTP ${claim.status}) — room reused`;
-      } else {
-        claimDeviceId = claim.body.deviceId ?? null;
+        live[name] = { statusBar: st.value.statusBar, state: st.value.status.state, pending: st.value.status.pending, deviceId: st.value.deviceId };
       }
-      const login = await wk('/admin/login', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ passphrase: PASSPHRASE }),
-      });
-      if (login.status !== 200) throw new Error(`admin login HTTP ${login.status}: ${fmt(login.body)}`);
-      cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
-      if (!cookie.startsWith('vsa_admin=')) throw new Error(`unexpected cookie: ${cookie.slice(0, 30)}`);
-      for (const [key, dev] of [['code4', DEVICE4], ['code5', DEVICE5]]) {
-        const res = await wk('/admin/pair', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', cookie },
-          body: JSON.stringify({ deviceName: dev, deviceType: 'desktop' }),
-        });
-        if (res.status !== 200 || typeof res.body.code !== 'string') throw new Error(`admin pair ${dev} HTTP ${res.status}: ${fmt(res.body)}`);
-        pairCodes[key] = res.body.code;
-      }
-      const codeShape = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/;
-      if (!codeShape.test(pairCodes.code4) || !codeShape.test(pairCodes.code5)) throw new Error(`bad code shapes: ${fmt(pairCodes)}`);
-      s.pass({
-        claim: { note: claimNote, deviceId: claimDeviceId },
-        adminCookie: 'vsa_admin=…',
-        pairingCodes: { vault4: pairCodes.code4, vault5: pairCodes.code5 },
-      });
-    } catch (e) {
-      s.fail(String(e.message ?? e));
-      fatalStop = true;
-    }
-  }
-
-  // ---- step 2: launch instance A (TestVault4) and pair — CLEAN, no overrides ------------------
-  {
-    const s = step('2', 'launch Obsidian→TestVault4 (no --disable-web-security), pair via pairFromSettings(code#1) — NO overrides');
-    try {
-      if (fatalStop) throw new Error('skipped (earlier fatal)');
-      const pid = launchObsidian(PROFILE_A, PORT_A);
-      const ready = await awaitInstanceReady({ http: CDP_A, match: 'TestVault4', label: 'vault4' });
-      cdp4 = ready.cdp;
-      const dom = await domEvidence(cdp4);
-      // CLEAN pairing: set only the settings a user would type (url + device
-      // name — the normal settings-tab flow), then the plugin's own code path.
-      const pairT0 = Date.now();
-      const outcome = await cdp4.eval(`(async () => {
-        const p = app.plugins.plugins.vaultsyncforagents;
-        p.data.url = ${jstr(WORKER)};
-        p.data.deviceName = ${jstr(DEVICE4)};
-        const raced = await Promise.race([
-          p.pairFromSettings(${jstr(pairCodes.code4)}).then(o => ({ done: true, outcome: o })),
-          new Promise(r => setTimeout(() => r({ done: false }), 25000)),
-        ]);
-        return { raced, overridesFetch: typeof p.overrides.fetchImpl, data: { url: p.data.url, deviceId: p.data.deviceId, tokenLen: (p.data.token || '').length } };
-      })()`);
-      if (!outcome.ok) throw new Error(`pair eval failed: ${outcome.error}`);
-      let final = outcome.value;
-      if (!final.raced.done) {
-        // pairing still running in-page (WS startup reconciliation) — poll data.json
-        const got = await waitFor(async () => {
-          const r = await cdp4.eval(`(async()=>{ const d = JSON.parse(await app.vault.adapter.read('.obsidian/plugins/vaultsyncforagents/data.json')); return (d.token||'').length > 10 ? d : null; })()`);
-          return r.ok ? r.value : null;
-        }, 30_000, 1000, 'vault4 token persisted');
-        final = { raced: { done: true, outcome: { status: 'paired', late: true } }, data: got, overridesFetch: final.overridesFetch };
-      }
-      deviceIds.vault4 = final.data?.deviceId ?? null;
-      // status bar reaches a connected/ok state
-      const sb = await waitFor(async () => {
-        const st = await pluginStatus(cdp4);
-        return st?.statusBar?.startsWith('vsa ✓') ? st : null;
-      }, 30_000, 1000, 'vault4 status bar ✓');
-      const cors = fatalConsoleHits({ vault4: cdp4 });
-      if (final.raced.outcome.status !== 'paired') throw new Error(`pair outcome: ${fmt(final.raced.outcome)}`);
-      if (final.overridesFetch !== 'undefined') throw new Error(`overrides.fetchImpl was set (${final.overridesFetch}) — not clean mode!`);
-      if (cors.length > 0) {
-        s.fail({ headline: 'CORS/Illegal-invocation console errors — fixes FAILED', hits: cors.slice(0, 5) });
-        fatalStop = true;
-        throw new Error(`FIX-REGRESSION: ${fmt(cors.slice(0, 3))}`);
-      }
-      s.pass({
-        headline: 'PAIRING WORKS WITH ZERO WORKAROUNDS (no --disable-web-security, no overrides.fetchImpl)',
-        pid,
-        instanceReadyMs: ready.readyMs,
-        firstRunDialogsDriven: ready.dialogsClicked,
-        vault: dom.vault,
-        pairOutcome: final.raced.outcome,
-        pairCallMs: Date.now() - pairT0,
-        overridesFetchImpl: final.overridesFetch,
-        persisted: { url: final.data.url, deviceId: final.data.deviceId, tokenLen: final.data.tokenLen },
-        statusBar: sb.value.statusBar,
-        clientState: sb.value.status?.state,
-      });
-    } catch (e) {
-      s.fail(String(e.message ?? e));
-      const hits = fatalConsoleHits({ vault4: cdp4 });
-      if (hits.length) report.step2ConsoleHits = hits.slice(0, 10);
-      if (/CORS|Illegal invocation|pair outcome|overrides/i.test(String(e.message ?? e))) fatalStop = true; // STOP rule
-    }
-  }
-
-  // ---- step 3: launch instance B (TestVault5), pair, both devices ONLINE ----------------------
-  {
-    const s = step('3', 'launch Obsidian→TestVault5, pair with code#2, assert BOTH devices online in /api/status');
-    try {
-      if (fatalStop) throw new Error('skipped (earlier fatal)');
-      const pid = launchObsidian(PROFILE_B, PORT_B);
-      const ready = await awaitInstanceReady({ http: CDP_B, match: 'TestVault5', label: 'vault5' });
-      cdp5 = ready.cdp;
-      const outcome = await cdp5.eval(`(async () => {
-        const p = app.plugins.plugins.vaultsyncforagents;
-        p.data.url = ${jstr(WORKER)};
-        p.data.deviceName = ${jstr(DEVICE5)};
-        const raced = await Promise.race([
-          p.pairFromSettings(${jstr(pairCodes.code5)}).then(o => ({ done: true, outcome: o })),
-          new Promise(r => setTimeout(() => r({ done: false }), 25000)),
-        ]);
-        return { raced, overridesFetch: typeof p.overrides.fetchImpl, data: { url: p.data.url, deviceId: p.data.deviceId, tokenLen: (p.data.token || '').length } };
-      })()`);
-      if (!outcome.ok) throw new Error(`pair eval failed: ${outcome.error}`);
-      let final = outcome.value;
-      if (!final.raced.done) {
-        const got = await waitFor(async () => {
-          const r = await cdp5.eval(`(async()=>{ const d = JSON.parse(await app.vault.adapter.read('.obsidian/plugins/vaultsyncforagents/data.json')); return (d.token||'').length > 10 ? d : null; })()`);
-          return r.ok ? r.value : null;
-        }, 30_000, 1000, 'vault5 token persisted');
-        final = { raced: { done: true, outcome: { status: 'paired', late: true } }, data: got, overridesFetch: final.overridesFetch };
-      }
-      deviceIds.vault5 = final.data?.deviceId ?? null;
-      if (final.raced.outcome.status !== 'paired') throw new Error(`pair outcome: ${fmt(final.raced.outcome)}`);
-      if (final.overridesFetch !== 'undefined') throw new Error(`overrides.fetchImpl set (${final.overridesFetch})`);
-      const sb = await waitFor(async () => {
-        const st = await pluginStatus(cdp5);
-        return st?.statusBar?.startsWith('vsa ✓') ? st : null;
-      }, 30_000, 1000, 'vault5 status bar ✓');
       const cors = fatalConsoleHits({ vault4: cdp4, vault5: cdp5 });
-      if (cors.length > 0) throw new Error(`FIX-REGRESSION console hits: ${fmt(cors.slice(0, 3))}`);
-      // both devices online per admin API
+      if (cors.length > 0) throw new Error(`CORS/Illegal-invocation console hits: ${fmt(cors.slice(0, 3))}`);
       const st = await waitFor(async () => {
         const res = await wk('/api/status', { headers: { cookie } });
-        const devices = res.body?.devices ?? [];
-        const online = devices.filter((d) => d.online).map((d) => d.name);
-        const have = new Set(devices.map((d) => d.name));
-        return have.has(DEVICE4) && have.has(DEVICE5) && online.includes(DEVICE4) && online.includes(DEVICE5)
-          ? { devices, online }
-          : null;
-      }, 30_000, 1000, 'both devices online');
-      const devices = st.value.devices.map((d) => `${d.name}(${d.type},${d.online ? 'online' : 'offline'})`);
+        const devs = res.body?.devices ?? [];
+        const online = devs.filter((d) => d.online).map((d) => d.name);
+        return online.includes(DEVICE4) && online.includes(DEVICE5) ? devs : null;
+      }, 45_000, 1000, 'both devices online');
       s.pass({
-        headline: 'BOTH VAULTS PAIRED CLEANLY — two online devices + admin in one room',
-        pid,
-        instanceReadyMs: ready.readyMs,
-        firstRunDialogsDriven: ready.dialogsClicked,
-        pairOutcome: final.raced.outcome,
-        persisted: { deviceId: final.data.deviceId, tokenLen: final.data.tokenLen },
-        statusBar: sb.value.statusBar,
-        devices,
-        attachments: st.value.attachments ?? null,
+        headline: 'CLOUD PAIRING PERSISTED — both clients auto-reconnected to the deployed worker with ZERO conflicts (run-#1 add-vs-add records were session-scoped)',
+        pids: report.pids,
+        vaults: live,
+        devicesOnline: st.value.filter((d) => d.online).map((d) => `${d.name}(${d.online ? 'online' : 'offline'})`),
       });
     } catch (e) {
       s.fail(String(e.message ?? e));
       const hits = fatalConsoleHits({ vault4: cdp4, vault5: cdp5 });
-      if (hits.length) report.step3ConsoleHits = hits.slice(0, 10);
-      if (/CORS|Illegal invocation|pair outcome|overrides/i.test(String(e.message ?? e))) fatalStop = true;
+      if (hits.length) report.r1ConsoleHits = hits.slice(0, 10);
+      if (/CORS|Illegal invocation/i.test(String(e.message ?? e))) fatalStop = true;
     }
   }
 
-  if (fatalStop) {
-    lines.push('[STOP] fatal condition hit (pairing/CORS/Illegal-invocation) — skipping sync phases per orders');
-  }
-
-  // ---- step 4: BIDIRECTIONAL SYNC -------------------------------------------------------------
+  // ---- step 4: BIDIRECTIONAL SYNC (same bodies as scenario-cloud.mjs) ------------------------
   const bidir = [
     {
       id: '4a',
@@ -619,9 +508,9 @@ try {
     if (r.ok) s.pass(r.result); else s.fail(String(r.error?.message ?? r.error));
   }
 
-  // ---- step 5: attachment smoke — >256KB binary forces the BLOB STORE (not WS-inline) ----------
+  // ---- step 5: attachment smoke — >256KB binary through real R2 ------------------------------
   {
-    const s = step('5', 'attachment smoke: 600KB random .bin in vault4 → byte-identical in vault5 via /blob/*');
+    const s = step('5', 'attachment smoke: 600KB random .bin in vault4 → byte-identical in vault5 via real-R2 /blob/*');
     const runOnce = async () => {
       const made = await cdp4.eval(`(async () => {
         const n = 614400; // 600 KB — above the 256 KB INLINE_CONTENT_MAX_BYTES, so the blob store carries it
@@ -657,7 +546,7 @@ try {
         latencyMs: ms,
         serverVersion: head ? { id: head.id, kind: head.kind, size: head.size, hash: head.hash?.slice(0, 12) + '…', deviceId: head.deviceId } : null,
         workerAttachments: status.body?.attachments ?? null,
-        blobPathForced: '600KB > 256KB inline cap → PUT/GET /blob/:hash (the CORS-fixed surface)',
+        blobPathForced: '600KB > 256KB inline cap → PUT/GET /blob/:hash through REAL Cloudflare R2',
       };
     };
     if (fatalStop || !cdp4 || !cdp5) s.fail('skipped (fatal earlier)');
@@ -667,7 +556,7 @@ try {
     }
   }
 
-  // ---- step 6: history chain + conflict audit ---------------------------------------------------
+  // ---- step 6: history chain + conflict audit --------------------------------------------------
   {
     const s = step('6', 'history sanity for v4-note.md (create@vault4-device, edit@vault5-device) + 0 conflict files');
     try {
@@ -763,7 +652,6 @@ try {
         const r = await cdp4.eval(`app.vault.delete(app.vault.getAbstractFileByPath('archive/a.md')).then(() => 'deleted')`);
         if (!r.ok) throw new Error(`delete: ${r.error}`);
         const ms = await waitFor(async () => ((await exists(cdp5, 'archive/a.md')) ? null : 'gone'), SYNC_TIMEOUT_MS, 400, 'vault5 file-delete propagation').then((x) => x.elapsedMs);
-        // observe the now-empty 'archive' folder on both sides across ~2 rescan cycles
         const samples = [];
         for (let i = 0; i <= 8; i++) {
           const [e4, e5] = await Promise.all([exists(cdp4, 'archive'), exists(cdp5, 'archive')]);
@@ -785,15 +673,14 @@ try {
       async run(s) {
         const mk = await cdp5.eval(`app.vault.createFolder('to-delete').then(() => 'created')`);
         if (!mk.ok) throw new Error(`createFolder: ${mk.error}`);
-        // placeholder sync → vault4 sees the folder
         let placeholderMs = null;
         try {
           placeholderMs = await waitFor(async () => ((await exists(cdp4, 'to-delete')) ? true : null), 35_000, 1000, 'vault4 sees to-delete').then((x) => x.elapsedMs);
         } catch {
-          await syncNow(cdp4); // rescan poke, then one more window
+          await syncNow(cdp4);
           placeholderMs = await waitFor(async () => ((await exists(cdp4, 'to-delete')) ? true : null), 35_000, 1000, 'vault4 sees to-delete after poke').then((x) => x.elapsedMs);
         }
-        await sleep(3000); // let vault5's placeholder push fully settle
+        await sleep(3000);
         // Obsidian 43.1.1: vault.delete(TFolder) always fails ERR_FS_EISDIR —
         // fileManager.trashFile is the plugin's own documented workaround.
         const del = await cdp5.eval(`(async () => {
@@ -849,7 +736,7 @@ try {
     if (fatalStop || !cdp4 || !cdp5) { s.fail('skipped (fatal earlier)'); continue; }
     try {
       if (t.id === 'F5') {
-        await t.run(s); // F5 reports PASS/GAP itself
+        await t.run(s);
       } else {
         const r = await withRetry(t.run);
         if (r.ok) s.pass(r.result); else s.fail(String(r.error?.message ?? r.error));
@@ -873,13 +760,18 @@ try {
   lines.push(`[FATAL] ${String(fatal?.stack ?? fatal)}`);
   report.fatal = String(fatal?.message ?? fatal);
 } finally {
-  // console capture + teardown
   const consoles = {};
   if (cdp4) consoles.vault4 = cdp4.consoleLog;
   if (cdp5) consoles.vault5 = cdp5.consoleLog;
   report.consoleProblems = {};
   for (const [name, entries] of Object.entries(consoles)) {
     report.consoleProblems[name] = entries.filter((e) => ['error', 'warning', 'warn'].includes(String(e.level).toLowerCase()));
+  }
+  try {
+    const h = await wk('/health');
+    report.workerLeftRunning = { url: WORKER, health: h.body, note: 'deployed Cloudflare worker — LEFT RUNNING' };
+  } catch {
+    report.workerLeftRunning = { url: WORKER, note: 'left deployed (health probe failed)' };
   }
   report.finishedAt = new Date().toISOString();
   let failed = 0;
@@ -892,23 +784,18 @@ try {
   exitCode = failed === 0 ? 0 : 1;
   lines.push('');
   lines.push(`SUMMARY: ${passed} PASS, ${failed} FAIL, ${gaps} KNOWN-GAP — overall ${report.overall}`);
-  lines.push('Workaround-free pairing verdict: ' + (
-    report.steps.find((x) => x.id === '2')?.status === 'PASS'
-      ? 'CLEAN-MODE PAIRING WORKS — no --disable-web-security, no overrides.fetchImpl, CORS fixed on worker, fetch bound in plugin'
-      : 'SEE STEP 2/3 — clean-mode pairing did not pass'));
   const totalProblems = Object.values(report.consoleProblems).reduce((a, b) => a + b.length, 0);
   lines.push(`Console errors/warnings captured: ${totalProblems}`);
   for (const [name, entries] of Object.entries(report.consoleProblems)) {
     for (const c of entries.slice(0, 10)) lines.push(`  [${name} ${c.level}] ${c.text.slice(0, 240)}`);
   }
   try {
-    writeFileSync(join(HERE, 'report-2vault.json'), JSON.stringify(report, null, 2));
+    writeFileSync(join(HERE, 'report-cloud-resume.json'), JSON.stringify(report, null, 2));
   } catch { /* best effort */ }
   cdp4?.close();
   cdp5?.close();
-  // TEARDOWN: kill Obsidian; LEAVE the 8797 worker RUNNING (user's dogfood state).
   await execFileP('taskkill', ['/F', '/IM', 'Obsidian.exe']).catch(() => {});
-  lines.push('TEARDOWN: Obsidian killed; worker 8797 LEFT RUNNING; both vaults LEFT PAIRED+SYNCED (dogfood state).');
+  lines.push(`TEARDOWN: Obsidian killed; CLOUD worker ${WORKER} LEFT DEPLOYED; both vaults LEFT PAIRED+SYNCED to it.`);
   console.log(lines.join('\n'));
   process.exit(exitCode);
 }

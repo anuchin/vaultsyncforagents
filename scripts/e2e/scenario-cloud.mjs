@@ -1,27 +1,42 @@
 /**
- * TWO-REAL-VAULT bidirectional sync E2E — CLEAN MODE (no workarounds).
+ * TWO-REAL-VAULT bidirectional sync E2E — CLOUD variant (real Cloudflare worker).
  *
- *   • worker: the user's dev worker on http://127.0.0.1:8797 (claimed by this
- *     scenario with passphrase "two-vault-test"; left running afterwards)
- *   • vaults: Z:/Projects/TestVaults/TestVault4 + TestVault5, REAL plugin,
- *     REAL Obsidian — TWO simultaneous instances, one per vault, each with its
- *     own throwaway --user-data-dir profile and CDP port (9222 / 9223)
- *   • CLEAN: launched WITHOUT --disable-web-security, pairing runs the
- *     plugin's own code path (pairFromSettings) with NO overrides.fetchImpl
- *     injection. If pairing works, that is the headline PASS of this run.
+ * Same flow as scenario-2vault.mjs, but pointed at a DEPLOYED worker
+ * (VSA_E2E_WORKER) instead of a local `wrangler dev` on 127.0.0.1:8797. No
+ * dev server is spawned — the worker is already deployed (R2 bucket +
+ * Durable Object + assets are all real Cloudflare resources).
  *
- * Phases: claim/mint → pair both → bidirectional file sync (create/edit/
- * rename/delete) → >256KB binary blob smoke → history/conflict audit →
- * folder-operations phase (F1-F6, coordinator extension).
+ * Differences from scenario-2vault.mjs:
+ *   • WORKER is the https workers.dev URL (real network on every op: WS
+ *     fan-out, /blob PUT+GET through real R2, admin routes).
+ *   • prep step additionally:
+ *       - refreshes the CURRENT plugin build (main.js/manifest/styles.css
+ *         from packages/plugin) into both vaults, and
+ *       - UNLINKS both vaults from the previous local 8797 worker at the
+ *         disk level, mirroring plugin unlink(): deletes /.vaultsyncforagents/
+ *         (device.json FR-44 marker + state index + tmp) and resets
+ *         data.json to defaults while KEEPING deviceName + settings, and
+ *       - removes the artifact files/folders this scenario itself creates
+ *         (left over from the earlier local-server run), so every create
+ *         step starts from a clean slate.
+ *   • timeouts are widened (pairing race 40s, propagation budget 40s) for
+ *     real-network latency; assertions are unchanged.
  *
- * Usage: node scripts/e2e/scenario-2vault.mjs
+ * Phases: claim/mint → unlink+prep → pair both → bidirectional file sync
+ * (create/edit/rename/delete) → >256KB binary blob smoke → history/conflict
+ * audit → folder-operations phase (F1-F6).
+ *
+ * Usage: node scripts/e2e/scenario-cloud.mjs
+ *   VSA_E2E_WORKER      worker base URL (default http://127.0.0.1:8797)
+ *   VSA_E2E_PASSPHRASE  admin passphrase (default two-vault-test — LOCAL
+ *                       wrangler-dev rooms only; set this for a deployed room)
  * Exit 0 iff every step passed (KNOWN-GAP-CONFIRMED passes with a note).
- * Report: scripts/e2e/report-2vault.json + stdout.
+ * Report: scripts/e2e/report-cloud.json + stdout.
  */
 
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -32,11 +47,14 @@ const HERE = join(fileURLToPath(import.meta.url), '..');
 
 // --- constants ---------------------------------------------------------------------------------
 
-const WORKER = 'http://127.0.0.1:8797'; // ALWAYS 127.0.0.1 (localhost stalls on IPv6 here)
-const PASSPHRASE = 'two-vault-test';
+// Target worker + admin passphrase come from the env (see header) — no
+// deployed URL or live passphrase is hardcoded here.
+const WORKER = process.env.VSA_E2E_WORKER ?? 'http://127.0.0.1:8797';
+const PASSPHRASE = process.env.VSA_E2E_PASSPHRASE ?? 'two-vault-test';
 const VAULT_NAME = 'two-vault-test';
 
 const OBSIDIAN_EXE = 'C:\\Program Files\\Obsidian\\Obsidian.exe'; // verified present (AppData/Local has only the updater)
+const PLUGIN_PKG = 'Z:/Projects/syncv2/packages/plugin';
 const V4_DIR = 'Z:/Projects/TestVaults/TestVault4';
 const V5_DIR = 'Z:/Projects/TestVaults/TestVault5';
 const PROFILE_A = 'Z:/Projects/TestVaults/e2e-2vault-profile'; // opens TestVault4
@@ -48,7 +66,23 @@ const CDP_B = `http://127.0.0.1:${PORT_B}`;
 
 const DEVICE4 = 'e2e-vault4';
 const DEVICE5 = 'e2e-vault5';
-const SYNC_TIMEOUT_MS = 25_000; // per the brief: 25s propagation budgets
+const SYNC_TIMEOUT_MS = 40_000; // widened vs 25s: every op now crosses the real internet twice
+const PAIR_RACE_MS = 40_000; // in-page Promise.race budget for pairFromSettings
+const PAIR_PERSIST_WAIT_MS = 60_000; // data.json token persistence fallback
+const STATUSBAR_WAIT_MS = 60_000; // startup reconciliation pushes the whole vault on first pair
+
+// Files/folders THIS scenario creates (leftovers from the earlier local-8797
+// run would make app.vault.create throw "already exists").
+const SCENARIO_ARTIFACTS = [
+  'v4-note.md',
+  'v5-note.md',
+  'renamed-from-v4.md',
+  'blob-smoke.bin',
+  'projects',
+  'archive',
+  'renamed-projects',
+  'to-delete',
+];
 
 const jstr = JSON.stringify;
 
@@ -57,6 +91,7 @@ const jstr = JSON.stringify;
 const report = {
   startedAt: new Date().toISOString(),
   worker: WORKER,
+  cloudMode: { realNetwork: true, devServerSpawned: false },
   cleanMode: { webSecurityDisabled: false, overridesInjected: false },
   steps: [],
 };
@@ -115,8 +150,8 @@ async function waitFor(fn, timeoutMs, everyMs = 500, label = '') {
 
 /**
  * Run a step body once; on throw, retry once (evidence rule), then give up.
- * BOTH attempts are caught — letting the retry's throw escape aborted whole
- * runs on the first double-failing step (cloud run #1, step 4f).
+ * BOTH attempts are caught — the original scenario-2vault.mjs let the retry's
+ * throw escape, which aborted the whole run at the first double-failing step.
  */
 async function withRetry(fn) {
   try {
@@ -127,7 +162,7 @@ async function withRetry(fn) {
       return { ok: true, result: await fn(true) };
     } catch (second) {
       log(`  retry-also-failed: ${String(second.message ?? second).slice(0, 300)}`);
-      return { ok: false, error: second, firstError: first };
+      return { ok: false, error: second };
     }
   }
 }
@@ -135,7 +170,7 @@ async function withRetry(fn) {
 // --- worker HTTP -----------------------------------------------------------------------------------
 
 async function wk(path, init = {}) {
-  const res = await fetch(`${WORKER}${path}`, { signal: AbortSignal.timeout(10_000), ...init });
+  const res = await fetch(`${WORKER}${path}`, { signal: AbortSignal.timeout(15_000), ...init });
   const text = await res.text();
   let body;
   try {
@@ -194,6 +229,66 @@ async function awaitNoteArrival(cdp, path, want, timeoutMs = SYNC_TIMEOUT_MS) {
     return text === want ? text : null;
   }, timeoutMs, 400, `arrival ${path}`);
   return r.elapsedMs;
+}
+
+// --- disk-level unlink + prep (mirrors plugin unlink(); CLOUD-only additions) -----------------------
+
+/**
+ * Unlink vault `dir` from any previous worker at the DISK level while
+ * Obsidian is dead — exactly what plugin unlink() persists:
+ *   • delete /.vaultsyncforagents/ (FR-44 device.json marker + state index)
+ *   • data.json ← defaults, KEEPING deviceName + settings
+ */
+function unlinkVaultOnDisk(dir) {
+  const stateDir = join(dir, '.vaultsyncforagents');
+  const removed = { stateDir: false, marker: false, stateIndex: false };
+  if (existsSync(stateDir)) {
+    removed.marker = existsSync(join(stateDir, 'device.json'));
+    removed.stateIndex = existsSync(join(stateDir, 'state'));
+    rmSync(stateDir, { recursive: true, force: true });
+    removed.stateDir = true;
+  }
+  const pluginDir = join(dir, '.obsidian/plugins/vaultsyncforagents');
+  const dataPath = join(pluginDir, 'data.json');
+  const before = existsSync(dataPath) ? JSON.parse(readFileSync(dataPath, 'utf8')) : null;
+  // defaultPluginData() with deviceName + settings preserved (unlink() semantics)
+  const after = {
+    url: '',
+    token: '',
+    deviceId: '',
+    deviceName: typeof before?.deviceName === 'string' ? before.deviceName : '',
+    settings:
+      before?.settings ??
+      { rescanIntervalSec: 30, obsidianSync: false, statusBarMode: 'detailed', syncOnStartup: true, logLevel: 'info', ignorePatterns: '' },
+  };
+  mkdirSync(pluginDir, { recursive: true });
+  writeFileSync(dataPath, JSON.stringify(after, null, 2));
+  return {
+    removed,
+    dataBefore: before ? { url: before.url, deviceId: before.deviceId, deviceName: before.deviceName, tokenLen: (before.token || '').length } : null,
+    dataAfter: { url: after.url, deviceId: after.deviceId, deviceName: after.deviceName, tokenLen: 0 },
+  };
+}
+
+/** Remove files/folders this scenario itself creates (rerun hygiene). */
+function removeScenarioArtifacts(dir) {
+  const gone = [];
+  for (const name of SCENARIO_ARTIFACTS) {
+    const p = join(dir, name);
+    if (existsSync(p)) {
+      rmSync(p, { recursive: true, force: true });
+      gone.push(name);
+    }
+  }
+  return gone;
+}
+
+/** Refresh the CURRENT plugin build into a vault (same as scenario-hardened prep). */
+function refreshPluginFiles(dir) {
+  const dest = join(dir, '.obsidian/plugins/vaultsyncforagents');
+  mkdirSync(dest, { recursive: true });
+  for (const f of ['main.js', 'manifest.json', 'styles.css']) copyFileSync(join(PLUGIN_PKG, f), join(dest, f));
+  return true;
 }
 
 // --- launch / first-run dialogs ---------------------------------------------------------------------
@@ -307,20 +402,31 @@ process.on('uncaughtException', (e) => {
 });
 
 try {
-  // ---- step 0: kill any running Obsidian, verify worker unclaimed, write profiles ----------
+  // ---- step 0: kill Obsidian, health-check CLOUD worker, unlink vaults, write profiles ----------
   {
-    const s = step('prep', 'kill Obsidian, verify worker unclaimed, write throwaway profiles');
+    const s = step('prep', 'kill Obsidian; CLOUD /health; refresh plugin build; UNLINK both vaults from local 8797; clear scenario artifacts; write profiles');
     try {
       await execFileP('taskkill', ['/F', '/IM', 'Obsidian.exe']).catch((e) => String(e)); // authorized; fine if none running
       await sleep(1500);
       const health = await wk('/health');
       if (health.status !== 200 || health.body.ok !== true) throw new Error(`unexpected /health: ${fmt(health.body)}`);
-      // NB: claimed:true is tolerated on re-runs — step 1 proves the room is OURS
-      // (admin login + /api/status vaultName) before using it.
+      if (health.body.claimed === true) {
+        log(`  note: worker already claimed (re-run) — step 1 will prove the room is ours`);
+      }
+      // Refresh the current plugin build into both vaults, then unlink them
+      // from the old local worker (disk-level mirror of plugin unlink()).
+      const unlinkEvidence = {};
+      for (const [name, dir] of [['TestVault4', V4_DIR], ['TestVault5', V5_DIR]]) {
+        refreshPluginFiles(dir);
+        unlinkEvidence[name] = unlinkVaultOnDisk(dir);
+        unlinkEvidence[name].artifactsRemoved = removeScenarioArtifacts(dir);
+      }
       const { stdout: pa } = await execFileP(process.execPath, [join(HERE, 'write-profile.mjs'), PROFILE_A, V4_DIR, V5_DIR]);
       const { stdout: pb } = await execFileP(process.execPath, [join(HERE, 'write-profile.mjs'), PROFILE_B, V5_DIR, V4_DIR]);
       s.pass({
         health: health.body,
+        pluginRefreshedFrom: PLUGIN_PKG,
+        unlink: unlinkEvidence,
         profileA: pa.trim(),
         profileB: pb.trim(),
         cdpPorts: { vault4: PORT_A, vault5: PORT_B },
@@ -334,7 +440,7 @@ try {
 
   // ---- step 1: claim + admin login + TWO pairing codes --------------------------------------
   {
-    const s = step('1', 'claim 8797 worker (POST /claim), admin login, mint TWO pairing codes');
+    const s = step('1', 'claim CLOUD worker (POST /claim), admin login, mint TWO pairing codes');
     try {
       if (fatalStop) throw new Error('skipped (prep failed)');
       let claimNote = 'fresh claim';
@@ -409,7 +515,7 @@ try {
         p.data.deviceName = ${jstr(DEVICE4)};
         const raced = await Promise.race([
           p.pairFromSettings(${jstr(pairCodes.code4)}).then(o => ({ done: true, outcome: o })),
-          new Promise(r => setTimeout(() => r({ done: false }), 25000)),
+          new Promise(r => setTimeout(() => r({ done: false }), ${PAIR_RACE_MS})),
         ]);
         return { raced, overridesFetch: typeof p.overrides.fetchImpl, data: { url: p.data.url, deviceId: p.data.deviceId, tokenLen: (p.data.token || '').length } };
       })()`);
@@ -420,25 +526,26 @@ try {
         const got = await waitFor(async () => {
           const r = await cdp4.eval(`(async()=>{ const d = JSON.parse(await app.vault.adapter.read('.obsidian/plugins/vaultsyncforagents/data.json')); return (d.token||'').length > 10 ? d : null; })()`);
           return r.ok ? r.value : null;
-        }, 30_000, 1000, 'vault4 token persisted');
+        }, PAIR_PERSIST_WAIT_MS, 1000, 'vault4 token persisted');
         final = { raced: { done: true, outcome: { status: 'paired', late: true } }, data: got, overridesFetch: final.overridesFetch };
       }
       deviceIds.vault4 = final.data?.deviceId ?? null;
-      // status bar reaches a connected/ok state
+      // status bar reaches a connected/ok state (first pair pushes the whole
+      // vault — ~35 files + 600KB blob — through real R2, so a wide budget)
       const sb = await waitFor(async () => {
         const st = await pluginStatus(cdp4);
         return st?.statusBar?.startsWith('vsa ✓') ? st : null;
-      }, 30_000, 1000, 'vault4 status bar ✓');
+      }, STATUSBAR_WAIT_MS, 1000, 'vault4 status bar ✓');
       const cors = fatalConsoleHits({ vault4: cdp4 });
       if (final.raced.outcome.status !== 'paired') throw new Error(`pair outcome: ${fmt(final.raced.outcome)}`);
       if (final.overridesFetch !== 'undefined') throw new Error(`overrides.fetchImpl was set (${final.overridesFetch}) — not clean mode!`);
       if (cors.length > 0) {
-        s.fail({ headline: 'CORS/Illegal-invocation console errors — fixes FAILED', hits: cors.slice(0, 5) });
+        s.fail({ headline: 'CORS/Illegal-invocation console errors — CLOUD worker CORS broken', hits: cors.slice(0, 5) });
         fatalStop = true;
         throw new Error(`FIX-REGRESSION: ${fmt(cors.slice(0, 3))}`);
       }
       s.pass({
-        headline: 'PAIRING WORKS WITH ZERO WORKAROUNDS (no --disable-web-security, no overrides.fetchImpl)',
+        headline: 'CLOUD PAIRING WORKS WITH ZERO WORKAROUNDS (real https worker, no --disable-web-security, no overrides.fetchImpl)',
         pid,
         instanceReadyMs: ready.readyMs,
         firstRunDialogsDriven: ready.dialogsClicked,
@@ -472,7 +579,7 @@ try {
         p.data.deviceName = ${jstr(DEVICE5)};
         const raced = await Promise.race([
           p.pairFromSettings(${jstr(pairCodes.code5)}).then(o => ({ done: true, outcome: o })),
-          new Promise(r => setTimeout(() => r({ done: false }), 25000)),
+          new Promise(r => setTimeout(() => r({ done: false }), ${PAIR_RACE_MS})),
         ]);
         return { raced, overridesFetch: typeof p.overrides.fetchImpl, data: { url: p.data.url, deviceId: p.data.deviceId, tokenLen: (p.data.token || '').length } };
       })()`);
@@ -482,7 +589,7 @@ try {
         const got = await waitFor(async () => {
           const r = await cdp5.eval(`(async()=>{ const d = JSON.parse(await app.vault.adapter.read('.obsidian/plugins/vaultsyncforagents/data.json')); return (d.token||'').length > 10 ? d : null; })()`);
           return r.ok ? r.value : null;
-        }, 30_000, 1000, 'vault5 token persisted');
+        }, PAIR_PERSIST_WAIT_MS, 1000, 'vault5 token persisted');
         final = { raced: { done: true, outcome: { status: 'paired', late: true } }, data: got, overridesFetch: final.overridesFetch };
       }
       deviceIds.vault5 = final.data?.deviceId ?? null;
@@ -491,7 +598,7 @@ try {
       const sb = await waitFor(async () => {
         const st = await pluginStatus(cdp5);
         return st?.statusBar?.startsWith('vsa ✓') ? st : null;
-      }, 30_000, 1000, 'vault5 status bar ✓');
+      }, STATUSBAR_WAIT_MS, 1000, 'vault5 status bar ✓');
       const cors = fatalConsoleHits({ vault4: cdp4, vault5: cdp5 });
       if (cors.length > 0) throw new Error(`FIX-REGRESSION console hits: ${fmt(cors.slice(0, 3))}`);
       // both devices online per admin API
@@ -503,10 +610,10 @@ try {
         return have.has(DEVICE4) && have.has(DEVICE5) && online.includes(DEVICE4) && online.includes(DEVICE5)
           ? { devices, online }
           : null;
-      }, 30_000, 1000, 'both devices online');
+      }, 45_000, 1000, 'both devices online');
       const devices = st.value.devices.map((d) => `${d.name}(${d.type},${d.online ? 'online' : 'offline'})`);
       s.pass({
-        headline: 'BOTH VAULTS PAIRED CLEANLY — two online devices + admin in one room',
+        headline: 'BOTH VAULTS PAIRED CLEANLY TO CLOUD — two online devices + admin in one room',
         pid,
         instanceReadyMs: ready.readyMs,
         firstRunDialogsDriven: ready.dialogsClicked,
@@ -621,7 +728,7 @@ try {
 
   // ---- step 5: attachment smoke — >256KB binary forces the BLOB STORE (not WS-inline) ----------
   {
-    const s = step('5', 'attachment smoke: 600KB random .bin in vault4 → byte-identical in vault5 via /blob/*');
+    const s = step('5', 'attachment smoke: 600KB random .bin in vault4 → byte-identical in vault5 via real-R2 /blob/*');
     const runOnce = async () => {
       const made = await cdp4.eval(`(async () => {
         const n = 614400; // 600 KB — above the 256 KB INLINE_CONTENT_MAX_BYTES, so the blob store carries it
@@ -657,7 +764,7 @@ try {
         latencyMs: ms,
         serverVersion: head ? { id: head.id, kind: head.kind, size: head.size, hash: head.hash?.slice(0, 12) + '…', deviceId: head.deviceId } : null,
         workerAttachments: status.body?.attachments ?? null,
-        blobPathForced: '600KB > 256KB inline cap → PUT/GET /blob/:hash (the CORS-fixed surface)',
+        blobPathForced: '600KB > 256KB inline cap → PUT/GET /blob/:hash through REAL Cloudflare R2',
       };
     };
     if (fatalStop || !cdp4 || !cdp5) s.fail('skipped (fatal earlier)');
@@ -892,23 +999,24 @@ try {
   exitCode = failed === 0 ? 0 : 1;
   lines.push('');
   lines.push(`SUMMARY: ${passed} PASS, ${failed} FAIL, ${gaps} KNOWN-GAP — overall ${report.overall}`);
-  lines.push('Workaround-free pairing verdict: ' + (
+  lines.push('Workaround-free CLOUD pairing verdict: ' + (
     report.steps.find((x) => x.id === '2')?.status === 'PASS'
-      ? 'CLEAN-MODE PAIRING WORKS — no --disable-web-security, no overrides.fetchImpl, CORS fixed on worker, fetch bound in plugin'
-      : 'SEE STEP 2/3 — clean-mode pairing did not pass'));
+      ? 'CLEAN-MODE PAIRING WORKS AGAINST THE REAL CLOUDFLARE WORKER — no --disable-web-security, no overrides.fetchImpl, CORS OK on deployed worker'
+      : 'SEE STEP 2/3 — clean-mode cloud pairing did not pass'));
   const totalProblems = Object.values(report.consoleProblems).reduce((a, b) => a + b.length, 0);
   lines.push(`Console errors/warnings captured: ${totalProblems}`);
   for (const [name, entries] of Object.entries(report.consoleProblems)) {
     for (const c of entries.slice(0, 10)) lines.push(`  [${name} ${c.level}] ${c.text.slice(0, 240)}`);
   }
   try {
-    writeFileSync(join(HERE, 'report-2vault.json'), JSON.stringify(report, null, 2));
+    writeFileSync(join(HERE, 'report-cloud.json'), JSON.stringify(report, null, 2));
   } catch { /* best effort */ }
   cdp4?.close();
   cdp5?.close();
-  // TEARDOWN: kill Obsidian; LEAVE the 8797 worker RUNNING (user's dogfood state).
+  // TEARDOWN: kill Obsidian; LEAVE the deployed CLOUD worker RUNNING (user's own
+  // account) and both vaults paired to it (dogfood state).
   await execFileP('taskkill', ['/F', '/IM', 'Obsidian.exe']).catch(() => {});
-  lines.push('TEARDOWN: Obsidian killed; worker 8797 LEFT RUNNING; both vaults LEFT PAIRED+SYNCED (dogfood state).');
+  lines.push(`TEARDOWN: Obsidian killed; CLOUD worker ${WORKER} LEFT DEPLOYED; both vaults LEFT PAIRED+SYNCED to it.`);
   console.log(lines.join('\n'));
   process.exit(exitCode);
 }

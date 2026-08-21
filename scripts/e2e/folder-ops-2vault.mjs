@@ -73,12 +73,18 @@ async function waitFor(fn, timeoutMs, everyMs = 500, label = '') {
     await sleep(everyMs);
   }
 }
+/** Run a step body once; on throw, retry once — BOTH failures returned, never thrown. */
 async function withRetry(fn) {
   try {
     return { ok: true, result: await fn(false) };
   } catch (first) {
     lines.push(`  retry-after-error: ${String(first.message ?? first).slice(0, 300)}`);
-    return { ok: false, error: first, result: await fn(true) };
+    try {
+      return { ok: true, result: await fn(true) };
+    } catch (second) {
+      lines.push(`  retry-also-failed: ${String(second.message ?? second).slice(0, 300)}`);
+      return { ok: false, error: second, firstError: first };
+    }
   }
 }
 

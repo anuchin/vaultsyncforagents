@@ -1,6 +1,6 @@
 /**
  * HARDENED-BUILD E2E on the two REAL dogfood vaults (TestVault4 + TestVault5)
- * against the user's live worker http://127.0.0.1:8797 ("two-vault-test").
+ * against a DEPLOYED Cloudflare worker (VSA_E2E_WORKER)
  *
  *   • Both vaults are ALREADY PAIRED (data.json holds tokens). This script
  *     NEVER pairs — it refreshes the plugin files from the current build,
@@ -28,7 +28,14 @@
  * passed. TEARDOWN: kills Obsidian, LEAVES the 8797 worker RUNNING (user's
  * live dogfood room) and both vaults paired+synced.
  *
- * Usage: node scripts/e2e/scenario-hardened.mjs
+ * CLOUD variant of scenario-hardened.mjs (same steps, real network; report
+ * report-hardened-cloud.json). Defines the progressRecorderStart/Stop helpers
+ * the committed script references but never defines.
+ *
+ * Usage: node scripts/e2e/scenario-hardened-cloud.mjs
+ *   VSA_E2E_WORKER      worker base URL (default http://127.0.0.1:8797)
+ *   VSA_E2E_PASSPHRASE  admin passphrase (default two-vault-test — LOCAL
+ *                       wrangler-dev rooms only; set this for a deployed room)
  */
 
 import { execFile, spawn } from 'node:child_process';
@@ -43,8 +50,10 @@ const HERE = join(fileURLToPath(import.meta.url), '..');
 
 // --- constants ---------------------------------------------------------------------------------
 
-const WORKER = 'http://127.0.0.1:8797'; // ALWAYS 127.0.0.1 (localhost stalls on IPv6 here)
-const PASSPHRASE = 'two-vault-test';
+// Target worker + admin passphrase come from the env (see header) — no
+// deployed URL or live passphrase is hardcoded here.
+const WORKER = process.env.VSA_E2E_WORKER ?? 'http://127.0.0.1:8797';
+const PASSPHRASE = process.env.VSA_E2E_PASSPHRASE ?? 'two-vault-test';
 
 const OBSIDIAN_EXE = 'C:\\Program Files\\Obsidian\\Obsidian.exe';
 const PLUGIN_PKG = 'Z:/Projects/syncv2/packages/plugin';
@@ -62,7 +71,7 @@ const CDP_B = `http://127.0.0.1:${PORT_B}`;
 const DEVICE4 = 'e2e-vault4';
 const DEVICE5_OLD = 'e2e-vault5';
 const DEVICE5_NEW = 'e2e-vault5-renamed';
-const SYNC_TIMEOUT_MS = 25_000;
+const SYNC_TIMEOUT_MS = 40_000; // widened for real-network latency
 const BURST_N = 30;
 const BURST_PREFIX = 'e2e-h-';
 const burstName = (i) => `${BURST_PREFIX}${String(i).padStart(2, '0')}.md`;
@@ -128,12 +137,7 @@ async function waitFor(fn, timeoutMs, everyMs = 500, label = '') {
   }
 }
 
-/**
- * Run a step body once; on throw, retry once (evidence rule), then give up.
- * Both failures are RETURNED (never thrown) so one double-failing step cannot
- * abort the remaining steps — the original `result: await fn(true)` let the
- * retry's rejection escape and kill the whole run.
- */
+/** Run a step body once; on throw, retry once (evidence rule), then give up. BOTH attempts caught. */
 async function withRetry(fn) {
   try {
     return { ok: true, result: await fn(false) };
@@ -143,7 +147,7 @@ async function withRetry(fn) {
       return { ok: true, result: await fn(true) };
     } catch (second) {
       log(`  retry-also-failed: ${String(second.message ?? second).slice(0, 300)}`);
-      return { ok: false, error: second, firstError: first };
+      return { ok: false, error: second };
     }
   }
 }
@@ -151,7 +155,7 @@ async function withRetry(fn) {
 // --- worker HTTP -----------------------------------------------------------------------------------
 
 async function wk(path, init = {}) {
-  const res = await fetch(`${WORKER}${path}`, { signal: AbortSignal.timeout(10_000), ...init });
+  const res = await fetch(`${WORKER}${path}`, { signal: AbortSignal.timeout(15_000), ...init });
   const text = await res.text();
   let body;
   try {
@@ -241,31 +245,33 @@ async function progressCaptureStart(cdp, { quietMs = 800, giveUpMs = 15_000, har
   return r.value;
 }
 
+
 /**
- * Robust X/Y progress recorders (S2 uses these). A 3 ms in-page sampler pushes
- * into window.__vsaProg; stop() polls from NODE until the sampler has gone
- * quiet (progress back to null), so no single CDP eval runs past cdp.mjs's
- * 30 s call timeout.
+ * Robust X/Y progress recorders (the committed script referenced these
+ * without defining them). A 3 ms in-page sampler pushes into
+ * window.__vsaProg; stop() polls from NODE until the sampler has gone quiet
+ * (progress back to null), so no single CDP eval runs past cdp.mjs's 30 s
+ * call timeout.
  */
 async function progressRecorderStart(cdp) {
-  const r = await cdp.eval(`(async () => { window.__vsaProg = [];
-    if (window.__vsaProgTimer) clearInterval(window.__vsaProgTimer);
-    window.__vsaProgTimer = setInterval(() => {
-      const pr = app.plugins?.plugins?.vaultsyncforagents?.client?.status?.()?.progress ?? null;
-      if (pr) window.__vsaProg.push({ t: Date.now(), ...pr });
-    }, 3);
-    return 'started'; })()`);
-  if (!r.ok) throw new Error(`recorder start: ${r.error}`);
+  const r = await cdp.eval("(async () => { window.__vsaProg = [];\n" +
+    "    if (window.__vsaProgTimer) clearInterval(window.__vsaProgTimer);\n" +
+    "    window.__vsaProgTimer = setInterval(() => {\n" +
+    "      const pr = app.plugins?.plugins?.vaultsyncforagents?.client?.status?.()?.progress ?? null;\n" +
+    "      if (pr) window.__vsaProg.push({ t: Date.now(), ...pr });\n" +
+    "    }, 3);\n" +
+    "    return 'started'; })()");
+  if (!r.ok) throw new Error("recorder start: " + r.error);
   return r.value;
 }
 async function progressRecorderStop(cdp, quietMs = 1000, giveUpMs = 20_000, hardCapMs = 90_000) {
   const t0 = Date.now();
   for (;;) {
     const peek = await cdp.eval('(window.__vsaProg ?? []).length');
-    if (!peek.ok) throw new Error(`recorder peek: ${peek.error}`);
+    if (!peek.ok) throw new Error('recorder peek: ' + peek.error);
     if ((peek.value ?? 0) > 0) {
       const lastT = await cdp.eval('(window.__vsaProg ?? []).slice(-1)[0]?.t ?? 0');
-      if (!lastT.ok) throw new Error(`recorder lastT: ${lastT.error}`);
+      if (!lastT.ok) throw new Error('recorder lastT: ' + lastT.error);
       if (Date.now() - (lastT.value ?? 0) > quietMs) break; // quiet -> settled
     } else if (Date.now() - t0 > giveUpMs) {
       break; // never saw any progress object
@@ -274,7 +280,7 @@ async function progressRecorderStop(cdp, quietMs = 1000, giveUpMs = 20_000, hard
     await sleep(250);
   }
   const fin = await cdp.eval('(async () => { const out = window.__vsaProg ?? []; clearInterval(window.__vsaProgTimer); window.__vsaProgTimer = undefined; window.__vsaProg = []; return out; })()');
-  if (!fin.ok) throw new Error(`recorder stop: ${fin.error}`);
+  if (!fin.ok) throw new Error('recorder stop: ' + fin.error);
   return fin.value ?? [];
 }
 
@@ -408,7 +414,7 @@ try {
         refreshed[v] = { copied: ['main.js', 'manifest.json', 'styles.css'], pairing: prePairing[v] };
       }
       if (prePairing.TestVault4.url !== WORKER || prePairing.TestVault5.url !== WORKER) {
-        throw new Error('vault data.json url mismatch — not pointed at the 8797 worker');
+        throw new Error('vault data.json url mismatch — not pointed at the CLOUD worker');
       }
       const { stdout: pa } = await execFileP(process.execPath, [join(HERE, 'write-profile.mjs'), PROFILE_A, V4_DIR, V5_DIR]);
       const { stdout: pb } = await execFileP(process.execPath, [join(HERE, 'write-profile.mjs'), PROFILE_B, V5_DIR, V4_DIR]);
@@ -463,7 +469,9 @@ try {
         const res = await wk('/api/status', { headers: { cookie } });
         const devs = res.body?.devices ?? [];
         const online = devs.filter((d) => d.online).map((d) => d.name);
-        return online.includes(DEVICE4) && online.includes(DEVICE5_OLD) ? devs : null;
+        // re-run tolerance: S4 may have renamed vault5 to DEVICE5_NEW in an earlier run
+        const v5online = online.includes(DEVICE5_OLD) || online.includes(DEVICE5_NEW);
+        return online.includes(DEVICE4) && v5online ? devs : null;
       }, 30_000, 1000, 'both devices online');
       s.pass({
         headline: 'PAIRING PERSISTED ACROSS PLUGIN UPGRADE — both clients auto-reconnected live with untouched tokens',
@@ -618,7 +626,8 @@ try {
       // PAUSE vault5 via the plugin's own control. Contract per plugin.ts:
       // paused=true, status bar 'vsa ⏸', client state idle. (hasClient stays
       // true — pauseSyncing() closes the client but keeps the reference; the
-      // old hasClient===false assertion contradicted the implementation.)
+      // committed script's hasClient===false assertion contradicted both the
+      // plugin code and the local run's own pausedUi evidence.)
       const paused = await cdp5.eval(`(() => { const p = app.plugins.plugins.vaultsyncforagents;
         p.pauseSyncing();
         return { paused: p.syncingPaused, hasClient: !!p.client, state: p.client?.status?.()?.state ?? null, statusBar: p.statusBarItem?.textContent ?? null }; })()`);
@@ -818,7 +827,9 @@ try {
       const content = `keep me ${Date.now()}`;
       const mk = await cdp5.eval(`(async () => {
         try { await app.vault.createFolder('resurrect'); } catch (e) {}
-        await app.vault.create('resurrect/keep.md', ${jstr(content)});
+        const text = ${jstr(content)};
+        try { await app.vault.create('resurrect/keep.md', text); }
+        catch (e) { const f = app.vault.getAbstractFileByPath('resurrect/keep.md'); if (!f) throw e; await app.vault.modify(f, text); }
         return 'created'; })()`);
       if (!mk.ok) throw new Error(`create resurrect/keep.md in vault5: ${mk.error}`);
       let toV4Ms;
@@ -909,13 +920,12 @@ try {
   for (const [name, entries] of Object.entries(consoles)) {
     report.consoleProblems[name] = entries.filter((e) => ['error', 'warning', 'warn'].includes(String(e.level).toLowerCase()));
   }
-  // worker PID(s) listening on 8797 (worker LEFT RUNNING)
+  // cloud worker liveness evidence (worker LEFT DEPLOYED)
   try {
-    const { stdout } = await execFileP('netstat', ['-ano']).catch(() => ({ stdout: '' }));
-    const pids = [...new Set(stdout.split('\n').filter((l) => /:8797\s/.test(l) && /LISTENING/i.test(l)).map((l) => l.trim().split(/\s+/).pop()))];
-    report.workerLeftRunning = { url: WORKER, listeningPids: pids, note: 'wrangler dev --port 8797 --persist-to .wrangler/devstate-testvault (user dogfood room) — LEFT RUNNING' };
+    const h = await wk('/health');
+    report.workerLeftRunning = { url: WORKER, health: h.body, note: 'deployed Cloudflare worker — LEFT RUNNING' };
   } catch {
-    report.workerLeftRunning = { url: WORKER, note: 'left running (PID capture failed)' };
+    report.workerLeftRunning = { url: WORKER, note: 'left deployed (health probe failed)' };
   }
   report.finishedAt = new Date().toISOString();
   const failed = report.steps.filter((x) => x.status === 'FAIL' || x.status === 'RUNNING').length;
@@ -930,15 +940,15 @@ try {
     for (const c of entries.slice(0, 10)) lines.push(`  [${name} ${c.level}] ${c.text.slice(0, 240)}`);
   }
   try {
-    writeFileSync(join(HERE, 'report-hardened.json'), JSON.stringify(report, null, 2));
+    writeFileSync(join(HERE, 'report-hardened-cloud.json'), JSON.stringify(report, null, 2));
   } catch {
     /* best effort */
   }
   cdp4?.close();
   cdp5?.close();
-  // TEARDOWN: kill Obsidian; LEAVE the 8797 worker RUNNING; vaults stay paired+synced.
+  // TEARDOWN: kill Obsidian; LEAVE the CLOUD worker DEPLOYED; vaults stay paired+synced.
   await execFileP('taskkill', ['/F', '/IM', 'Obsidian.exe']).catch(() => {});
-  lines.push('TEARDOWN: Obsidian killed; worker 8797 LEFT RUNNING; both vaults LEFT PAIRED+SYNCED.');
+  lines.push('TEARDOWN: Obsidian killed; CLOUD worker LEFT DEPLOYED; both vaults LEFT PAIRED+SYNCED to it.');
   console.log(lines.join('\n'));
   process.exit(exitCode);
 }
