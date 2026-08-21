@@ -1,0 +1,220 @@
+{
+  "startedAt": "2026-08-21T03:01:18.499Z",
+  "worker": "http://localhost:8801",
+  "steps": [
+    {
+      "id": "a",
+      "name": "plugin loaded in real Obsidian",
+      "status": "PASS",
+      "t0": 1787281278525,
+      "ms": 2,
+      "detail": {
+        "basePath": "Z:\\Projects\\TestVaults\\TestVault4-e2e",
+        "loaded": true,
+        "enabledInConfig": true,
+        "pairFromSettings": "function"
+      }
+    },
+    {
+      "id": "b",
+      "name": "claim worker (POST /claim), admin login, mint pairing code (POST /admin/pair)",
+      "status": "PASS",
+      "t0": 1787281278527,
+      "ms": 299,
+      "detail": {
+        "health": {
+          "ok": true,
+          "claimed": false
+        },
+        "claim": {
+          "vaultName": "e2e-vault",
+          "deviceId": "dev-96583b048d90",
+          "tokenMinted": true
+        },
+        "adminCookie": "vsa_admin=…",
+        "pairingCode": "99E4-25YP"
+      }
+    },
+    {
+      "id": "c",
+      "name": "pair plugin via plugin.pairFromSettings(code) — real code path",
+      "status": "PASS",
+      "t0": 1787281278826,
+      "ms": 668,
+      "detail": {
+        "outcome": {
+          "status": "paired",
+          "url": "http://localhost:8801",
+          "token": "uVBtbd1qImjF97_kzOFecOtAOMlTwuC2xE0LLT_m-Xc",
+          "deviceId": "dev-2009ea5d1e58"
+        },
+        "pairMs": 668,
+        "persistedData": {
+          "url": "http://localhost:8801",
+          "deviceId": "dev-2009ea5d1e58",
+          "tokenLen": 43,
+          "deviceName": "e2e-obsidian"
+        },
+        "deviceMarker": {
+          "deviceId": "dev-2009ea5d1e58",
+          "deviceName": "e2e-obsidian",
+          "url": "http://localhost:8801",
+          "linkedAt": 1787281279145
+        },
+        "statusBar": "vsa ✓ 0s"
+      }
+    },
+    {
+      "id": "d",
+      "name": "push: app.vault.create → plugin syncs → worker version exists",
+      "status": "PASS",
+      "t0": 1787281279494,
+      "ms": 551,
+      "detail": {
+        "created": "e2e-push-test.md",
+        "serverVersionsAfterMs": 550,
+        "versionCount": 1,
+        "headVersion": {
+          "id": "v1",
+          "deviceId": "dev-2009ea5d1e58",
+          "size": 33,
+          "hash": "7f7f8d94bbea…",
+          "current": true
+        },
+        "content": "hello from obsidian 1787281279494"
+      }
+    },
+    {
+      "id": "e",
+      "name": "edit: app.vault.modify → second server version",
+      "status": "PASS",
+      "t0": 1787281280045,
+      "ms": 2064,
+      "detail": {
+        "editArrivedAfterMs": 555,
+        "versionCount": 2,
+        "newestVersion": {
+          "id": "v2",
+          "deviceId": "dev-2009ea5d1e58",
+          "size": 34,
+          "current": true
+        },
+        "content": "edited from obsidian 1787281281552"
+      }
+    },
+    {
+      "id": "f",
+      "name": "pull/push via CLI device #2: vsa link + vsa status one-shot → file arrives in vault",
+      "status": "PASS",
+      "t0": 1787281282109,
+      "ms": 1086,
+      "detail": {
+        "link": "Linked e2e-vault at Z:\\Projects\\TestVaults\\e2e-cli-vault",
+        "statusSummary": "1 vault connected",
+        "cliHistoryHasPushNote": true,
+        "arrivedInVaultAfterMs": 1,
+        "contentMatches": true,
+        "content": "sent from cli device 1787281282501"
+      }
+    },
+    {
+      "id": "g",
+      "name": "GET /api/status (admin): devices, lastEdit, attachments/storage",
+      "status": "PASS",
+      "t0": 1787281283195,
+      "ms": 9,
+      "detail": {
+        "vaultName": "e2e-vault",
+        "devices": [
+          "e2e-admin(desktop,offline)",
+          "e2e-obsidian(desktop,online)",
+          "e2e-cli(cli,online)"
+        ],
+        "lastEdit": {
+          "ts": 1787281282841,
+          "deviceId": "dev-5b3180518832",
+          "path": "/e2e-cli-note.md"
+        },
+        "attachments": {
+          "count": 0,
+          "bytes": 0
+        },
+        "storageBytes": 101,
+        "recentEvents": [
+          "change:/e2e-cli-note.md",
+          "device_paired:e2e-cli",
+          "change:/e2e-push-test.md",
+          "change:/e2e-push-test.md",
+          "device_paired:e2e-obsidian"
+        ]
+      }
+    },
+    {
+      "id": "i",
+      "name": "race probe: modify right after create-commit ack — server head == disk content?",
+      "status": "PASS",
+      "t0": 1787281283204,
+      "ms": 844,
+      "detail": {
+        "note": "no divergence: server head == sha256(disk) after the rapid edit",
+        "versions": 2,
+        "head": {
+          "id": "v5",
+          "size": 25,
+          "deviceId": "dev-2009ea5d1e58"
+        },
+        "diskContent": "race edited 1787281283204",
+        "indexInSync": true
+      }
+    },
+    {
+      "id": "h",
+      "name": "conflict smoke: plugin client status shows 0 conflicts",
+      "status": "PASS",
+      "t0": 1787281284048,
+      "ms": 0,
+      "detail": {
+        "state": "live",
+        "pending": 0,
+        "conflicts": 0,
+        "lastSyncAt": 1787281283913
+      }
+    }
+  ],
+  "console": [
+    {
+      "ts": "2026-08-21T03:01:18.524Z",
+      "source": "console:log",
+      "level": "log",
+      "text": "%cObsidian Developer Console color:#7f6df2; font-size:40px; font-weight:bold;"
+    },
+    {
+      "ts": "2026-08-21T03:01:18.524Z",
+      "source": "console:warning",
+      "level": "warning",
+      "text": "[vsa] transport closed Object"
+    },
+    {
+      "ts": "2026-08-21T03:01:18.525Z",
+      "source": "console:warning",
+      "level": "warning",
+      "text": "[vsa] transport closed Object"
+    }
+  ],
+  "consoleProblems": [
+    {
+      "ts": "2026-08-21T03:01:18.524Z",
+      "source": "console:warning",
+      "level": "warning",
+      "text": "[vsa] transport closed Object"
+    },
+    {
+      "ts": "2026-08-21T03:01:18.525Z",
+      "source": "console:warning",
+      "level": "warning",
+      "text": "[vsa] transport closed Object"
+    }
+  ],
+  "finishedAt": "2026-08-21T03:01:24.048Z",
+  "overall": "PASS"
+}
