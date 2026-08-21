@@ -3,6 +3,7 @@
  * `SyncClientStatus`, repainted by the plugin's 1 s supervision tick.
  *
  *   vsa ⋯              connecting / syncing
+ *   vsa ⋯ 1234/5000    syncing, bulk phase progress (scanning/pushing/pulling)
  *   vsa ✓ 12s          live, last completed cycle 12 s ago
  *   vsa ⚠ conflicts: 2 conflicts observed (conflict copies exist in the vault)
  *   vsa ✗ offline      disconnected (reconnect backoff running)
@@ -50,6 +51,11 @@ export function formatSince(elapsedMs: number): string {
 /**
  * The one-line status text for a client status at time `now`. `mode` shrinks
  * the line (compact drops the trailing detail); `paused` wins over everything.
+ *
+ * During a bulk phase (`status.progress` — scanning/pushing/pulling of a
+ * multi-minute initial sync) both detail levels show the counts —
+ * `vsa ⋯ 1234/5000` — because that is the one thing a user waiting on a big
+ * sync needs; hidden mode shows nothing (the item is never mounted).
  */
 export function statusLineFor(
   status: SyncClientStatus,
@@ -61,8 +67,11 @@ export function statusLineFor(
   const compact = mode === 'compact';
   switch (status.state) {
     case 'connecting':
-    case 'syncing':
+    case 'syncing': {
+      const progress = status.progress;
+      if (progress !== undefined) return `vsa ⋯ ${progress.done}/${progress.total}`;
       return 'vsa ⋯';
+    }
     case 'disconnected':
       return compact ? 'vsa ✗' : 'vsa ✗ offline';
     case 'live':
@@ -94,6 +103,9 @@ export function statusTooltipFor(status: SyncClientStatus, context: StatusContex
       ? 'Last sync: never'
       : `Last sync: ${formatSince(now - status.lastSyncAt)} ago`,
   );
+  if (status.progress !== undefined) {
+    lines.push(`Syncing: ${status.progress.done}/${status.progress.total} (${status.progress.phase})`);
+  }
   lines.push(`Pending changes: ${status.pending}`);
   lines.push(`Conflicts: ${status.conflicts.length}`);
   if (status.conflicts.length > 0) {

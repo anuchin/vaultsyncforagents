@@ -113,6 +113,16 @@ export interface HelloAckMessage {
   deviceId: string;
   vaultName: string;
   settings: VaultSettings;
+  /**
+   * Lowest change-event sequence number the server still retains (protocol
+   * v1, pre-release; optional so older servers can be answered with a full
+   * manifest). A client whose cursor satisfies
+   * `oldestRetainedSeq <= cursor + 1` can request a delta manifest — every
+   * event after its cursor is still replayable, so its index is guaranteed
+   * to only miss heads with `head_seq > cursor`. Absent (or `> cursor + 1`)
+   * ⇒ the client must fall back to a full manifest.
+   */
+  oldestRetainedSeq?: number;
 }
 
 /** Reply to `getManifest`: the (possibly delta) file index. */

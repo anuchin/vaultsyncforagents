@@ -390,6 +390,14 @@ export class VaultRoom extends DurableObject<Env> {
         obsidianSync: (await this.getMeta('settings_obsidian_sync')) === '1',
         displayName: vaultName,
       },
+      // Replay-window answer (§5/§6): the oldest change-event seq still
+      // retained under the pruning policy (30 days / newest 10k). Clients
+      // with `cursor + 1 >= oldestRetainedSeq` request a delta manifest
+      // (`getManifest{since}`) instead of the full vault index; with a gap —
+      // or on legacy servers that omit the field — they fall back to full.
+      // No change events retained ⇒ "nothing servable" (`head + 1`), which
+      // reads as servable only to a cursor already at the head.
+      oldestRetainedSeq: await this.oldestRetainedSeq(),
     });
     this.broadcastOthers(ws, { type: 'deviceSeen', deviceId: device.id, ts: now });
     // Catch-up replay (§5): everything the client missed since its cursor.
@@ -1256,6 +1264,18 @@ export class VaultRoom extends DurableObject<Env> {
     const row = this.sql('SELECT head_seq FROM files WHERE path = ?', path).toArray()[0];
     const seq = row?.head_seq as number | undefined;
     return seq === undefined || seq === 0 ? undefined : seq;
+  }
+
+  /**
+   * Oldest change-event sequence number still retained (§6 pruning: 30 days
+   * / newest 10k — `MIN(seq)` already reflects both arms). Non-change events
+   * carry NULL seq and are excluded; with no change events left the answer
+   * is "head + 1" (nothing servable below the head).
+   */
+  private async oldestRetainedSeq(): Promise<number> {
+    const row = this.sql('SELECT MIN(seq) AS oldest FROM events WHERE seq IS NOT NULL').toArray()[0];
+    const oldest = row?.oldest as number | null;
+    return oldest ?? this.globalSeq() + 1;
   }
 
   // --- blob bookkeeping ---------------------------------------------------------------------------

@@ -3,9 +3,13 @@
  *
  * Composes the phase-1a/1b pieces into one loop per device:
  *
- *   startup:  loadLocalIndex → hello/helloAck → getManifest → scanVault →
- *             computeSyncPlan → execute (pushes inline-or-blob, pulls via
- *             applyPull with the injected blob store);
+ *   startup:  loadLocalState (entries + persisted cursor) → hello/helloAck
+ *             (server reports `oldestRetainedSeq`) → getManifest — a DELTA
+ *             manifest (`since: syncedThrough`) merged over the index
+ *             projection when the replay window is intact, else full →
+ *             scanVault → computeSyncPlan → execute (pushes through a
+ *             bounded-concurrency pipeline, pulls via applyPull with the
+ *             injected blob store);
  *   live:     `change` messages materialize immediately when the target is
  *             clean, and defer to a full reconcile cycle when it is not — a
  *             remote change is NEVER written over locally-modified content
@@ -15,6 +19,9 @@
  *   reconnect: `onClose` flips to `'disconnected'`; `reconnect()` re-runs the
  *             whole startup reconciliation (backoff is the caller's job).
  *
+ * Bulk phases report X/Y on `status().progress` (throttled via the injected
+ * clock); the push phase keeps up to `pushConcurrency` commits in flight.
+ *
  * All I/O crosses the adapter seams (`StorageAdapter`, `Transport`,
  * `BlobStore`, `LogAdapter`); the class itself is pure orchestration and runs
  * anywhere `core` runs — Workers tests included.
@@ -22,7 +29,7 @@
 
 import type { LogAdapter, StorageAdapter, WatchAdapter } from './adapters.js';
 import { compareClocks } from './clock.js';
-import { applyPull, loadLocalIndex, pruneParentOnDelete, type FetchBlob } from './engine.js';
+import { applyPull, loadLocalState, pruneParentOnDelete, type FetchBlob } from './engine.js';
 import { NetworkError, ProtocolError, RevokedError, UnauthorizedError } from './errors.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
@@ -32,6 +39,7 @@ import {
   removeEntry,
   serializeLocalIndex,
   type LocalIndex,
+  type PersistedSyncState,
 } from './localindex.js';
 import {
   base64ToBytes,
@@ -90,9 +98,33 @@ export interface SyncClientOptions {
    * manual queue — the client never touches a real timer behind this seam.
    */
   schedule?: (fn: () => void, ms: number) => () => void;
+  /**
+   * Bounded concurrency of the push pipeline: how many commits may be in
+   * flight (sent, awaiting ack) at once. Default 8. Conflict arbitration is
+   * server-side and PER PATH, and a cycle stages at most one commit per path,
+   * so ordering across different files is irrelevant — see
+   * `runPushPipeline` for the full argument.
+   */
+  pushConcurrency?: number;
+  /**
+   * Minimum wall-clock ms between `status().progress` updates during bulk
+   * phases (default 50 — renderer coalescing; phase changes and completions
+   * always emit). Tests pass 0 to observe every file.
+   */
+  progressThrottleMs?: number;
 }
 
 export type SyncClientState = 'idle' | 'connecting' | 'syncing' | 'live' | 'disconnected';
+
+/** The bulk phase a running cycle is currently grinding through. */
+export type SyncPhase = 'scanning' | 'pushing' | 'pulling';
+
+/** X/Y progress of one bulk phase; present on `SyncClientStatus` mid-cycle only. */
+export interface SyncProgress {
+  phase: SyncPhase;
+  done: number;
+  total: number;
+}
 
 export interface SyncClientStatus {
   state: SyncClientState;
@@ -102,7 +134,17 @@ export interface SyncClientStatus {
   pending: number;
   /** Conflicts observed by plan cycles (informational; resolution is in the data). */
   conflicts: ConflictOp[];
+  /**
+   * Progress of the RUNNING cycle's current bulk phase (`vsa ⋯ 1234/5000`);
+   * absent between cycles. Updates are throttled to `progressThrottleMs`.
+   */
+  progress?: SyncProgress;
 }
+
+/** Default in-flight commit cap (see `SyncClientOptions.pushConcurrency`). */
+export const DEFAULT_PUSH_CONCURRENCY = 8;
+/** Default progress coalescing window (see `SyncClientOptions.progressThrottleMs`). */
+export const DEFAULT_PROGRESS_THROTTLE_MS = 50;
 
 const defaultLog: LogAdapter = {
   debug: () => {},
@@ -147,6 +189,8 @@ export class SyncClient {
   private readonly debounceMs: number;
   private readonly schedule: (fn: () => void, ms: number) => () => void;
   private readonly dialTransport: () => Transport;
+  private readonly pushConcurrency: number;
+  private readonly progressThrottleMs: number;
 
   private transport: Transport | null = null;
   private state: SyncClientState = 'idle';
@@ -159,18 +203,51 @@ export class SyncClient {
   private watchAdapter: WatchAdapter | null = null;
   private cancelDebounce: (() => void) | null = null;
 
+  /**
+   * Delta-manifest bookkeeping (persisted alongside the index, see
+   * `PersistedSyncState`): `syncedThrough` — the manifest cursor of the last
+   * fully-successful cycle, i.e. the seq through which the index is known
+   * COMPLETE (null until one finishes); `needsFullManifest` — a remote change
+   * was deferred over local divergence and must be resolved through a full
+   * manifest's plan logic; `serverOldestRetainedSeq` — the helloAck's answer
+   * to "is my replay window intact" (null for legacy servers ⇒ always full).
+   */
+  private syncedThrough: number | null = null;
+  private needsFullManifest = false;
+  private serverOldestRetainedSeq: number | null = null;
+
+  /** Current bulk-phase progress, cleared when a cycle settles. */
+  private progress: SyncProgress | null = null;
+  private lastProgressAt = 0;
+
   /** Serialized operation queue — exactly one async op runs at a time. */
   private tail: Promise<unknown> = Promise.resolve();
   private queuedOps = 0;
   /** Startup-time change flood is buffered; the full manifest subsumes it. */
   private buffering = false;
   private buffered: Message[] = [];
-  /** Single outstanding request expectation (ops are serialized). */
-  private expectation: {
+  /**
+   * Outstanding request expectations, oldest first. Ops are serialized per
+   * cycle EXCEPT the push pipeline, which keeps several commits in flight —
+   * replies on the ordered WS arrive in send order, so matching the OLDEST
+   * expectation that accepts a message pairs every reply with its request
+   * (the DO arbitrates behind `runExclusive`, and the in-memory server
+   * mirrors that, so the server never reorders replies either).
+   */
+  private expectations: Array<{
     matches: (message: Message) => boolean;
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
-  } | null = null;
+  }> = [];
+  /**
+   * Serializes ACK APPLICATION across pipeline slots. Slots await replies
+   * concurrently, but each reply folds into the SHARED `this.index`
+   * (read-modify-write); chaining the folds keeps every apply atomic with
+   * respect to the others. Order across different paths is irrelevant (one
+   * commit per path per cycle, per-path server arbitration), so no ordering
+   * guarantee is needed beyond mutual exclusion.
+   */
+  private ackChain: Promise<void> = Promise.resolve();
 
   constructor(options: SyncClientOptions) {
     this.options = options;
@@ -178,6 +255,8 @@ export class SyncClient {
     this.now = options.now ?? (() => Date.now());
     this.debounceMs = options.debounceMs ?? 300;
     this.schedule = options.schedule ?? defaultSchedule;
+    this.pushConcurrency = Math.max(1, options.pushConcurrency ?? DEFAULT_PUSH_CONCURRENCY);
+    this.progressThrottleMs = Math.max(0, options.progressThrottleMs ?? DEFAULT_PROGRESS_THROTTLE_MS);
     this.dialTransport =
       typeof options.transport === 'function'
         ? options.transport
@@ -239,6 +318,7 @@ export class SyncClient {
       lastSyncAt: this.lastSyncAt,
       pending: this.pending,
       conflicts: [...this.conflicts],
+      ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
   }
 
@@ -264,9 +344,22 @@ export class SyncClient {
     this.buffering = true;
     this.buffered = [];
 
-    this.index = (await this.safeStorageExists(LOCAL_INDEX_STATE_PATH))
-      ? await loadLocalIndex(this.options.storage)
-      : {};
+    // Restore the index AND the sync-cursor bookkeeping (one atomic file):
+    // the persisted cursor lets hello replay only what was missed, and
+    // `syncedThrough` decides whether a delta manifest may be requested.
+    if (await this.safeStorageExists(LOCAL_INDEX_STATE_PATH)) {
+      const loaded = await loadLocalState(this.options.storage);
+      this.index = loaded.index;
+      this.cursor = loaded.state.cursor;
+      this.syncedThrough = loaded.state.syncedThrough;
+      this.needsFullManifest = loaded.state.needsFullManifest;
+    } else {
+      this.index = {};
+      this.cursor = 0;
+      this.syncedThrough = null;
+      this.needsFullManifest = false;
+    }
+    this.serverOldestRetainedSeq = null;
 
     const transport = this.dialTransport();
     this.transport = transport;
@@ -293,8 +386,29 @@ export class SyncClient {
         ? { extraIgnores: this.ignoreSettings.extraIgnores }
         : {}),
     };
+    // Replay-window answer: with this, the client can tell whether every
+    // event after its cursor was retained (delta-manifest eligibility).
+    this.serverOldestRetainedSeq = helloAck.oldestRetainedSeq ?? null;
 
     this.state = 'syncing';
+    if (this.shouldRequestDeltaManifest()) {
+      // DELTA MODE: apply the replayed changes BEFORE planning. The delta
+      // manifest omits every head at or below the cursor — including heads
+      // that no longer exist because the authority MIGRATED them (a rename
+      // deletes the old row) — so the index projection must not carry those
+      // paths anymore. The replayed rename (seq > cursor) materializes here
+      // and removes the stale path, making the merged view identical to what
+      // a full manifest would have said. (The ordered wire guarantees the
+      // replay precedes the manifest reply; anything straggling stays
+      // buffered and is dispatched after the cycle, as always.) A replayed
+      // change that hits the divergence guard flips `needsFullManifest`,
+      // and `fetchManifest` re-evaluates — falling back to full, as designed.
+      const replay = this.buffered;
+      this.buffered = [];
+      for (const message of replay) {
+        await this.dispatch(message);
+      }
+    }
     await this.runCycle();
 
     this.buffering = false;
@@ -317,9 +431,9 @@ export class SyncClient {
   private onTransportClose(reason: { code?: number; reason?: string }): void {
     this.log.warn('transport closed', reason);
     this.state = 'disconnected';
-    const expectation = this.expectation;
-    if (expectation !== null) {
-      this.expectation = null;
+    const expectations = this.expectations;
+    this.expectations = [];
+    for (const expectation of expectations) {
       expectation.reject(
         new NetworkError(`connection closed: ${reason.reason ?? reason.code ?? 'unknown'}`),
       );
@@ -329,10 +443,15 @@ export class SyncClient {
   // --- message pump ----------------------------------------------------------------------
 
   private onTransportMessage = (message: Message): void => {
-    const expectation = this.expectation;
-    if (expectation !== null && expectation.matches(message)) {
-      this.expectation = null;
-      expectation.resolve(message);
+    // Oldest expectation that accepts this message. With the push pipeline
+    // several commit expectations are outstanding at once; the ordered wire +
+    // the server's serialized arbitration deliver replies in send order, so
+    // first-match pairs each reply with its own request.
+    const index = this.expectations.findIndex((expectation) => expectation.matches(message));
+    if (index >= 0) {
+      const expectation = this.expectations[index];
+      this.expectations.splice(index, 1);
+      if (expectation !== undefined) expectation.resolve(message);
       return;
     }
     if (this.buffering) {
@@ -387,11 +506,21 @@ export class SyncClient {
     // The guard: never write a remote change over locally-diverged content.
     if (!(await this.changeIsSafe(change))) {
       this.log.info('deferring remote change over local divergence', change.path);
+      // The divergence must be resolved by a plan cycle that can SEE the
+      // remote head — flag the next manifest full (delta manifests omit
+      // heads at or below the cursor, which this change may be at).
+      this.needsFullManifest = true;
       this.scheduleReconcile();
       return;
     }
 
     this.index = await this.applyPulls([this.pullOpFromChange(change)]);
+    // This path's head is now materialized locally, so the completion
+    // watermark advances with the (strictly ordered) feed. A change that
+    // took the defer branch above never reaches this line, and its
+    // `needsFullManifest` flag keeps delta mode off until a full-manifest
+    // cycle resolves the divergence.
+    if (change.seq > (this.syncedThrough ?? 0)) this.syncedThrough = change.seq;
   }
 
   /**
@@ -464,14 +593,48 @@ export class SyncClient {
   }
 
   /** Materialize pulls through the verified engine path; returns the new index. */
-  private async applyPulls(pulls: ReadonlyArray<PullOp>): Promise<LocalIndex> {
+  private async applyPulls(
+    pulls: ReadonlyArray<PullOp>,
+    progress?: { onProgress: (done: number, total: number) => void },
+  ): Promise<LocalIndex> {
     return applyPull(
       this.options.storage,
       this.index,
       { pushes: [], pulls: [...pulls], conflicts: [], folderPushes: [] },
       this.fetchBlob,
-      { now: this.now() },
+      {
+        now: this.now(),
+        // Keep the envelope's cursor bookkeeping intact across pull-side
+        // persists (applyPull rewrites the whole state file).
+        persistedState: this.persistedState(),
+        ...(progress !== undefined ? { onProgress: progress.onProgress } : {}),
+      },
     );
+  }
+
+  /** The envelope bookkeeping written whenever the client persists the index. */
+  private persistedState(): PersistedSyncState {
+    return {
+      cursor: this.cursor,
+      syncedThrough: this.syncedThrough,
+      needsFullManifest: this.needsFullManifest,
+    };
+  }
+
+  /**
+   * Record one bulk-phase step on `status().progress`. Coalesced to at most
+   * one update per `progressThrottleMs` (renderer churn), EXCEPT phase
+   * changes and completions, which always emit so a phase is never missed
+   * and `done/total` always lands on its final value.
+   */
+  private emitProgress(phase: SyncPhase, done: number, total: number): void {
+    if (total === 0) return; // nothing to show for an empty phase
+    const now = this.now();
+    const complete = done >= total;
+    const phaseChanged = this.progress?.phase !== phase;
+    if (!complete && !phaseChanged && now - this.lastProgressAt < this.progressThrottleMs) return;
+    this.lastProgressAt = now;
+    this.progress = { phase, done, total };
   }
 
   // --- watcher ------------------------------------------------------------------------------
@@ -499,6 +662,7 @@ export class SyncClient {
   private async runCycle(): Promise<void> {
     if (this.transport === null || this.isDisconnected()) return;
     this.state = 'syncing';
+    this.progress = null;
     try {
       const manifest = await this.fetchManifest();
       const localChanges = await scanVault(
@@ -506,6 +670,7 @@ export class SyncClient {
         this.index,
         this.ignoreSettings,
         this.now(),
+        { onProgress: (done, total) => this.emitProgress('scanning', done, total) },
       );
       const plan = computeSyncPlan({
         localChanges,
@@ -521,11 +686,23 @@ export class SyncClient {
       // conflict-copy push reads the loser content from the original path).
       const staged = await this.stagePushes(plan, localChanges.hashed);
 
-      this.index = await this.applyPulls(plan.pulls);
+      this.index = await this.applyPulls(plan.pulls, {
+        onProgress: (done, total) => this.emitProgress('pulling', done, total),
+      });
 
-      for (const commit of staged) {
-        await this.sendCommit(commit);
-      }
+      // Push pipeline: up to `pushConcurrency` commits in flight; acks fold
+      // into the index as they arrive (serialized through `ackChain`).
+      // Blob uploads for >256KB files start inside their slot and overlap
+      // with the OTHER slots' in-flight commits instead of serializing.
+      const pushTotal = staged.length + plan.folderPushes.length;
+      let pushDone = 0;
+      const settlePush = (): void => {
+        pushDone += 1;
+        this.emitProgress('pushing', pushDone, pushTotal);
+      };
+      this.emitProgress('pushing', 0, pushTotal);
+      await this.runPushPipeline(staged, settlePush);
+
       // Prune-on-delete (C), local side: every deletion that actually
       // committed this cycle (the index now tombstones it / migrated it away)
       // may have emptied its parent directory. Remove such directories —
@@ -554,13 +731,14 @@ export class SyncClient {
         }
       }
 
+      const folderCommits: StagedCommit[] = [];
       for (const path of plan.folderPushes) {
         // Never resurrect a directory this cycle emptied (delete-derived
         // placeholders are suppressed even when removal itself was not
         // possible), nor push one that vanished since the scan.
         if (emptiedDirs.has(path)) continue;
         if (!(await this.storageExists(path))) continue;
-        await this.sendCommit({
+        folderCommits.push({
           kind: 'edit',
           path,
           parentVersion: this.index[path]?.versionId ?? null,
@@ -569,6 +747,7 @@ export class SyncClient {
           isFolder: true,
         });
       }
+      await this.runPushPipeline(folderCommits, settlePush);
 
       // Cache the scan's hash observations (mtime) onto entries whose hash
       // still matches, so the next fast scan can skip those files. Runs
@@ -576,26 +755,98 @@ export class SyncClient {
       // `recordHashedFiles` skips anything the cycle changed underneath us.
       this.index = recordHashedFiles(this.index, localChanges.hashed);
 
+      // The cycle finished clean: every pull of the manifest applied, every
+      // staged commit acked. The index is now complete through the MANIFEST's
+      // fetch-time cursor (deliberately not the later ack seqs — a concurrent
+      // device's change can interleave and ride the post-cycle dispatch
+      // queue), which is what makes the next delta manifest safe.
+      if (this.manifestCursorOfCycle !== null && this.manifestCursorOfCycle > (this.syncedThrough ?? 0)) {
+        this.syncedThrough = this.manifestCursorOfCycle;
+      }
+      this.manifestCursorOfCycle = null;
+      this.needsFullManifest = false;
+
       this.lastSyncAt = this.now();
       this.pending = 0;
       if (!this.isDisconnected()) this.state = 'live';
     } catch (error) {
+      this.manifestCursorOfCycle = null;
       this.log.error('sync cycle failed', error);
       if (!this.isDisconnected()) this.state = this.transport !== null ? 'live' : 'idle';
       throw error;
+    } finally {
+      this.progress = null;
     }
+  }
+
+  /**
+   * The manifest's fetch-time cursor for the RUNNING cycle — the completion
+   * watermark a successful cycle records into `syncedThrough` (see the
+   * comment there). Null outside cycles.
+   */
+  private manifestCursorOfCycle: number | null = null;
+
+  /**
+   * Whether THIS cycle may request a delta manifest. All four gates must
+   * hold (any failure ⇒ full manifest, today's behavior):
+   *
+   *  1. `cursor > 0` — a first-ever connect knows nothing; full manifest.
+   *  2. `syncedThrough !== null` — some full-manifest cycle completed, so the
+   *     index is COMPLETE through it; heads after it arrive via replay +
+   *     delta. An interrupted initial sync never sets it ⇒ full manifest.
+   *  3. `!needsFullManifest` — no deferred divergence awaits plan resolution.
+   *  4. Replay window intact — helloAck reported `oldestRetainedSeq <=
+   *     cursor + 1`, so every event after our cursor is still on the server.
+   */
+  private shouldRequestDeltaManifest(): boolean {
+    return (
+      this.cursor > 0 &&
+      this.syncedThrough !== null &&
+      !this.needsFullManifest &&
+      this.serverOldestRetainedSeq !== null &&
+      this.serverOldestRetainedSeq <= this.cursor + 1
+    );
   }
 
   private async fetchManifest(): Promise<RemoteFile[]> {
     const transport = this.transport;
     if (transport === null) throw new NetworkError('not connected');
+    const useDelta = this.shouldRequestDeltaManifest();
+    const since = useDelta && this.syncedThrough !== null ? this.syncedThrough : undefined;
     const reply = await this.request<ManifestMessage | ServerErrorMessage>(
       (m) => m.type === 'manifest' || m.type === 'error',
-      () => transport.send({ type: 'getManifest' }),
+      () => transport.send({ type: 'getManifest', ...(since !== undefined ? { since } : {}) }),
     );
     if (reply.type === 'error') throw this.toError(reply);
     if (reply.cursor > this.cursor) this.cursor = reply.cursor;
-    return Object.values(reply.entries).map((entry) => ({ ...entry }));
+    this.manifestCursorOfCycle = reply.cursor;
+    if (!useDelta) {
+      return Object.values(reply.entries).map((entry) => ({ ...entry }));
+    }
+    // Delta: merge the changed heads over an INDEX PROJECTION of the full
+    // manifest. computeSyncPlan needs the complete remote view — Phase B
+    // treats an index path absent from the manifest as "migrated away" — and
+    // eligibility guarantees the index already agrees with the server for
+    // every path the delta omits (heads ≤ syncedThrough). Projecting entries
+    // to their index state therefore reconstructs exactly what the full
+    // manifest would have said, at O(changes) instead of O(vault).
+    const merged = new Map<string, RemoteFile>();
+    for (const [path, entry] of Object.entries(this.index)) {
+      merged.set(path, {
+        path,
+        version: entry.versionId,
+        hash: entry.hash,
+        size: entry.size,
+        deleted: entry.deletedAt !== undefined,
+        clock: entry.clock,
+        ...(entry.isFolder ? { isFolder: true } : {}),
+        mtime: entry.mtime ?? 0,
+      });
+    }
+    for (const [path, entry] of Object.entries(reply.entries)) {
+      merged.set(path, { ...entry });
+    }
+    return [...merged.values()];
   }
 
   private async stagePushes(
@@ -683,6 +934,55 @@ export class SyncClient {
     }
   }
 
+  /**
+   * Send `commits` through a bounded-concurrency pipeline: up to
+   * `pushConcurrency` commits in flight (sent, awaiting their server reply)
+   * at once; each slot sends its next commit as soon as an earlier one is
+   * settled.
+   *
+   * WHY PIPELINING IS SAFE (vs. a batch message): conflict arbitration is
+   * SERVER-side and PER PATH (`arbitrateCommit` reads and writes exactly the
+   * committed path's head), and a cycle stages at most ONE commit per path
+   * (the scan buckets by path; renames consume both ends). So two in-flight
+   * commits can never interact on the server, and reply ORDER across
+   * different paths does not matter for the resulting state — only per-path
+   * pairing of reply→commit matters, which the ordered WebSocket plus the
+   * server's serialized arbitration guarantee (replies arrive in send order,
+   * matched FIFO by `onTransportMessage`). A batch protocol message would
+   * additionally couple blob-upload timing and error granularity for no
+   * correctness gain, so protocol v1 stays unchanged.
+   *
+   * On the first failure, in-flight commits still settle (their acks are
+   * applied — they are real heads) but no NEW commit starts; the error is
+   * rethrown after all slots drain so the cycle fails exactly like the old
+   * sequential loop did (unsent pushes simply retry next cycle).
+   */
+  private async runPushPipeline(
+    commits: readonly StagedCommit[],
+    onSettled: () => void,
+  ): Promise<void> {
+    if (commits.length === 0) return;
+    let next = 0;
+    let failure: Error | null = null;
+    const slots = Math.min(this.pushConcurrency, commits.length);
+    const worker = async (): Promise<void> => {
+      while (next < commits.length) {
+        if (failure !== null) return;
+        const commit = commits[next++]!;
+        try {
+          await this.sendCommit(commit);
+        } catch (error) {
+          failure ??= error instanceof Error ? error : new Error(String(error));
+          return;
+        } finally {
+          onSettled();
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: slots }, worker));
+    if (failure !== null) throw failure;
+  }
+
   private async sendCommit(commit: StagedCommit): Promise<void> {
     const transport = this.transport;
     if (transport === null) throw new NetworkError('not connected');
@@ -701,7 +1001,11 @@ export class SyncClient {
         : {}),
     };
 
-    // Attachments above the inline cap ride the blob store (FR-8).
+    // Attachments above the inline cap ride the blob store (FR-8). Inside a
+    // pipeline slot this await overlaps with the OTHER slots' in-flight
+    // commits — the upload no longer serializes ahead of every commit — and
+    // still completes before ITS commit is sent (the server rejects a commit
+    // whose blob has not arrived).
     if (commit.bytes !== undefined && commit.bytes.byteLength > INLINE_CONTENT_MAX_BYTES) {
       await this.uploadBlob(commit.hash, commit.bytes);
     }
@@ -712,12 +1016,26 @@ export class SyncClient {
     );
     if (reply.type === 'error') throw this.toError(reply);
 
-    if (reply.type === 'commitAck') {
-      if (reply.seq > this.cursor) this.cursor = reply.seq;
-      this.applyAckToIndex(commit, reply.version, reply.clock);
-      return;
-    }
-    await this.handleConflictReply(commit, reply);
+    // Fold the reply into shared state behind the ack chain: concurrent
+    // slots must not read-modify-write `this.index` at the same time.
+    await this.serializeAckApplication(async () => {
+      if (reply.type === 'commitAck') {
+        if (reply.seq > this.cursor) this.cursor = reply.seq;
+        this.applyAckToIndex(commit, reply.version, reply.clock);
+        return;
+      }
+      await this.handleConflictReply(commit, reply);
+    });
+  }
+
+  /** Chain one reply's index application after every previously-started one. */
+  private serializeAckApplication(apply: () => Promise<void>): Promise<void> {
+    const run = this.ackChain.then(apply, apply);
+    this.ackChain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
   }
 
   private applyAckToIndex(commit: StagedCommit, versionId: string, clock: LogicalClock): void {
@@ -861,15 +1179,17 @@ export class SyncClient {
     send: () => void,
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.expectation = {
+      const expectation: (typeof this.expectations)[number] = {
         matches: (message) => matches(message),
         resolve: (message) => resolve(message as T),
         reject,
       };
+      this.expectations.push(expectation);
       try {
         send();
       } catch (error) {
-        this.expectation = null;
+        const index = this.expectations.indexOf(expectation);
+        if (index >= 0) this.expectations.splice(index, 1);
         reject(error instanceof Error ? error : new NetworkError(String(error)));
       }
     });
@@ -910,7 +1230,7 @@ export class SyncClient {
   }
 
   private persistIndex(): void {
-    const snapshot = serializeLocalIndex(this.index);
+    const snapshot = serializeLocalIndex(this.index, this.persistedState());
     void this.options.storage
       .writeFile(LOCAL_INDEX_STATE_PATH, new TextEncoder().encode(snapshot))
       .catch((error: unknown) => this.log.warn('failed to persist local index', error));

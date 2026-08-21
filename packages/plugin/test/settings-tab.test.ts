@@ -379,7 +379,7 @@ describe('VaultSyncSettingTab', () => {
 
       await findButton('Open README').click();
       expect(open).toHaveBeenCalledWith(
-        'https://github.com/vaultsyncforagents/vaultsyncforagents#readme',
+        'https://github.com/anuchin/vaultsyncforagents#readme',
         '_blank',
       );
     } finally {

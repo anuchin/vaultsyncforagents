@@ -40,11 +40,13 @@ import type { StorageAdapter } from './adapters.js';
 import { sha256Hex } from './hashing.js';
 import {
   applyCommit,
-  deserializeLocalIndex,
+  deserializeLocalState,
   LOCAL_INDEX_STATE_PATH,
   removeEntry,
   serializeLocalIndex,
+  type DeserializedLocalState,
   type LocalIndex,
+  type PersistedSyncState,
 } from './localindex.js';
 import { isStrictlyBeneath, parentPath } from './paths.js';
 import type { PullOp, SyncPlan } from './resolve.js';
@@ -57,6 +59,20 @@ export interface ApplyPullOptions {
    *  function is I/O orchestration, not a pure function, but tests inject
    *  a fixed value for determinism. */
   now?: number;
+  /**
+   * Bulk-pull progress: called once with (0, total) up front and once after
+   * each pull materializes. Pure reporting — never affects application.
+   */
+  onProgress?: (done: number, total: number) => void;
+  /**
+   * Sync-cursor bookkeeping to write into the state file's envelope whenever
+   * this call persists the index. Without it a pull-side persist would strip
+   * the client's cursor/syncedThrough fields from `/.vaultsyncforagents/state`
+   * (the envelope is rewritten wholesale). The client passes its current
+   * values; a snapshot a moment stale is harmless — the next persist refreshes
+   * it, and an under-reported cursor only widens the next replay.
+   */
+  persistedState?: PersistedSyncState;
 }
 
 /**
@@ -75,15 +91,20 @@ export async function applyPull(
   options: ApplyPullOptions = {},
 ): Promise<LocalIndex> {
   const now = options.now ?? Date.now();
+  const onProgress = options.onProgress;
   let working: LocalIndex = index;
 
+  onProgress?.(0, plan.pulls.length);
+  let done = 0;
   try {
     for (const pull of plan.pulls) {
       working = await applyOnePull(storage, working, pull, fetchBlob, now);
+      done += 1;
+      onProgress?.(done, plan.pulls.length);
     }
   } catch (error) {
     try {
-      await persistIndex(storage, working);
+      await persistIndex(storage, working, options.persistedState);
     } catch {
       // Persistence failure must not mask the original error; the caller
       // retries the whole cycle anyway.
@@ -91,7 +112,7 @@ export async function applyPull(
     throw error;
   }
 
-  await persistIndex(storage, working);
+  await persistIndex(storage, working, options.persistedState);
   return working;
 }
 
@@ -292,19 +313,33 @@ async function fetchVerified(
   await storage.writeFile(path, bytes);
 }
 
-async function persistIndex(storage: StorageAdapter, index: LocalIndex): Promise<void> {
+async function persistIndex(
+  storage: StorageAdapter,
+  index: LocalIndex,
+  state: PersistedSyncState = {},
+): Promise<void> {
   await storage.writeFile(
     LOCAL_INDEX_STATE_PATH,
-    new TextEncoder().encode(serializeLocalIndex(index)),
+    new TextEncoder().encode(serializeLocalIndex(index, state)),
   );
 }
 
 /**
- * Load the persisted index from storage (ARCHITECTURE §8 step 1). Throws
+ * Load the persisted index AND its sync-cursor bookkeeping (the client's
+ * startup path — the cursor powers delta-manifest reconnects). Throws
+ * `ProtocolError` (via `deserializeLocalState`) on corrupt or future-schema
+ * state — callers surface that instead of silently re-syncing from scratch.
+ */
+export async function loadLocalState(storage: StorageAdapter): Promise<DeserializedLocalState> {
+  const bytes = await storage.readFile(LOCAL_INDEX_STATE_PATH);
+  return deserializeLocalState(new TextDecoder().decode(bytes));
+}
+
+/**
+ * Load the persisted index (ARCHITECTURE §8 step 1). Throws
  * `ProtocolError` (via `deserializeLocalIndex`) on corrupt or future-schema
  * state — callers surface that instead of silently re-syncing from scratch.
  */
 export async function loadLocalIndex(storage: StorageAdapter): Promise<LocalIndex> {
-  const bytes = await storage.readFile(LOCAL_INDEX_STATE_PATH);
-  return deserializeLocalIndex(new TextDecoder().decode(bytes));
+  return (await loadLocalState(storage)).index;
 }

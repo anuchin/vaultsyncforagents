@@ -65,11 +65,22 @@ export class InMemorySyncServer {
   /** path → global sequence number of its current head. */
   private readonly headSeq = new Map<string, number>();
   /** Change log in sequence order (cursor replay). */
-  private readonly log: ChangeMessage[] = [];
+  private log: ChangeMessage[] = [];
   private seq = 0;
   private readonly connections = new Map<MemoryTransport, Connection>();
   private readonly bus = new MessageBus();
   private readonly now: () => number;
+  /**
+   * Serializes the ASYNC continuations (commit / putBlob / getBlob) FIFO.
+   * The real Durable Object chains every handler through `runExclusive`, so
+   * ITS replies always arrive in send order — the client's push pipeline
+   * relies on that pairing of reply→commit. Concurrent async handlers here
+   * (each awaiting `crypto.subtle` inside content verification) could
+   * otherwise interleave and reorder replies. Synchronous handlers (hello,
+   * ping, getManifest, errors) still run — and reply — inside the caller's
+   * tick, exactly like the un-chained original. Null ⇒ nothing pending.
+   */
+  private queueTail: Promise<void> | null = null;
   readonly settings: VaultSettings;
   readonly vaultName: string;
 
@@ -106,9 +117,28 @@ export class InMemorySyncServer {
     this.connections.set(pair.server, { deviceId: null });
     pair.server.onClose(() => this.connections.delete(pair.server));
     pair.server.onMessage((message) => {
-      void this.handle(pair.server, token, message as ClientMessage);
+      // Synchronous prefix runs in the caller's tick; an async remainder
+      // (content hashing, arbitration) is chained FIFO behind any pending
+      // one — the in-memory mirror of the DO's `runExclusive` (field doc).
+      const rest = this.handle(pair.server, token, message as ClientMessage);
+      if (rest === undefined) return;
+      const run = this.queueTail === null ? rest() : this.queueTail.then(rest, rest);
+      this.queueTail = run;
+      void run.catch(() => {}).then(() => {
+        if (this.queueTail === run) this.queueTail = null; // drain back to idle
+      });
     });
     return pair;
+  }
+
+  /**
+   * Test-only events pruning: drop replay-log entries with `seq < beforeSeq`,
+   * exactly like the worker's 30-days/newest-10k policy prunes its `events`
+   * table. After this, `helloAck.oldestRetainedSeq` rises and clients with an
+   * older cursor must fall back to a full manifest.
+   */
+  pruneEventsForTests(beforeSeq: number): void {
+    while (this.log.length > 0 && this.log[0]!.seq < beforeSeq) this.log.shift();
   }
 
   /** Test-only direct storage access (seeding / assertions). */
@@ -116,46 +146,61 @@ export class InMemorySyncServer {
 
   // --- message handling --------------------------------------------------------
 
-  private async handle(
+  /**
+   * Handle one client message. Everything up to the first await runs
+   * SYNCHRONOUSLY (auth, hello/ping/getManifest replies, errors) — the
+   * caller's tick sees those replies immediately, as with a real socket.
+   * Returns the async remainder as a thunk for the caller to chain (or
+   * `undefined` when the message was fully handled synchronously).
+   */
+  private handle(
     server: MemoryTransport,
     token: string,
     message: ClientMessage,
-  ): Promise<void> {
+  ): (() => Promise<void>) | undefined {
     const connection = this.connections.get(server);
-    if (connection === undefined) return;
+    if (connection === undefined) return undefined;
     try {
       switch (message.type) {
         case 'hello':
           this.handleHello(server, token, connection, message.token, message.protocolVersion, message.cursor);
-          return;
+          return undefined;
         case 'ping':
           this.reply(server, { type: 'pong', ...(message.ts !== undefined ? { ts: message.ts } : {}) });
-          return;
+          return undefined;
         default:
           break;
       }
       if (connection.deviceId === null) {
         this.fail(server, 'UNAUTHORIZED', 'say hello first');
-        return;
+        return undefined;
       }
       switch (message.type) {
         case 'getManifest':
           this.handleGetManifest(server, message.since);
-          return;
+          return undefined;
         case 'putBlob':
-          await this.handlePutBlob(server, message.hash, message.content);
-          return;
+          return () =>
+            this.handlePutBlob(server, message.hash, message.content).catch(
+              (error: unknown) =>
+                this.fail(server, 'PROTOCOL', error instanceof Error ? error.message : String(error)),
+            );
         case 'getBlob':
-          this.handleGetBlob(server, message.hash);
-          return;
+          this.handleGetBlob(server, message.hash); // synchronous map lookup
+          return undefined;
         case 'commit':
-          await this.handleCommit(server, connection.deviceId, message);
-          return;
+          return () =>
+            this.handleCommit(server, connection.deviceId as string, message).catch(
+              (error: unknown) =>
+                this.fail(server, 'PROTOCOL', error instanceof Error ? error.message : String(error)),
+            );
         default:
           this.fail(server, 'PROTOCOL', `unexpected message type ${JSON.stringify((message as { type: string }).type)}`);
+          return undefined;
       }
     } catch (error) {
       this.fail(server, 'PROTOCOL', error instanceof Error ? error.message : String(error));
+      return undefined;
     }
   }
 
@@ -192,6 +237,11 @@ export class InMemorySyncServer {
       deviceId,
       vaultName: this.vaultName,
       settings: this.settings,
+      // Replay-window answer (protocol v1, pre-release): the seq of the
+      // oldest retained change event — the log's first entry, or "nothing
+      // retained" (`seq + 1`) once pruned/empty. A client cursor C is
+      // servable iff this is ≤ C + 1.
+      oldestRetainedSeq: this.log.length > 0 ? this.log[0]!.seq : this.seq + 1,
     });
     this.broadcastOthers(server, { type: 'deviceSeen', deviceId, ts: device.lastSeen });
     // Catch-up replay (§5): everything the client missed since its cursor.

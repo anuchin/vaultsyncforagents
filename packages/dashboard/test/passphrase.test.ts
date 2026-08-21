@@ -15,8 +15,12 @@ import {
 } from '../src/passphrase.js';
 import { eventLabel } from '../src/rows.js';
 import { INITIAL_STATE, reduce, type AppEvent } from '../src/state.js';
+import type { PassphraseFormEvent } from '../src/passphrase.js';
 
-function walk(events: AppEvent[], from: PassphraseFormState = INITIAL_PASSPHRASE_FORM): PassphraseFormState {
+function walk(
+  events: PassphraseFormEvent[],
+  from: PassphraseFormState = INITIAL_PASSPHRASE_FORM,
+): PassphraseFormState {
   return events.reduce(reducePassphraseForm, from);
 }
 
@@ -130,11 +134,13 @@ describe('stale sessions after a rotation (other tabs)', () => {
   it('a 401 from a dead post-rotation cookie collapses any authenticated view to login', () => {
     // Another tab rotated the passphrase: this tab's cookie was signed with
     // the old secret, so its next /api/status poll answers 401.
-    const status = [{ type: 'login-ok' }].reduce(reduce, INITIAL_STATE);
-    const restore = [
+    const statusEvents: AppEvent[] = [{ type: 'login-ok' }];
+    const status = statusEvents.reduce(reduce, INITIAL_STATE);
+    const restoreEvents: AppEvent[] = [
       { type: 'login-ok' },
-      { type: 'navigate', view: 'restore' as const },
-    ].reduce(reduce, INITIAL_STATE);
+      { type: 'navigate', view: 'restore' },
+    ];
+    const restore = restoreEvents.reduce(reduce, INITIAL_STATE);
     for (const before of [status, restore]) {
       const after = reduce(before, { type: 'unauthorized' });
       expect(after.view).toBe('login');
@@ -143,11 +149,12 @@ describe('stale sessions after a rotation (other tabs)', () => {
   });
 
   it('re-login with the new passphrase lands back on status, message cleared', () => {
-    const state = [
+    const events: AppEvent[] = [
       { type: 'login-ok' },
       { type: 'unauthorized' },
       { type: 'login-ok' },
-    ].reduce(reduce, INITIAL_STATE);
+    ];
+    const state = events.reduce(reduce, INITIAL_STATE);
     expect(state.view).toBe('status');
     expect(state.message).toBeNull();
   });

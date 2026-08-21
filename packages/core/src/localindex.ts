@@ -27,6 +27,12 @@ import { ProtocolError } from './errors.js';
  *         see `scan.ts`). Graceful migration: v1 entries simply lack `mtime`,
  *         which reads back as "unknown" — the next fast scan re-hashes the
  *         file and records it. Old v1 state files load without error.
+ *
+ * The v2 ENVELOPE also carries optional sync-cursor bookkeeping (`cursor`,
+ * `syncedThrough`, `needsFullManifest` — see `PersistedSyncState`); files
+ * written before it existed simply lack those keys, which read back as
+ * "no cursor knowledge" (full manifest on the next connect). No version
+ * bump: both directions tolerate the missing fields.
  */
 export const LOCAL_INDEX_SCHEMA_VERSION = 2;
 
@@ -70,6 +76,43 @@ export type LocalIndex = Readonly<Record<string, LocalIndexEntry>>;
 export interface LocalIndexEnvelope {
   schemaVersion: number;
   entries: Record<string, LocalIndexEntry>;
+  /**
+   * Envelope-level sync bookkeeping (optional so v2 files written before it
+   * existed still load; unknown fields are tolerated in both directions).
+   * See `PersistedSyncState`.
+   */
+  cursor?: number;
+  syncedThrough?: number | null;
+  needsFullManifest?: boolean;
+}
+
+/**
+ * Sync-cursor bookkeeping persisted atomically WITH the entries (one file,
+ * one write) so the two can never disagree after a crash. Restored on
+ * startup to power delta-manifest reconnects.
+ */
+export interface PersistedSyncState {
+  /** Last seen server sequence number (sent as `hello.cursor`). */
+  cursor?: number;
+  /**
+   * Sequence through which the index is known COMPLETE: the manifest cursor
+   * of the last sync cycle that finished successfully. Every head at or
+   * below it is reflected in the entries above, so a later reconnect only
+   * needs heads with `head_seq > syncedThrough` — the delta-manifest window.
+   * `null`/absent ⇒ no completed cycle yet (or an interrupted one): the next
+   * manifest must be FULL. Deliberately NOT advanced to commit-ack seqs seen
+   * mid-cycle: a change broadcast from another device can interleave with
+   * our acks and land in the post-cycle dispatch queue, so only the
+   * fetch-time manifest cursor is a completion guarantee.
+   */
+  syncedThrough?: number | null;
+  /**
+   * A remote change was deferred over locally-diverged content (`handleChange`
+   * guard) and has not been through a plan cycle yet. The next manifest must
+   * be FULL so `computeSyncPlan` sees the remote head and resolves the
+   * divergence through its conflict logic instead of a stale-parent push.
+   */
+  needsFullManifest?: boolean;
 }
 
 /** One authoritative state change to fold into the index. */
@@ -143,9 +186,10 @@ export function removeEntry(index: LocalIndex, path: string): LocalIndex {
 /**
  * Serialize to a deterministic JSON string: versioned envelope, entries
  * sorted by path (so identical indexes serialize byte-identically and diff
- * cleanly in state-dir listings).
+ * cleanly in state-dir listings). `state` (optional) carries the sync-cursor
+ * bookkeeping persisted alongside the entries — see `PersistedSyncState`.
  */
-export function serializeLocalIndex(index: LocalIndex): string {
+export function serializeLocalIndex(index: LocalIndex, state: PersistedSyncState = {}): string {
   const entries: Record<string, LocalIndexEntry> = {};
   for (const path of Object.keys(index).sort()) {
     entries[path] = index[path] as LocalIndexEntry;
@@ -153,8 +197,67 @@ export function serializeLocalIndex(index: LocalIndex): string {
   const envelope: LocalIndexEnvelope = {
     schemaVersion: LOCAL_INDEX_SCHEMA_VERSION,
     entries,
+    ...(state.cursor !== undefined ? { cursor: state.cursor } : {}),
+    ...(state.syncedThrough !== undefined ? { syncedThrough: state.syncedThrough } : {}),
+    ...(state.needsFullManifest !== undefined
+      ? { needsFullManifest: state.needsFullManifest }
+      : {}),
   };
   return JSON.stringify(envelope);
+}
+
+/** The entries plus the sync-cursor bookkeeping of a persisted state file. */
+export interface DeserializedLocalState {
+  index: LocalIndex;
+  /** Envelope bookkeeping; defaults for files written before it existed. */
+  state: Required<PersistedSyncState>;
+}
+
+/**
+ * Parse a serialized state file INCLUDING its envelope bookkeeping (the
+ * client's startup path). Entry validation is identical to
+ * `deserializeLocalIndex`; the extra fields default to "no cursor knowledge"
+ * (`cursor: 0`, `syncedThrough: null`, `needsFullManifest: false`) so v2
+ * files written by older builds load unchanged and simply reconnect with a
+ * full manifest.
+ */
+export function deserializeLocalState(json: string): DeserializedLocalState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (cause) {
+    throw new ProtocolError('Local index state is not valid JSON', { cause });
+  }
+  if (!isPlainObject(parsed)) {
+    throw new ProtocolError('Local index state is not an object');
+  }
+  // Entry-level validation is exactly `deserializeLocalIndex`'s; the call
+  // also enforces the schema-version window.
+  const index = deserializeLocalIndex(json);
+  const rawCursor = (parsed as { cursor?: unknown }).cursor;
+  const rawSyncedThrough = (parsed as { syncedThrough?: unknown }).syncedThrough;
+  const rawNeedsFull = (parsed as { needsFullManifest?: unknown }).needsFullManifest;
+  if (rawCursor !== undefined && (typeof rawCursor !== 'number' || !Number.isInteger(rawCursor) || rawCursor < 0)) {
+    throw new ProtocolError('Local index state: cursor must be a non-negative integer');
+  }
+  if (
+    rawSyncedThrough !== undefined &&
+    rawSyncedThrough !== null &&
+    (typeof rawSyncedThrough !== 'number' || !Number.isInteger(rawSyncedThrough) || rawSyncedThrough < 0)
+  ) {
+    throw new ProtocolError('Local index state: syncedThrough must be a non-negative integer or null');
+  }
+  if (rawNeedsFull !== undefined && typeof rawNeedsFull !== 'boolean') {
+    throw new ProtocolError('Local index state: needsFullManifest must be a boolean when present');
+  }
+  return {
+    index,
+    state: {
+      cursor: typeof rawCursor === 'number' ? rawCursor : 0,
+      syncedThrough: typeof rawSyncedThrough === 'number' ? rawSyncedThrough : null,
+      needsFullManifest: rawNeedsFull === true,
+    },
+  };
 }
 
 /**

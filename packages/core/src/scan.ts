@@ -70,6 +70,12 @@ export interface ScanVaultOptions {
   mode?: 'fast' | 'full';
   /** Content hash override (tests count/inspect hashing). Default: sha256Hex. */
   hash?: HashFn;
+  /**
+   * Bulk-scan progress: called once with (0, total) before the walk and once
+   * per file afterwards (`done` counts hashed AND fast-path-skipped files).
+   * Pure reporting — never affects the scan's decisions.
+   */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /** A local content change for a path that exists in storage. */
@@ -160,6 +166,7 @@ export async function scanVault(
 ): Promise<LocalChanges> {
   const hashFn = options.hash ?? sha256Hex;
   const mode = options.mode ?? 'fast';
+  const onProgress = options.onProgress;
 
   const files = await storage.listFiles();
 
@@ -173,13 +180,19 @@ export async function scanVault(
   const modified: ScanCandidate[] = [];
   const hashed: HashedFile[] = [];
 
+  onProgress?.(0, kept.length);
+  let scanned = 0;
   for (const file of kept) {
     const entry = index[file.path];
     if (mode === 'fast' && statMatchesEntry(entry, file)) {
+      scanned += 1;
+      onProgress?.(scanned, kept.length);
       continue; // size+mtime unchanged since the recorded hash — trust it
     }
     const hash = await hashFn(await storage.readFile(file.path));
     hashed.push({ path: file.path, hash, size: file.size, mtime: file.mtime });
+    scanned += 1;
+    onProgress?.(scanned, kept.length);
     if (entry === undefined) {
       added.push({ path: file.path, hash, size: file.size });
       continue;
