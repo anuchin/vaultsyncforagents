@@ -107,19 +107,24 @@ Two channels to the worker, both token-authenticated:
 | Direction | Message | Purpose |
 |---|---|---|
 | C→S | `hello {token, protocolVersion, cursor}` | auth + last-seen version sequence |
-| S→C | `helloAck {deviceId, vaultName, settings}` or `421 unclaimed` / `401 revoked` | |
+| S→C | `helloAck {deviceId, vaultName, settings, serverVersion}` or `421 unclaimed` / `401 revoked` | |
 | C→S | `getManifest {since?}` | full or delta manifest: `{path → {version, hash, size, deleted, mtime}}` |
 | C→S | `commit {path, parentVersion, hash, size, inline?}` | new version; content inline (base64) if ≤ **256 KB**, else client uploads the blob first via HTTP and references the hash |
 | S→C | `commitAck {version, clock}` or `conflict {winner, loserDisposition}` | server is the sole arbiter |
 | S→C | `change {path, version, hash, size, deleted, device}` | fan-out broadcast to all *other* connected clients |
 | S→C | `deviceSeen {deviceId, ts}` etc. | presence for dashboard/`status` |
+| C→S | `snapshotCreate {name?}` | whole-vault restore point: heads captured atomically server-side; no fan-out (list via `GET /api/snapshots`) |
+| S→C | `snapshotCreateAck {id, name, ts, seq, fileCount}` | ids are `s1, s2, …` |
+| C→S | `snapshotRestore {id}` | revert every head to the snapshot |
+| S→C | `snapshotRestoreAck {id, restored, tombstoned, seq}` | restore = new fast-path versions, fanned out to other clients; history never deleted |
 | C↔S | `ping/pong` | keepalive; DO hibernation between events |
 
 **HTTPS routes (worker, streamed)** — content and admin:
 
 - `GET/PUT /blob/:hash` — stream to/from R2; PUT is idempotent (same hash ⇒ same content) and verifies the streamed body actually hashes to `:hash` while it flows (DigestStream; mismatch → `422` and the stored object is evicted — R2-side checksums would catch a corrupted put as a second net); enforced size cap ~100 MB (Workers request limit; YAOS capped 10 MB — we're 10× that, chunked uploads later if demanded).
-- `GET /health` — liveness + claimed state (for `vsa doctor` and uptime checks).
+- `GET /health` — liveness + claimed state + `serverVersion`/`protocolVersion` (for `vsa doctor` and uptime checks).
 - `GET /api/status` — dashboard/CLI data: engine health, devices with last-seen, last synced edit, attachment count, R2 bytes used, recent events.
+- `GET /api/snapshots` — vault-level snapshot list, newest first (device token or admin session).
 - Claim/pairing endpoints (`POST /claim`, `POST /pair`, admin session login).
 
 **Catch-up:** every client persists a cursor (last seen DO sequence number). On connect, `hello {cursor}` → DO replays all changes since; a client offline for days simply receives a longer batch. First-ever connect does a full manifest exchange plus bulk blob download.
@@ -134,6 +139,8 @@ devices  (id, name, type, token_hash, created_at, last_seen, revoked)
 events   (seq, ts, device_id, kind, path, detail)   -- dashboard/`vsa logs` feed
 pairs    (code_hash, expires_at, used)              -- pairing codes
 blobs    (hash, size, refcount, last_gc_at)          -- GC bookkeeping
+snapshots (id, name, ts, device_id, seq, file_count, heads)
+           -- whole-vault restore points; heads JSON captured at creation (schema v2)
 meta     (key, value)                                -- claim state, admin hash,
                                                      -- settings, global seq
 ```
@@ -195,8 +202,9 @@ vsa unlink [path]
 vsa status                # per vault: connected?, last sync, pending, conflicts; counts across vaults
 vsa devices               # list per worker        |  vsa devices revoke <name>
 vsa history <file>        # version list           |  vsa restore <file> [--version|--from-device]
+vsa snapshot create [name] | list | restore <idOrName> [--yes]   # vault-level snapshots; restore is server-side
 vsa daemon install|start|stop|status|logs
-vsa doctor                # reachability, token validity, claim state, clock skew, R2 usage, hints
+vsa doctor                # reachability, token validity, claim state, clock skew, server version, R2 usage, hints
 vsa logs                  # recent events from the worker's event log
 ```
 
@@ -263,6 +271,7 @@ Every user self-hosts in their own account, so load is inherently distributed.
 | 11 | Repo shape | Monorepo + separate deploy-template repo | Separate plugin/daemon repos — shared-core version drift; RVA's split was forced by third-party status, not chosen |
 | 12 | Naming | VaultSyncforAgents (`vsa`, plugin id `vaultsyncforagents`) | VaultRelay — already an Obsidian plugin |
 | 13 | Client coexistence | One client per machine per vault (v1), warn on double-link | Plugin+daemon same vault — double-commit races; lockfile handshake later |
+| 14 | Snapshot model | Heads-JSON captured at creation + restore as new fast-path versions | Time-travel by seq — `versions.seq` is dead (written 0) and events are pruned, so seq-based historical state is unrecoverable |
 
 ## 16. Build order (suggestion)
 

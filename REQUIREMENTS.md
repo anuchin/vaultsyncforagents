@@ -70,6 +70,13 @@ This is the successor to [remote-vault-for-agents](https://github.com/anuchin/re
 - **FR-57** — `vsa logs` — recent sync events from the worker's event log.
 - **FR-58** — CLI is fully cross-platform from day one (Windows, macOS, Linux).
 
+### Reliability & operations
+
+- **FR-60** — Vault-level snapshots: one action captures a point-in-time restore point of the whole vault (`vsa snapshot create [name]` / `list` / `restore <idOrName>`); restore runs server-side, converges every client, and never deletes history.
+- **FR-61** — Every component reports its version (worker: helloAck, `/health`, `/api/status`); clients assess compatibility against a documented policy and surface advisory warnings (plugin notice, `vsa doctor` check) — hard protocol gating stays at the hello handshake.
+- **FR-62** — One command in the plugin exports a redacted support bundle (file + clipboard diagnostics): versions, connection, settings, sync state, recent logs — never the device token, never file contents.
+- **FR-63** — An agent installation brief ([docs/AGENT_SETUP.md](./docs/AGENT_SETUP.md)) I can hand verbatim to an AI agent on a VPS; it installs, pairs, and verifies the daemon without further supervision.
+
 ## Non-functional requirements
 
 - **NFR-1** — Free-tier friendly: the design targets Cloudflare's free plan (Workers, Durable Objects with SQLite, R2, Cron). Paid tiers should work identically; staying in free tier is a goal, not a hard requirement.
