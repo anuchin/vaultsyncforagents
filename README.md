@@ -13,7 +13,9 @@ worker also serves the vault's status dashboard.
 > bidirectional two-vault scenarios against real Obsidian and deployed workers, in both clean and
 > hardened production builds, including large-vault runs. `worker-bundle.zip` releases (`v0.1.0` –
 > `v0.1.2`) already feed the deploy-button template and `vsa setup`. Not yet done: Obsidian
-> community-directory submission and npm publishing — see NFR-2 in [REQUIREMENTS.md](REQUIREMENTS.md).
+> community-directory submission and the actual `npm publish` (the `vaultsyncforagents` CLI package
+> is publish-ready — `npm pack` + tarball install verified) — see NFR-2 in
+> [REQUIREMENTS.md](REQUIREMENTS.md).
 
 ## What is included
 
@@ -73,18 +75,31 @@ state inside a synchronized vault. Details: [ARCHITECTURE.md](ARCHITECTURE.md) �
 
 ## Install
 
-Nothing is published to npm or the Obsidian community directory yet; everything below runs from
-this repo today.
+Nothing is published to npm or the Obsidian community directory yet (the CLI
+package is publish-ready — `npm pack` verified — awaiting an owner's publish);
+everything below runs today.
 
+- **CLI (`vsa`) + worker setup** — no clone needed. With only Node.js 22+ installed:
+
+  ```sh
+  npx vaultsyncforagents setup        # deploy a worker + R2 bucket into your Cloudflare account
+  # or, for repeated use:
+  npm i -g vaultsyncforagents         # installs the `vsa` (and `vaultsyncforagents`) command
+  ```
+
+  `setup` asks for the vault name, walks Cloudflare auth (browser or API token),
+  downloads the pinned release bundle, creates the bucket, deploys, and prints
+  the claim URL — no wrangler knowledge required.
 - **Obsidian plugin** — built from source. `npm run build --workspace @vsa/plugin` bundles `main.js`
   with esbuild; copy `main.js`, `manifest.json`, and `styles.css` into a vault's
   `.obsidian/plugins/vaultsyncforagents/`. Exact steps in
   [packages/plugin/README.md](packages/plugin/README.md).
-- **Worker** — self-hosted, one per vault. The Cloudflare Deploy Button template provisions worker +
-  Durable Object + R2 + cron in your own account, pinned to a released `worker-bundle.zip`;
-  `vsa setup` does the same from the terminal. Details: [template/README.md](template/README.md).
-- **CLI and daemon** — run from a clone: `npm run vsa -- <command>` (Node 24+). The
-  `npm i -g vaultsyncforagents` shortcut is planned; publishing is not set up yet.
+- **Worker** — self-hosted, one per vault. `vsa setup` (above) is the terminal path; the
+  Cloudflare Deploy Button template provisions the same worker + Durable Object + R2 +
+  cron in your own account, pinned to a released `worker-bundle.zip`. Details:
+  [template/README.md](template/README.md).
+- **CLI and daemon from source** — clone and run: `npm run vsa -- <command>`
+  (Node 22.7+, for `--experimental-transform-types`).
 
 - [Install the Obsidian plugin](packages/plugin/README.md)
 - [Deploy or update the worker](template/README.md)
@@ -95,9 +110,10 @@ this repo today.
 
 For a new vault, the intended path:
 
-1. Build and enable the plugin in Obsidian ([packages/plugin/README.md](packages/plugin/README.md)).
-2. Deploy a worker into your Cloudflare account — the plugin's **Deploy your worker** button, the
-   template's deploy button, or `vsa setup`.
+1. Install the Obsidian plugin ([packages/plugin/README.md](packages/plugin/README.md)).
+2. Deploy a worker into your Cloudflare account — `npx vaultsyncforagents setup`
+   (the terminal path), the plugin's **Deploy your worker** button, or the
+   template's deploy button.
 3. Open the worker URL and claim it: set the admin passphrase and name the vault.
 4. Pair devices from the dashboard (*Devices → Pair new device*): paste the code into plugin
    settings, scan the QR, or click the `obsidian://` deep link.
@@ -106,9 +122,11 @@ For a new vault, the intended path:
 
 ## Local development
 
-Requirements: Node.js 24 or newer and npm (workspaces). The `vsa` bin re-execs Node with
-`--experimental-transform-types` to run the TypeScript sources directly; a bundled plain-JS build
-replaces that when publishing happens.
+Requirements: Node.js 22 or newer and npm (workspaces) — the verified baseline is the
+22 LTS line (the full link/sync/daemon flow ran on 22.23.2); the source runner re-execs
+Node with `--experimental-transform-types` (first in 22.7.0), so use a current 22.x.
+The published package (`packages/cli`, esbuild-bundled to plain JS) needs only
+Node 22.
 
 ```sh
 npm install            # install workspace dependencies

@@ -7,9 +7,9 @@
 
 | Part | Where it lives | How it updates |
 |---|---|---|
-| Sync worker (+ Durable Object, R2) | Your Cloudflare account, deployed from your copy of the `vaultsyncforagents-template` repo | Edit the template's `VERSION` → push; its workflow redeploys |
+| Sync worker (+ Durable Object, R2) | Your Cloudflare account, deployed from your copy of the `vaultsyncforagents-template` repo or `vsa setup` | Edit the template's `VERSION` → push; its workflow redeploys |
 | Obsidian plugin | Every desktop/mobile machine with the vault open | Obsidian's plugin updater (community directory; manual before listing) |
-| CLI + daemon | Every server/machine with a vault linked | Re-pull the source clone (npm package planned) |
+| CLI + daemon | Every server/machine with a vault linked | `npm i -g vaultsyncforagents@latest` (or re-pull the source clone) |
 
 ## What you're running
 
@@ -70,7 +70,19 @@ Obsidian's plugin updater. Until then, replace the plugin's files under
 
 ## Updating the CLI + daemon
 
-Installed from a source clone today (npm packages are planned):
+Installed from npm (`npm i -g vaultsyncforagents`):
+
+```sh
+npm i -g vaultsyncforagents@latest
+vsa daemon stop
+vsa daemon start
+```
+
+(The systemd unit's `ExecStart` points at the installed CLI, so upgrading the
+package and restarting is the whole update — no reinstall. Machines that only
+use the CLI skip the daemon lines.)
+
+Installed from a source clone instead:
 
 ```sh
 cd ~/vaultsyncforagents                     # your clone

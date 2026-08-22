@@ -16,7 +16,8 @@ service — no root.
 ## Prerequisites
 
 - A Linux VPS with systemd, network access to the worker URL, and git.
-- Node.js 24 or newer (`node --version`).
+- Node.js 22 or newer (`node --version`) — the verified baseline is the 22 LTS
+  line (the full link/sync/daemon flow ran on 22.23.2).
 - From the operator (ask for them if missing):
   1. **Worker URL** — `https://<name>.<account>.workers.dev`
   2. **Pairing code** — minted on the worker dashboard
@@ -24,22 +25,31 @@ service — no root.
      if it is rejected, ask for a fresh one.
   3. **Vault path** — where the vault lives on this server, e.g. `/srv/vault`.
 
-The CLI is not on npm yet (releases currently ship only the worker bundle), so
-install it from source. `npm i -g vaultsyncforagents` is the planned shortcut;
-until then every `vsa` invocation below is `npm run vsa -- <command>` run from
-the repo root.
-
 ## Install
 
 Run everything as the user the agents will work as — not root.
 
+Install the published CLI from npm (no clone needed):
+
 ```sh
-node --version                    # must report v24 or newer
-git clone https://github.com/vaultsyncforagents/vaultsyncforagents.git ~/vaultsyncforagents
+node --version                    # must report v22 or newer
+npm i -g vaultsyncforagents       # provides the `vsa` command (bin alias: `vaultsyncforagents`)
+vsa --version
+```
+
+If the package is not on npm yet (or you prefer tracking the source), install
+from a clone instead; every `vsa` invocation below is then
+`npm run vsa -- <command>` run from the repo root:
+
+```sh
+git clone https://github.com/anuchin/vaultsyncforagents.git ~/vaultsyncforagents
 cd ~/vaultsyncforagents
 npm install                       # workspace install: CLI, daemon, shared core
 npm run vsa -- --version
 ```
+
+> Convention below: commands are written as `npm run vsa -- <command>` (the
+> from-source form). With the npm install, they are simply `vsa <command>`.
 
 ## Pair the vault
 

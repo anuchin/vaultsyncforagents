@@ -2,10 +2,10 @@
 
 Deploy your own private Obsidian-vault sync engine (Worker + Durable Object + R2)
 into **your** Cloudflare account. One worker per vault, free tier friendly,
-no central server — [ARCHITECTURE.md](https://github.com/vaultsyncforagents/vaultsyncforagents/blob/main/ARCHITECTURE.md)
+no central server — [ARCHITECTURE.md](https://github.com/anuchin/vaultsyncforagents/blob/main/ARCHITECTURE.md)
 has the full picture.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/vaultsyncforagents/vaultsyncforagents-template)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/anuchin/vaultsyncforagents-template)
 
 ## Deploy to Cloudflare (one click)
 
@@ -34,7 +34,7 @@ bucket if missing, and deploys. Nothing else lands in your account.
 ### The release bundle (artifact convention)
 
 The worker code is **not** in this repo. This template tracks a released
-version of [VaultSyncforAgents](https://github.com/vaultsyncforagents/vaultsyncforagents)
+version of [VaultSyncforAgents](https://github.com/anuchin/vaultsyncforagents)
 (pinned in [`VERSION`](./VERSION)) and downloads that release's
 `worker-bundle.zip` during CI:
 
@@ -85,13 +85,16 @@ secret `CLOUDFLARE_API_TOKEN`, and put your account id in
 
 ## CLI alternative: `vsa setup`
 
-If you have Node 20+ and prefer the terminal, the [`vsa` CLI](https://github.com/vaultsyncforagents/vaultsyncforagents/tree/main/packages/cli)
-does the same flow interactively (it can also reuse an existing
-`wrangler login`):
+Prefer a terminal? With Node.js 22+ installed you need nothing else — no clone,
+no wrangler:
 
 ```
-npx vsa setup
+npx vaultsyncforagents setup
 ```
+
+(or `npm i -g vaultsyncforagents` for repeated use; the [`vsa` CLI]
+(https://github.com/anuchin/vaultsyncforagents/tree/main/packages/cli)
+is the same tool.)
 
 It asks for the vault name, derives `vaultsync-<slug>-<suffix>` worker +
 bucket names, authenticates (browser login or a pasted API token), downloads

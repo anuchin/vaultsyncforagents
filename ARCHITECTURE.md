@@ -62,7 +62,7 @@ Why this shape (vs alternatives considered — see §15 Decision log):
 
 **Lifecycle of a worker:** `unclaimed → claimed`.
 
-1. **Deploy.** User clicks "Create my sync worker" in the plugin → browser opens `https://deploy.workers.cloudflare.com/?url=https://github.com/vaultsyncforagents/vaultsyncforagents-template` → Cloudflare login → approve. The template provisions worker + Durable Object class + R2 bucket + cron trigger with preconfigured settings (via the template's CI; wrangler provisions declared resources). The user never edits config.
+1. **Deploy.** User clicks "Create my sync worker" in the plugin → browser opens `https://deploy.workers.cloudflare.com/?url=https://github.com/anuchin/vaultsyncforagents-template` → Cloudflare login → approve. The template provisions worker + Durable Object class + R2 bucket + cron trigger with preconfigured settings (via the template's CI; wrangler provisions declared resources). The user never edits config.
 2. **Claim.** Deploy finishes → user lands on `https://<their-worker>.workers.dev/` → the worker serves its claim page → user sets an **admin passphrase** (argon2 hash stored in DO `meta`) and names the vault. Until claimed, every API call returns `421 unclaimed`. Claiming also mints the first device pairing.
 3. **Pair devices.** The dashboard (admin-authenticated) issues short-lived **pairing codes** (e.g. `7F3K-Q9M2`, 10-min TTL, one-time, stored hashed in DO). Each device enters URL + code once:
    - Plugin: settings form, or scans a QR (dashboard renders QR containing URL + code), or clicks an `obsidian://vaultsyncforagents/pair?...` deep link — the plugin registers an Obsidian protocol handler, so the whole flow can be click-through with zero typing.
