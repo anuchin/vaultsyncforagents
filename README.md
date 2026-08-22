@@ -92,7 +92,12 @@ everything below runs today.
   `setup` asks for the vault name, walks Cloudflare auth (browser or API token),
   downloads the pinned release bundle, creates the bucket, deploys, and prints
   the claim URL — no wrangler knowledge required.
-- **Obsidian plugin** — built from source. `npm run build --workspace @vsa/plugin` bundles `main.js`
+- **Obsidian plugin** — **beta install via [BRAT](https://github.com/TfTHacker/obsidian42-brat)** (recommended):
+  install *BRAT* from Obsidian's community plugins, open its settings → **Add Beta plugin** →
+  paste `anuchin/vaultsyncforagents`, then enable *VaultSync for Agents* in Community plugins.
+  BRAT installs from the latest [GitHub release](https://github.com/anuchin/vaultsyncforagents/releases)
+  (`main.js` / `manifest.json` / `styles.css` assets) and offers updates when new releases ship.
+  Alternatively, build from source: `npm run build --workspace @vsa/plugin` bundles `main.js`
   with esbuild; copy `main.js`, `manifest.json`, and `styles.css` into a vault's
   `.obsidian/plugins/vaultsyncforagents/`. Exact steps in
   [packages/plugin/README.md](packages/plugin/README.md).

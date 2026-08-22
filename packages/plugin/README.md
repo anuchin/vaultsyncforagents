@@ -9,18 +9,26 @@ third-party service in the middle.
 
 ## Install
 
-### From a release (recommended)
+### With BRAT (recommended for beta)
 
-1. Download the release zip (`main.js`, `manifest.json`, `styles.css`).
+1. Install **BRAT** (*Beta Reviewers Auto-update Tool*) from Obsidian's
+   community plugins and enable it.
+2. BRAT settings → **Add Beta plugin** → paste `anuchin/vaultsyncforagents`.
+3. Enable **VaultSync for Agents** in *Settings → Community plugins*.
+
+BRAT installs from this repo's latest
+[GitHub release](https://github.com/anuchin/vaultsyncforagents/releases)
+(`main.js` / `manifest.json` / `styles.css` assets) and offers the update
+automatically when a new release ships — no file copying, no rebuilds.
+
+### Manually from a release
+
+1. From the latest [release](https://github.com/anuchin/vaultsyncforagents/releases),
+   download the three assets: `main.js`, `manifest.json`, `styles.css`.
 2. In your vault, create `.obsidian/plugins/vaultsyncforagents/` and copy the
    three files into it.
 3. Restart Obsidian (or reload), then enable **VaultSync for Agents** in
    *Settings → Community plugins*.
-
-### With BRAT
-
-Add `BRAT` → *Add Beta plugin* → paste this repo. BRAT installs and updates the
-plugin from the `main.js`/`manifest.json` in the repo.
 
 ### Building from source
 

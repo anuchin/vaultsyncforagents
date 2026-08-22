@@ -52,6 +52,9 @@ jobs:
       - name: Build the dashboard SPA (embedded into the bundle)
         run: npm run build --workspace @vsa/dashboard
 
+      - name: Rebuild the plugin bundle (release asset for BRAT installs)
+        run: npm run build --workspace @vsa/plugin
+
       - name: Bundle worker + dashboard into worker-bundle.zip
         run: node scripts/build-release.mjs
 
@@ -61,15 +64,27 @@ jobs:
       - name: Create the GitHub release with the bundle + checksum
         uses: softprops/action-gh-release@v2
         with:
+          # main.js / manifest.json / styles.css ride the release as exact-name
+          # assets: BRAT (Beta Reviewers Auto-update Tool) installs Obsidian
+          # plugins straight from the latest release's assets — that is the
+          # beta-distribution path for the plugin.
           files: |
             dist/worker-bundle.zip
             dist/worker-bundle.zip.sha256
+            packages/plugin/main.js
+            packages/plugin/manifest.json
+            packages/plugin/styles.css
           fail_on_unmatched_files: true
           body: |
             Deploy-button release bundle (`worker-bundle.zip`):
             `worker.js` (bundled ESM worker entry, exports `VaultRoom`) + `dashboard/` (SPA).
             `worker-bundle.zip.sha256` is its checksum — `vsa setup` verifies the
             download against it (see packages/cli/src/cloudflare.ts).
+
+            Obsidian plugin beta install via **BRAT**: Settings → Community
+            plugins → install **BRAT**, then BRAT → *Add Beta plugin* →
+            `anuchin/vaultsyncforagents`. BRAT installs from this release's
+            `main.js`/`manifest.json`/`styles.css` assets.
 
             Consumed by [vaultsyncforagents-template](https://github.com/anuchin/vaultsyncforagents-template)
             CI and `vsa setup` — see ARCHITECTURE.md §3/§12 for the artifact convention.
