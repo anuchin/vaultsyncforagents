@@ -8,11 +8,14 @@
   "workspaces": [
     "packages/*"
   ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test": "npm run test:core && npm run test:node-runtime && npm run test:cli && npm run test:worker && npm run test:daemon && npm run test:dashboard && npm run test:plugin",
     "test:core": "vitest run",
     "test:node-runtime": "npm run test --workspace @vsa/node-runtime",
-    "test:cli": "npm run test --workspace @vsa/cli",
+    "test:cli": "npm run test --workspace vaultsyncforagents",
     "test:worker": "npm run test --workspace @vsa/worker",
     "test:daemon": "npm run test --workspace @vsa/daemon",
     "test:dashboard": "npm run test --workspace @vsa/dashboard",

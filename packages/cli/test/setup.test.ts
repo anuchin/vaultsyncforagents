@@ -263,7 +263,7 @@ describe('runSetup', () => {
 
     // Downloaded the pinned release.
     expect(rig.fake.downloadUrls).toEqual([
-      `https://github.com/vaultsyncforagents/vaultsyncforagents/releases/download/${PINNED_RELEASE}/worker-bundle.zip`,
+      `https://github.com/anuchin/vaultsyncforagents/releases/download/${PINNED_RELEASE}/worker-bundle.zip`,
     ]);
 
     // The walkthrough: URL → claim → pairing code → vsa link.

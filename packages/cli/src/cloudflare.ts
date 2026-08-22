@@ -16,6 +16,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { unzip, type Unzipped } from 'fflate';
 
 /** Result of one command invocation (exit status + captured output). */
 export interface ExecResult {
@@ -225,7 +228,7 @@ export interface CloudflareControl {
   download(url: string): Promise<Uint8Array>;
   /** `GET /client/v4/accounts` with a pasted API token (verify + list). */
   restListAccounts(token: string): Promise<RestAccount[]>;
-  /** Extract a zip into `destDir` (tar bsdtar first, unzip fallback). */
+  /** Extract a zip into `destDir` (pure-JS fflate — no system tar/unzip). */
   extractZip(zipPath: string, destDir: string, env?: Record<string, string>): Promise<ExecResult>;
   /** Open the default browser at `url` (platform dispatch). */
   openBrowser(url: string): Promise<ExecResult>;
@@ -269,17 +272,52 @@ export function createCloudflareControl(options: WranglerCliOptions = {}): Cloud
       return new Uint8Array(await response.arrayBuffer());
     },
     restListAccounts: (token) => restListAccounts(token, fetchImpl),
-    async extractZip(zipPath, destDir, env) {
-      // bsdtar reads zip on Windows 10+ and macOS; unzip covers plain-GNU-tar Linux.
-      const viaTar = await exec('tar', ['-xf', zipPath, '-C', destDir], { env });
-      if (viaTar.code === 0) return viaTar;
-      return exec('unzip', ['-o', zipPath, '-d', destDir], { env });
+    async extractZip(zipPath, destDir) {
+      // Pure-JS unzip (fflate) — no system tar/unzip, so the published npm
+      // package works with nothing but Node installed. Same contract as the
+      // shell-out it replaced: {code: 0} on success, {code≠0, stderr} on
+      // failure (setup.ts surfaces the message verbatim).
+      try {
+        const entries = await unzipFile(new Uint8Array(await readFile(zipPath)));
+        const root = resolve(destDir);
+        let files = 0;
+        for (const [name, bytes] of Object.entries(entries)) {
+          if (name === '' || name.endsWith('/')) continue; // directory marker
+          const target = resolve(root, name);
+          const rel = relative(root, target);
+          if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+            throw new Error(`refusing to extract ${name} (escapes ${destDir})`);
+          }
+          await mkdir(dirname(target), { recursive: true });
+          await writeFile(target, bytes);
+          files += 1;
+        }
+        return { code: 0, stdout: `extracted ${files} file(s)`, stderr: '' };
+      } catch (error) {
+        return {
+          code: 1,
+          stdout: '',
+          stderr: error instanceof Error ? error.message : String(error),
+        };
+      }
     },
     openBrowser: (url) => {
       const { command, args } = browserOpenCommand(platform, url);
       return exec(command, args);
     },
   };
+}
+
+// --- zip extraction (pure JS) ----------------------------------------------------------------
+
+/** Promisified fflate `unzip` — `{ name: bytes }` for every entry in the archive. */
+function unzipFile(data: Uint8Array): Promise<Unzipped> {
+  return new Promise((resolve, reject) => {
+    unzip(data, (error, unzipped) => {
+      if (error !== null) reject(new Error(`invalid zip archive: ${error.message}`));
+      else resolve(unzipped);
+    });
+  });
 }
 
 function parse(result: ExecResult): WhoamiInfo {

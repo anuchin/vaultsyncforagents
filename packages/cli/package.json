@@ -1,31 +1,57 @@
 {
-  "name": "@vsa/cli",
-  "version": "0.1.0",
-  "private": true,
-  "description": "VaultSync for Agents CLI (`vsa`): link, status, devices, history/restore, logs, doctor",
-  "license": "UNLICENSED",
+  "name": "vaultsyncforagents",
+  "version": "0.1.2",
+  "description": "VaultSync for Agents CLI (`vsa`): `setup` deploys your own Cloudflare sync worker, then link, sync, and manage vaults from any machine.",
   "type": "module",
   "bin": {
-    "vsa": "./bin/vsa.js"
+    "vsa": "./bin/vsa.js",
+    "vaultsyncforagents": "./bin/vaultsyncforagents.js"
   },
+  "files": [
+    "bin/",
+    "dist/",
+    "README.md"
+  ],
   "main": "./src/cli.ts",
   "types": "./src/cli.ts",
   "exports": {
     ".": "./src/cli.ts"
   },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "obsidian",
+    "vault",
+    "sync",
+    "cloudflare",
+    "workers",
+    "r2",
+    "durable-objects",
+    "cli",
+    "self-hosted",
+    "agents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anuchin/vaultsyncforagents.git",
+    "directory": "packages/cli"
+  },
   "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
-  "dependencies": {
+  "devDependencies": {
     "@clack/prompts": "^0.11.0",
+    "@types/node": "^24.3.0",
     "@vsa/core": "^0.1.0",
     "@vsa/daemon": "^0.1.0",
     "@vsa/node-runtime": "^0.1.0",
     "commander": "^14.0.0",
+    "esbuild": "^0.27.3",
+    "fflate": "^0.8.3",
     "picocolors": "^1.1.1"
-  },
-  "devDependencies": {
-    "@types/node": "^24.3.0"
   }
 }

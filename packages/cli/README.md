@@ -10,13 +10,16 @@ The CLI speaks the exact same protocol as the Obsidian plugin and the
 
 ## Install
 
-> The CLI is developed in this monorepo. Once published it installs globally:
+Node.js 22 or newer is the only prerequisite (verified on the 22 LTS line).
+The package is self-contained — zero runtime dependencies, no system tar/unzip.
 
 ```sh
-npm i -g vaultsyncforagents   # provides the `vsa` command (planned)
+npx vaultsyncforagents setup    # one-shot: deploy a worker + R2 bucket into your Cloudflare account
+npm i -g vaultsyncforagents     # or install for repeated use (provides `vsa` and `vaultsyncforagents`)
 ```
 
-Inside the repo, run it through the workspace bin (Node 24+):
+Inside the repo, run it through the workspace bin (Node 22.7+ for
+`--experimental-transform-types`; `npm run build` bundles dist/ for publishing):
 
 ```sh
 npm run vsa -- status
@@ -144,18 +147,22 @@ then invoke `vsa status` / `vsa restore` / `vsa doctor` on demand, or edit
 files and run a one-shot sync via `vsa status` (its snapshot reconciles).
 
 For continuous, watched syncing — a daemon that keeps the vault live for
-OpenClaw / Hermes / Claude Code style agents — a dedicated `vsa daemon`
-package is coming in a later phase (systemd on Linux, launchd on macOS). The
-engine it will run is already in `@vsa/core` + `@vsa/node-runtime`; the CLI
-shares both.
+OpenClaw / Hermes / Claude Code style agents — use `vsa daemon` (systemd on
+Linux, launchd on macOS; see [docs/AGENT_SETUP.md](../../docs/AGENT_SETUP.md)).
+The engine it runs is the same `@vsa/core` + `@vsa/node-runtime` the CLI
+shares.
 
 ## Development
 
 ```sh
 npm run test:cli        # unit tests (fake worker + in-memory sync server)
 npm run typecheck
+npm run build --workspace vaultsyncforagents   # esbuild-bundle dist/cli.js for publishing
 ```
 
 Command logic lives in `src/commands/*` as plain functions over an injectable
 `VsRuntime` (config store, fetch, transport factory, clock, output, prompts) —
-`src/cli.ts` is a thin commander layer on top.
+`src/cli.ts` is a thin commander layer on top. The published package is the
+esbuild bundle (`build.mjs`): one plain-JS file, zero runtime dependencies;
+`bin/vsa.js` runs it when `dist/` exists and falls back to the TypeScript
+sources otherwise.

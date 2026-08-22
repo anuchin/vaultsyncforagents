@@ -5,6 +5,6 @@
   "minAppVersion": "1.5.0",
   "description": "Self-hosted vault sync through your own Cloudflare Worker. Keeps desktop, mobile, and AI agents working on the same files.",
   "author": "VaultSync for Agents",
-  "authorUrl": "https://github.com/vaultsyncforagents/vaultsyncforagents",
+  "authorUrl": "https://github.com/anuchin/vaultsyncforagents",
   "isDesktopOnly": false
 }

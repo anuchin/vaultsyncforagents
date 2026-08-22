@@ -27,10 +27,14 @@ import {
 } from '../cloudflare.js';
 
 /** Release the template + setup track (see template/VERSION). */
-export const PINNED_RELEASE = 'v0.1.0';
+export const PINNED_RELEASE = 'v0.1.2';
 
-/** GitHub release artifact convention: tag v0.1.0 ships `worker-bundle.zip`. */
-export const RELEASE_BUNDLE_URL = `https://github.com/vaultsyncforagents/vaultsyncforagents/releases/download/${PINNED_RELEASE}/worker-bundle.zip`;
+/**
+ * GitHub release artifact convention: the tag ships `worker-bundle.zip`
+ * (worker.js + dashboard/ — the layout scripts/build-release.mjs produces
+ * and the template's CI asserts).
+ */
+export const RELEASE_BUNDLE_URL = `https://github.com/anuchin/vaultsyncforagents/releases/download/${PINNED_RELEASE}/worker-bundle.zip`;
 
 /** Must match packages/worker/wrangler.jsonc (and template/wrangler.jsonc). */
 export const WORKER_COMPATIBILITY_DATE = '2026-08-01';

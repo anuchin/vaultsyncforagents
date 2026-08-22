@@ -59,7 +59,7 @@ export function generateSystemdUnit(params: SystemdUnitParams): string {
   return [
     '[Unit]',
     'Description=VaultSync for Agents daemon (headless multi-vault sync)',
-    'Documentation=https://github.com/vaultsyncforagents/vaultsyncforagents',
+    'Documentation=https://github.com/anuchin/vaultsyncforagents',
     'After=network-online.target',
     'Wants=network-online.target',
     '',
