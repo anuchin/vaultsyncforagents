@@ -99,6 +99,23 @@ describe('api call shapes', () => {
     expect(JSON.parse(String(init.body))).toEqual({});
   });
 
+  it('adminPassphraseChange posts {current, next} to the rotation route', async () => {
+    const { calls } = stubFetch(() => jsonResponse(200, { ok: true, expiresAt: 123 }));
+    const doc = await api.adminPassphraseChange('old-one', 'new-one');
+    expect(doc).toEqual({ ok: true, expiresAt: 123 });
+    const [input, init] = calls[0]!;
+    expect(input).toBe('/admin/passphrase-change');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ current: 'old-one', next: 'new-one' });
+  });
+
+  it('adminPassphraseChange maps a wrong-current 401 like every other 401', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(401, { error: 'invalid current passphrase' })));
+    const error = await api.adminPassphraseChange('nope', 'next-one').catch((e: unknown) => e);
+    expect((error as ApiError).kind).toBe('unauthorized');
+    expect((error as ApiError).message).toBe('invalid current passphrase');
+  });
+
   it('history URL-encodes the path query parameter', async () => {
     const { calls } = stubFetch(() => jsonResponse(200, { path: '/a b&c.md', head: null, versions: [] }));
     await api.history('/a b&c.md');
