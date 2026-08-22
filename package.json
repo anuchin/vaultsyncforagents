@@ -1,6 +1,6 @@
 {
   "name": "vaultsyncforagents",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Self-hosted Obsidian vault sync engine (monorepo root)",
   "license": "MIT",

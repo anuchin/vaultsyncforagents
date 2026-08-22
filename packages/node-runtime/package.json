@@ -1,6 +1,6 @@
 {
   "name": "@vsa/node-runtime",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "VaultSync for Agents Node runtime glue: fs storage adapter, HTTP blob store, WebSocket transport, machine config (shared by CLI and daemon)",
   "license": "MIT",
