@@ -661,6 +661,11 @@ export class SyncClient {
         size: change.size,
         version: change.version,
         clock: change.clock,
+        // A folder rename is a metadata move (hash ''); without the flag the
+        // engine's rename branch would fetch content for the empty hash when
+        // fromPath is already gone locally (true on the author) — the exact
+        // wedge the empty-hash guard exists to catch.
+        ...(change.isFolder === true ? { isFolder: true } : {}),
       };
     }
     const entry = this.index[change.path];
@@ -1226,6 +1231,9 @@ export class SyncClient {
         hash: commit.hash,
         size: commit.size,
         clock,
+        // A folder rename acks folder metadata at the destination, exactly
+        // like every other ack kind (the entry must not lose its flag).
+        ...(commit.isFolder === true ? { isFolder: true } : {}),
       });
       return;
     }
@@ -1273,12 +1281,14 @@ export class SyncClient {
     if (commit.kind === 'rename' && commit.fromPath !== undefined) {
       // Our rename lost: the file stays where the winner keeps it; record
       // the winner head for the destination (the source path is untouched).
+      // A placeholder winner records folder metadata — never a content pull.
       this.index = applyCommit(this.index, {
         path: reply.winner.path,
         versionId: reply.winner.id,
         hash: reply.winner.hash,
         size: reply.winner.size,
         clock: reply.winner.clock,
+        ...(reply.winner.isFolder === true ? { isFolder: true } : {}),
       });
       return;
     }
@@ -1286,7 +1296,13 @@ export class SyncClient {
     this.index = await this.applyPulls([this.winnerAsPull(reply.winner)]);
   }
 
-  /** Turn an arbitrated winner version into a pull op (content ops only). */
+  /**
+   * Turn an arbitrated winner version into a pull op (content ops only).
+   * `isFolder` rides along when the server sent it (older servers omit the
+   * flag): a folder-placeholder winner must materialize as an `ensureDir`, not
+   * as a content fetch for its empty hash — which the blob guard refuses,
+   * wedging every future cycle on the same conflict.
+   */
   private winnerAsPull(winner: {
     path: string;
     id: string;
@@ -1295,6 +1311,7 @@ export class SyncClient {
     deviceId: string;
     clock: LogicalClock;
     kind: CommitMessage['kind'];
+    isFolder?: boolean;
   }): PullOp {
     const entry = this.index[winner.path];
     const deleted = winner.kind === 'delete';
@@ -1313,6 +1330,7 @@ export class SyncClient {
       version: winner.id,
       clock: winner.clock,
       deleted,
+      ...(winner.isFolder === true ? { isFolder: true } : {}),
     };
   }
 

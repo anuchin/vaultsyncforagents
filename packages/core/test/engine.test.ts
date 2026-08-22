@@ -263,6 +263,134 @@ describe('applyPull — renames', () => {
     expect('/a.md' in next).toBe(false);
     expect(next['/c.md']).toMatchObject({ hash, versionId: 'v2' });
   });
+
+  // --- folder renames (the isFolder propagation fix) ---------------------------
+  //
+  // A folder rename pull carries the placeholder's empty hash. When fromPath
+  // is gone locally (always true on the author, who already moved the
+  // directory) the file-rename fallback would fetch content for '' — the
+  // empty-hash guard refuses that and the cycle wedges. The pull must be a
+  // metadata move, never a fetch.
+
+  /** fetchBlob that records calls and hard-fails on the empty hash (the guard). */
+  function guardedBlobTransport(): { fetchBlob: FetchBlob; calls: string[] } {
+    const calls: string[] = [];
+    const fetchBlob: FetchBlob = async (hash) => {
+      calls.push(hash);
+      if (hash === '') throw new Error('refusing to fetch content for an empty hash');
+      throw new Error(`unexpected content fetch for ${hash}`);
+    };
+    return { fetchBlob, calls };
+  }
+
+  it('folder rename with fromPath gone (the author) materializes the destination and never fetches', async () => {
+    const storage = new InMemoryStorageAdapter({}); // the author already moved /old away
+    const index: LocalIndex = {
+      '/old': { hash: '', size: 0, versionId: 'v1', clock: { counter: 1, deviceId: 'dev' }, isFolder: true },
+    };
+    const { fetchBlob, calls } = guardedBlobTransport();
+
+    const next = await applyPull(
+      storage,
+      index,
+      planOf([
+        {
+          kind: 'rename',
+          fromPath: '/old',
+          toPath: '/new',
+          hash: '',
+          size: 0,
+          version: 'v2',
+          clock,
+          isFolder: true,
+        },
+      ]),
+      fetchBlob,
+      { now: NOW },
+    );
+
+    expect(calls).toEqual([]);
+    expect(await storage.exists('/new')).toBe(true);
+    expect(await storage.exists('/old')).toBe(false);
+    expect('/old' in next).toBe(false);
+    expect(next['/new']).toMatchObject({ hash: '', size: 0, versionId: 'v2', isFolder: true });
+  });
+
+  it('folder rename with the source still present (a receiver) retires the vacant source directory', async () => {
+    const storage = new InMemoryStorageAdapter({});
+    await storage.ensureDir('/old');
+    const index: LocalIndex = {
+      '/old': { hash: '', size: 0, versionId: 'v1', clock: { counter: 1, deviceId: 'dev' }, isFolder: true },
+    };
+    const { fetchBlob, calls } = guardedBlobTransport();
+
+    const next = await applyPull(
+      storage,
+      index,
+      planOf([
+        {
+          kind: 'rename',
+          fromPath: '/old',
+          toPath: '/new',
+          hash: '',
+          size: 0,
+          version: 'v2',
+          clock,
+          isFolder: true,
+        },
+      ]),
+      fetchBlob,
+      { now: NOW },
+    );
+
+    expect(calls).toEqual([]);
+    expect(await storage.exists('/new')).toBe(true);
+    expect(await storage.exists('/old')).toBe(false);
+    expect(next['/new']?.isFolder).toBe(true);
+    expect('/old' in next).toBe(false);
+  });
+
+  it('folder rename never deletes a non-empty source directory (children converge via their own ops)', async () => {
+    const storage = new InMemoryStorageAdapter({ '/old/child.md': 'still here' });
+    const index: LocalIndex = {
+      '/old': { hash: '', size: 0, versionId: 'v1', clock: { counter: 1, deviceId: 'dev' }, isFolder: true },
+      '/old/child.md': {
+        hash: await sha256Hex('still here'),
+        size: 9,
+        versionId: 'v1c',
+        clock: { counter: 1, deviceId: 'dev' },
+      },
+    };
+    const { fetchBlob, calls } = guardedBlobTransport();
+
+    const next = await applyPull(
+      storage,
+      index,
+      planOf([
+        {
+          kind: 'rename',
+          fromPath: '/old',
+          toPath: '/new',
+          hash: '',
+          size: 0,
+          version: 'v2',
+          clock,
+          isFolder: true,
+        },
+      ]),
+      fetchBlob,
+      { now: NOW },
+    );
+
+    expect(calls).toEqual([]);
+    expect(await storage.exists('/new')).toBe(true);
+    // The child is untouched on disk and in the index; the directory lingers
+    // until the child's own move (or deletion) empties it.
+    expect(text(await storage.readFile('/old/child.md'))).toBe('still here');
+    expect(next['/old/child.md']).toBeDefined();
+    expect('/old' in next).toBe(false);
+    expect(next['/new']?.isFolder).toBe(true);
+  });
 });
 
 describe('applyPull — empty plans', () => {

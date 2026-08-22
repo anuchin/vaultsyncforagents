@@ -235,6 +235,25 @@ describe('server-data validators (ingest boundary)', () => {
     ).toThrow(ProtocolError);
     expect(() => validateConflictMessage({ ...goodConflict, seq: 'x' as unknown as number })).toThrow(ProtocolError);
   });
+
+  it('accepts a folder-placeholder conflict winner, and the isFolder-omitted legacy shape', () => {
+    // The wire winner of a folder-placeholder head: hash '', size 0, flag on.
+    const folderWinner: ConflictMessage = {
+      ...goodConflict,
+      winner: { ...goodConflict.winner, hash: '', size: 0, isFolder: true },
+    };
+    expect(() => validateConflictMessage(folderWinner)).not.toThrow();
+    // Older servers omit the flag entirely (optional on the wire) — still valid.
+    expect(() => validateConflictMessage({ ...goodConflict })).not.toThrow();
+    // A malformed flag is a protocol violation, exactly like every field
+    // that would survive a persist/reload cycle.
+    expect(() =>
+      validateConflictMessage({
+        ...goodConflict,
+        winner: { ...goodConflict.winner, isFolder: 'yes' as unknown as boolean },
+      }),
+    ).toThrow(ProtocolError);
+  });
 });
 
 // --- client boundary -----------------------------------------------------------------

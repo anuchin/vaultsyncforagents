@@ -423,6 +423,94 @@ describe('commit validation and edge kinds', () => {
     expect(manifest.entries['/projects/empty']).toMatchObject({ isFolder: true, hash: '', size: 0 });
   });
 
+  // --- the isFolder-propagation wire (real-Obsidian e2e regression) -----------
+  //
+  // A conflict whose winner is a folder placeholder must carry the flag on
+  // the wire: the losing client materializes the winner directly, and a
+  // flagless placeholder (hash '') becomes a content pull the blob guard
+  // refuses — wedging every later cycle on that client.
+
+  it('a conflict lost to a folder-placeholder head replies with an isFolder winner', async () => {
+    const { wsDesktop, wsMobile } = await rig();
+    // Desktop builds the placeholder to head v2: {1, desktop} then {2, desktop}.
+    for (const parent of [null, 'v1']) {
+      const ack = wsDesktop.next((m) => m.type === 'commitAck');
+      wsDesktop.send({
+        type: 'commit',
+        path: '/projects/empty',
+        parentVersion: parent,
+        hash: '',
+        size: 0,
+        kind: 'edit',
+        isFolder: true,
+      });
+      expect(await ack).toMatchObject({ type: 'commitAck' });
+    }
+    // Mobile commits a stale-parent edit (null while the head is v2): its
+    // tentative {1, mobile} loses to {2, desktop} regardless of device ids.
+    const loserBytes = enc('a file where a folder lives');
+    const reply = wsMobile.next((m) => m.type === 'conflict' || m.type === 'commitAck' || m.type === 'error');
+    wsMobile.send({
+      type: 'commit',
+      path: '/projects/empty',
+      parentVersion: null,
+      hash: await hashOf(loserBytes),
+      size: loserBytes.byteLength,
+      kind: 'edit',
+      inline: b64(loserBytes),
+    });
+    const conflict = (await reply) as ConflictMessage;
+    expect(conflict.type).toBe('conflict');
+    expect(conflict.winner.id).toBe('v2');
+    expect(conflict.winner).toMatchObject({ hash: '', size: 0, isFolder: true });
+    // The losing file content survives as the conflict copy (all sockets).
+    const copy = await wsMobile.next((m) => m.type === 'change' && m.kind === 'conflictCopy');
+    expect(copy).toMatchObject({ hash: await hashOf(loserBytes) });
+    // The placeholder row survives the conflict with its flag intact.
+    const manifest = await manifestOf(wsDesktop);
+    expect(manifest.entries['/projects/empty']).toMatchObject({ isFolder: true, version: 'v2' });
+  });
+
+  it('a folder rename broadcasts isFolder with fromPath; the manifest keeps the destination a folder', async () => {
+    const { wsDesktop, wsMobile } = await rig();
+    const seed = wsDesktop.next((m) => m.type === 'commitAck');
+    wsDesktop.send({
+      type: 'commit',
+      path: '/old',
+      parentVersion: null,
+      hash: '',
+      size: 0,
+      kind: 'edit',
+      isFolder: true,
+    });
+    expect(await seed).toMatchObject({ type: 'commitAck', version: 'v1' });
+
+    const changePromise = wsMobile.next((m) => m.type === 'change' && m.kind === 'rename');
+    const ack = wsDesktop.next((m) => m.type === 'commitAck');
+    wsDesktop.send({
+      type: 'commit',
+      path: '/new',
+      parentVersion: 'v1',
+      hash: '',
+      size: 0,
+      kind: 'rename',
+      fromPath: '/old',
+      isFolder: true,
+    });
+    expect(await ack).toMatchObject({ type: 'commitAck', version: 'v2' });
+    const change = (await changePromise) as ChangeMessage;
+    expect(change).toMatchObject({
+      kind: 'rename',
+      fromPath: '/old',
+      path: '/new',
+      hash: '',
+      isFolder: true,
+    });
+    const manifest = await manifestOf(wsDesktop);
+    expect(manifest.entries['/new']).toMatchObject({ isFolder: true, hash: '', version: 'v2' });
+    expect(manifest.entries['/old']).toBeUndefined(); // the chain migrated away
+  });
+
   it('putBlob over the WS verifies the hash; a bad one is rejected', async () => {
     const { wsDesktop } = await rig();
     const bytes = enc('over the wire');

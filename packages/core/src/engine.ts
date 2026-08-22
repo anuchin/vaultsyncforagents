@@ -124,10 +124,34 @@ async function applyOnePull(
   now: number,
 ): Promise<LocalIndex> {
   if (pull.kind === 'rename') {
+    if (pull.isFolder === true) {
+      // Folder rename (FR-10): a metadata move — the hash is the
+      // placeholder's `''` and must NEVER reach a content fetch. The rename
+      // branch below would fetch when `fromPath` is gone locally (always true
+      // on the author, who already moved the directory), tripping the
+      // empty-hash guard and wedging every later cycle. Instead: materialize
+      // the destination, retire the source entry, and remove the source
+      // directory once it is vacant (children move through their own file
+      // ops; a non-empty directory is never deleted and converges later —
+      // `renameFile` is a file-only contract, so no directory rename is
+      // attempted).
+      await storage.ensureDir(pull.toPath);
+      const moved = applyCommit(removeEntry(index, pull.fromPath), {
+        path: pull.toPath,
+        versionId: pull.version,
+        hash: pull.hash,
+        size: pull.size,
+        clock: pull.clock,
+        isFolder: true,
+      });
+      await removeDirIfVacant(storage, moved, pull.fromPath);
+      return moved;
+    }
     if (await storage.exists(pull.fromPath)) {
       await storage.renameFile(pull.fromPath, pull.toPath);
     } else {
       // Old path never materialized here (or already moved): fetch content.
+      // A FILE rename only — folder renames never reach this branch.
       await fetchVerified(storage, pull.toPath, pull.hash, fetchBlob);
     }
     const moved = applyCommit(removeEntry(index, pull.fromPath), {

@@ -511,6 +511,103 @@ describe('arbitrateCommit — renames (mirrors resolve.ts FR-9)', () => {
   });
 });
 
+describe('arbitrateCommit — the folder flag on every wire path (isFolder propagation)', () => {
+  /**
+   * Seed a folder placeholder at `/dir` whose head clock is `{counter, dev-Z}`
+   * (dev-Z sorts above every other test device, so later stale commits lose
+   * their races deterministically).
+   */
+  function seededPlaceholder(counter: number): { state: ArbitrationState; parent: string } {
+    let state = emptyArbitrationState();
+    let parent: string | null = null;
+    for (let i = 0; i < counter; i++) {
+      const v = arbitrateCommit(
+        state,
+        commit({ path: '/dir', parentVersion: parent, hash: '', size: 0, isFolder: true }),
+        'dev-Z',
+        NOW - 1000 + i,
+        DEVICES,
+      );
+      state = v.state;
+      parent = v.outcome.newVersionId;
+    }
+    return { state, parent: parent as string };
+  }
+
+  it('a folder placeholder rename migrates the flag: winner, broadcast, and the files row all stay folders', () => {
+    const { state, parent } = seededPlaceholder(1);
+    const verdict = arbitrateCommit(
+      state,
+      commit({
+        path: '/dir-new',
+        parentVersion: parent,
+        hash: '',
+        size: 0,
+        kind: 'rename',
+        fromPath: '/dir',
+        isFolder: true,
+      }),
+      'dev-A',
+      NOW,
+      DEVICES,
+    );
+    expect(verdict.outcome.result).toBe('applied');
+    expect(verdict.outcome.winner.isFolder).toBe(true);
+    expect(verdict.outcome.broadcast).toMatchObject({
+      kind: 'rename',
+      fromPath: '/dir',
+      path: '/dir-new',
+      isFolder: true,
+    });
+    expect(verdict.state.files.has('/dir')).toBe(false);
+    expect(verdict.state.files.get('/dir-new')?.isFolder).toBe(true);
+  });
+
+  it('a commit losing to a standing folder placeholder gets a folder winner (the e2e wedge path)', () => {
+    // Head at {3, dev-Z}; an incoming edit naming the placeholder's FIRST
+    // version (two heads behind) tentatively sits at {2, dev-A} and loses.
+    const { state } = seededPlaceholder(3);
+    const verdict = arbitrateCommit(
+      state,
+      commit({ path: '/dir', parentVersion: 'v1', hash: 'a'.repeat(64), size: 1 }),
+      'dev-A',
+      NOW,
+      DEVICES,
+    );
+    expect(verdict.outcome.result).toBe('conflict');
+    expect(verdict.outcome.winner.isFolder).toBe(true);
+    expect(verdict.outcome.winner.hash).toBe('');
+    expect(verdict.outcome.broadcast.isFolder).toBe(true);
+    // The placeholder head stands; the losing edit is preserved as a copy.
+    expect(verdict.state.files.get('/dir')?.isFolder).toBe(true);
+    expect(verdict.outcome.conflictCopy).toBeDefined();
+  });
+
+  it('a folder placeholder winning as the incoming commit also carries the flag', () => {
+    // Standing FILE head at {1, dev-A}; incoming placeholder edit on the
+    // stale null parent tentatively {1, dev-Z} wins the device-id tie.
+    let state = emptyArbitrationState();
+    const file = arbitrateCommit(
+      state,
+      commit({ path: '/dir', hash: 'b'.repeat(64), size: 2 }),
+      'dev-A',
+      NOW - 1000,
+      DEVICES,
+    );
+    state = file.state;
+    const verdict = arbitrateCommit(
+      state,
+      commit({ path: '/dir', hash: '', size: 0, isFolder: true }),
+      'dev-Z',
+      NOW,
+      DEVICES,
+    );
+    expect(verdict.outcome.result).toBe('conflict');
+    expect(verdict.outcome.winner.isFolder).toBe(true);
+    expect(verdict.state.files.get('/dir')?.isFolder).toBe(true);
+  });
+});
+
 describe('arbitrateCommit — purity, determinism, validation', () => {
   it('is pure: identical inputs → identical verdicts; the input state is not mutated', async () => {
     const f = await seededRace();

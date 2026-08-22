@@ -116,6 +116,12 @@ export interface PullRenameOp {
   size: number;
   version: string;
   clock: LogicalClock;
+  /**
+   * True when the renamed head is a folder placeholder (FR-10): the op moves
+   * DIRECTORY metadata only — `hash` is `''` and must never reach a content
+   * fetch (`engine.ts`).
+   */
+  isFolder?: boolean;
 }
 
 export type PullOp = PullFileOp | PullRenameOp;

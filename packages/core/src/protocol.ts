@@ -172,11 +172,24 @@ export interface CommitAckMessage {
 /** What happened to the losing side of a concurrent edit (see disposition). */
 export type ConflictLoserDisposition = 'conflictCopy';
 
+/**
+ * The winning version of a `conflict` reply: a `Version` plus the head's
+ * folder flag. `isFolder` is optional on the wire (older servers omit it);
+ * folder-placeholder winners carry `hash: ''` / `size: 0`, and the flag is
+ * what lets a client materialize the head as folder metadata — an `ensureDir`
+ * — instead of attempting a content fetch for the empty hash (which the
+ * blob-fetch guard rightly refuses).
+ */
+export interface ConflictWinner extends Version {
+  /** True when the winning head is a folder placeholder (FR-10). */
+  isFolder?: boolean;
+}
+
 /** Commit lost the race; the server's chosen winner stands. */
 export interface ConflictMessage {
   type: 'conflict';
   /** The winning version (this commit or the concurrent one). */
-  winner: Version;
+  winner: ConflictWinner;
   /** What the server did with the loser's content — never deleted. */
   loserDisposition: ConflictLoserDisposition;
   /** Global sequence number of the winning head, when it has one. */
@@ -527,6 +540,7 @@ export function validateConflictMessage(message: ConflictMessage): void {
     deviceId?: unknown;
     clock?: unknown;
     kind?: unknown;
+    isFolder?: unknown;
   };
   const where = `conflict winner ${JSON.stringify(winner.path)}`;
   expectNonEmptyString(winner.path, `${where}: path`);
@@ -541,6 +555,9 @@ export function validateConflictMessage(message: ConflictMessage): void {
   expectClock(winner.clock, `${where}: clock`);
   if (typeof winner.kind !== 'string' || !VERSION_KINDS.has(winner.kind)) {
     throw new ProtocolError(`${where}: kind must be a VersionKind`);
+  }
+  if (winner.isFolder !== undefined && typeof winner.isFolder !== 'boolean') {
+    throw new ProtocolError(`${where}: isFolder must be a boolean when present`);
   }
   if (message.seq !== undefined) {
     expectNonNegativeInteger(message.seq, 'conflict.seq');

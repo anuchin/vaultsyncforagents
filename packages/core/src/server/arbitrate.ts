@@ -32,7 +32,7 @@
 import { compareClocks, nextClock } from '../clock.js';
 import { conflictCopyPath } from '../conflictnames.js';
 import { ProtocolError } from '../errors.js';
-import type { ChangePayload } from '../protocol.js';
+import type { ChangePayload, ConflictWinner } from '../protocol.js';
 import type { LogicalClock, Version, VersionKind } from '../types.js';
 
 // --- state --------------------------------------------------------------------
@@ -81,8 +81,15 @@ export type LoserDisposition = 'conflictCopy';
 
 export interface ArbitrationOutcome {
   result: 'applied' | 'conflict';
-  /** The winning version (newly created, or the standing head). */
-  winner: Version;
+  /**
+   * The winning version (newly created, or the standing head), with the
+   * head's folder flag folded in (`isFolder`). `conflict` replies carry the
+   * winner to the LOSING client verbatim; without the flag a folder
+   * placeholder winner (hash `''`) would be materialized as a content pull
+   * for an empty hash — the blob-fetch guard refuses that, wedging the
+   * client's cycle. The flag is metadata routing, not new authority.
+   */
+  winner: ConflictWinner;
   loserDisposition: LoserDisposition;
   /** Id of the winning version — what a `commitAck` would echo. */
   newVersionId: string;
@@ -154,15 +161,23 @@ export function arbitrateCommit(
       };
       versions.set(id, version);
       files.delete(source!.head.path);
-      files.set(commit.path, { currentVersion: id, head: version, deleted: false });
+      files.set(commit.path, {
+        currentVersion: id,
+        head: version,
+        deleted: false,
+        ...(commit.isFolder ? { isFolder: true } : {}),
+      });
       return {
         outcome: {
           result: 'applied',
-          winner: version,
+          winner: { ...version, ...(commit.isFolder === true ? { isFolder: true } : {}) },
           loserDisposition: 'conflictCopy',
           newVersionId: id,
           clock,
-          broadcast: payloadOf(version, { fromPath: source!.head.path }),
+          broadcast: payloadOf(version, {
+            fromPath: source!.head.path,
+            isFolder: commit.isFolder === true,
+          }),
         },
         state: { files, versions },
       };
@@ -226,7 +241,7 @@ export function arbitrateCommit(
     return {
       outcome: {
         result: 'applied',
-        winner: version,
+        winner: { ...version, ...(commit.isFolder === true ? { isFolder: true } : {}) },
         loserDisposition: 'conflictCopy',
         newVersionId: id,
         clock,
@@ -266,7 +281,7 @@ export function arbitrateCommit(
     }
     const outcome: ArbitrationOutcome = {
       result: 'conflict',
-      winner: version,
+      winner: { ...version, ...(commit.isFolder === true ? { isFolder: true } : {}) },
       loserDisposition: 'conflictCopy',
       newVersionId: id,
       clock: tentative,
@@ -369,7 +384,10 @@ function loseToHead(
   const head = target.head;
   const outcome: ArbitrationOutcome = {
     result: 'conflict',
-    winner: head,
+    // The standing head wins — fold its folder flag into the wire winner like
+    // every other outcome branch (a placeholder winner must materialize as
+    // folder metadata on the losing client, never as a content pull).
+    winner: { ...head, ...(target.isFolder === true ? { isFolder: true } : {}) },
     loserDisposition: 'conflictCopy',
     newVersionId: head.id,
     clock: head.clock,
