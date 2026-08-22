@@ -141,6 +141,15 @@ export interface SyncClientStatus {
    */
   conflicts: ConflictOp[];
   /**
+   * Paths whose live index entry is INVISIBLE on this filesystem because
+   * another synced file differs from it only by name case (a case-colliding
+   * pair, creatable from a case-sensitive client — ARCHITECTURE §14). The
+   * scan never pushes a deletion for them; they are surfaced here (and via a
+   * `warn` log line per cycle) until a human renames one of the pair.
+   * Replaced every cycle like `conflicts`; omitted when there are none.
+   */
+  caseCollisions?: string[];
+  /**
    * Server release version as reported by helloAck (null before the first
    * ack — and for legacy servers ≤ 0.1, which never send the field; see
    * `checkServerCompatibility` for the shared skew policy).
@@ -211,6 +220,7 @@ export class SyncClient {
   private lastSyncAt: number | null = null;
   private pending = 0;
   private conflicts: ConflictOp[] = [];
+  private caseCollisions: string[] = [];
   private ignoreSettings: IgnoreSettings;
   private watchAdapter: WatchAdapter | null = null;
   private cancelDebounce: (() => void) | null = null;
@@ -332,6 +342,7 @@ export class SyncClient {
       lastSyncAt: this.lastSyncAt,
       pending: this.pending,
       conflicts: [...this.conflicts],
+      ...(this.caseCollisions.length > 0 ? { caseCollisions: [...this.caseCollisions] } : {}),
       serverVersion: this.serverVersion,
       ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
@@ -712,6 +723,16 @@ export class SyncClient {
       // a synced-quiet client reports 0 while still-contested paths stay
       // visible until a cycle actually resolves them.
       this.conflicts = [...plan.conflicts];
+      // Case-collision diagnostics from the scan (never deletions — see
+      // `SyncClientStatus.caseCollisions`): replaced every cycle so a
+      // resolved collision disappears, an unresolved one stays visible.
+      this.caseCollisions = [...(localChanges.caseCollisions ?? [])];
+      if (this.caseCollisions.length > 0) {
+        this.log.warn(
+          'case-colliding file pair: these files differ only by name case and one is invisible on this filesystem; rename one of them',
+          this.caseCollisions,
+        );
+      }
 
       // Stage push contents BEFORE pulls overwrite the working tree (a
       // conflict-copy push reads the loser content from the original path).

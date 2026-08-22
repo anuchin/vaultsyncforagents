@@ -46,6 +46,12 @@
  *                  beneath the directory, this is genuine local recreation:
  *                  the dir lands in `emptyFolders` instead, restoring the
  *                  placeholder — local wins is correct there.
+ *   - `caseCollisions` — live index entries whose path differs only by case
+ *                  from a file present on disk: the invisible twin of a
+ *                  case-colliding pair (ARCHITECTURE §14). NEVER deleted —
+ *                  emitting a tombstone would destroy the twin on the server
+ *                  and on case-sensitive peers. Surfaced as a diagnostic
+ *                  only; the collision stays unresolved by design.
  *
  * ## The mtime+size pre-filter (fast mode, the default)
  *
@@ -177,6 +183,15 @@ export interface LocalChanges {
    * whole-object comparisons of `LocalChanges` stay stable for clean scans.
    */
   staleDirs?: string[];
+  /**
+   * Live index paths whose file is invisible on this filesystem because
+   * another file differs from them only by name case (a case-colliding pair,
+   * creatable from a case-sensitive client — ARCHITECTURE §14). The scan
+   * never emits a deletion for these (the twin on disk must not be destroyed
+   * by a tombstone push); the client surfaces them as a diagnostic
+   * (`SyncClientStatus.caseCollisions`). Omitted when there are none.
+   */
+  caseCollisions?: string[];
   /** Every file the scan hashed (fast mode's skipped files are absent), sorted by path. */
   hashed: HashedFile[];
 }
@@ -255,6 +270,11 @@ export async function scanVault(
   }
 
   const { renamed, deleted: unmatchedDeleted, added: unmatchedAdded } = detectRenames(deleted, added);
+  const { deleted: safeDeleted, caseCollisions } = splitCaseCollisions(
+    unmatchedDeleted,
+    keptPaths,
+    new Set([...unmatchedAdded.map((c) => c.path), ...modified.map((c) => c.path), ...renamed.map((r) => r.to)]),
+  );
   const dirs = await storage.listDirs();
   const { emptyFolders, staleDirs } = detectEmptyFolders(index, settings, files, dirs, thisDeviceId);
   const folderDeletions = detectFolderDeletions(index, settings, dirs);
@@ -263,14 +283,62 @@ export async function scanVault(
     scannedAt: now,
     added: sortCandidates(unmatchedAdded),
     modified: sortCandidates(modified),
-    deleted: [...unmatchedDeleted].sort(byPath),
+    deleted: [...safeDeleted].sort(byPath),
     renamed: [...renamed].sort((a, b) => byPath(a, b)),
     emptyFolders,
     folderDeletions,
     // Omitted when empty (not `[]`) — see the field's doc.
     ...(staleDirs.length > 0 ? { staleDirs } : {}),
+    ...(caseCollisions.length > 0 ? { caseCollisions } : {}),
     hashed: [...hashed].sort(byPath),
   };
+}
+
+/**
+ * Case-collision guard (ARCHITECTURE §14): an unmatched deletion whose path
+ * differs only by case from a file PRESENT on disk is not a deletion the user
+ * made — it is the invisible twin of a case-colliding pair (creatable from a
+ * case-sensitive client, e.g. the Linux daemon). This case-insensitive
+ * filesystem shows only one directory entry for both, so emitting the delete
+ * would push a tombstone that destroys the twin server-side and on every
+ * case-sensitive peer. Instead the path is surfaced as a `caseCollisions`
+ * diagnostic (never a deletion push); the collision itself stays unresolved
+ * until a human renames one of the pair.
+ *
+ * The guard deliberately runs AFTER rename correlation and skips twins that
+ * this scan reports as added/modified/renamed-to: a case-only rename (or
+ * rename+edit) the user performed on THIS device produces exactly that
+ * delete+twin-changed shape, and its decomposition into delete+add is the
+ * documented, correct behavior (applyPull orders case-colliding pulls
+ * delete-first, `resolve.ts`). Only a twin that is otherwise UNCHANGED —
+ * meaning it is a genuinely separate remote file this disk can only show one
+ * of — suppresses the deletion.
+ */
+function splitCaseCollisions(
+  deleted: readonly DeletedCandidate[],
+  keptPaths: ReadonlySet<string>,
+  changedPaths: ReadonlySet<string>,
+): { deleted: DeletedCandidate[]; caseCollisions: string[] } {
+  const keptByLower = new Map<string, string>();
+  for (const path of keptPaths) keptByLower.set(path.toLowerCase(), path);
+  const safeDeleted: DeletedCandidate[] = [];
+  const caseCollisions: string[] = [];
+  for (const candidate of deleted) {
+    const twin = keptByLower.get(candidate.path.toLowerCase());
+    if (twin !== undefined && !changedPaths.has(twin)) {
+      caseCollisions.push(candidate.path);
+      continue;
+    }
+    safeDeleted.push(candidate);
+  }
+  return {
+    deleted: safeDeleted,
+    caseCollisions: caseCollisions.sort(compareStrings),
+  };
+}
+
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /**

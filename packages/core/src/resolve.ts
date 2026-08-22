@@ -139,7 +139,10 @@ export interface ConflictOp {
 
 /**
  * The complete reconciliation result for one sync cycle. Ops are sorted by
- * target path (renames by `toPath`); every array may be empty. `pushes` and
+ * target path (renames by `toPath`); the sole exception: within a pair of
+ * pull targets differing only by name case, deletes sort before writes (see
+ * `comparePullOps` — case-insensitive-filesystem safety). Every array may be
+ * empty. `pushes` and
  * `pulls` are independent — a path appears at most once in each. Pushes are
  * NOT applied to the local index until the server acks them; pulls are
  * applied by `applyPull` (`engine.ts`).
@@ -430,7 +433,7 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
 
   return {
     pushes: pushes.sort((a, b) => compareStrings(opPath(a), opPath(b))),
-    pulls: pulls.sort((a, b) => compareStrings(opPath(a), opPath(b))),
+    pulls: pulls.sort(comparePullOps),
     conflicts: conflicts.sort((a, b) => compareStrings(a.path, b.path)),
     folderPushes: [...localChanges.emptyFolders].sort(compareStrings),
   };
@@ -642,6 +645,31 @@ function remoteEntryChanged(
 
 function opPath(op: PushOp | PullOp): string {
   return op.kind === 'rename' ? op.toPath : op.path;
+}
+
+/**
+ * Deterministic pull order (by target path), with ONE carve-out for
+ * case-insensitive filesystems (Windows, macOS): when two pull targets
+ * differ only by name case — e.g. a rename+edit that decomposed into
+ * `pull add '/NOTE.md'` + `pull delete '/Note.md'` — the DELETE must apply
+ * first. Applied add-first, the add's atomic temp+rename write physically
+ * replaces the old-case file, and the subsequent delete then finds and
+ * removes the just-written file (adapters resolve paths case-insensitively),
+ * leaving disk empty while the index holds the new path live — the next scan
+ * would push that phantom deletion vault-wide. Delete-first is safe on both
+ * filesystem classes: on a case-sensitive adapter the two paths are distinct
+ * files, so relative order does not matter; only the case-colliding pair is
+ * reordered, every other pair keeps the exact-path sort.
+ */
+function comparePullOps(a: PullOp, b: PullOp): number {
+  const byExact = compareStrings(opPath(a), opPath(b));
+  if (byExact === 0) return 0;
+  if (opPath(a).toLowerCase() !== opPath(b).toLowerCase()) return byExact;
+  // Case-colliding pair: deletes before writes (add/edit/rename/restore).
+  const aDeletes = a.kind === 'delete';
+  const bDeletes = b.kind === 'delete';
+  if (aDeletes !== bDeletes) return aDeletes ? -1 : 1;
+  return byExact;
 }
 
 function compareStrings(a: string, b: string): number {

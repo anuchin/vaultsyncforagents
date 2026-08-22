@@ -271,6 +271,11 @@ export function buildSupportBundle(input: DiagnosticsInput, now: number): string
       `- Conflicts: ${conflictPaths.length}`,
     );
     for (const path of conflictPaths) lines.push(`  - ${path}`);
+    const collisions = status.caseCollisions ?? [];
+    if (collisions.length > 0) {
+      lines.push(`- Case-colliding paths (invisible twin on this filesystem): ${collisions.length}`);
+      for (const path of collisions) lines.push(`  - ${path}`);
+    }
     if (status.progress !== undefined) {
       lines.push(`- Progress: ${status.progress.phase} ${status.progress.done}/${status.progress.total}`);
     }

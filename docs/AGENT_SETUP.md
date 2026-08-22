@@ -154,5 +154,10 @@ npm run vsa -- snapshot restore s3 --yes                 # revert the whole vaul
   grants permanent sync access. The operator can revoke the device from the
   dashboard or `vsa devices revoke` — a revoked token stops syncing
   immediately.
-- Avoid case-only renames: case-insensitive clients (Windows/macOS) collide
-  with this Linux daemon (ARCHITECTURE.md §14).
+- Case-only renames are safe to make on any device. The one rule: never
+  create two files that differ only by name case (possible from this
+  case-sensitive Linux daemon). A case-insensitive client (Windows/macOS)
+  cannot store such a pair — it will keep exactly one of them and surface
+  the other as a `caseCollisions` diagnostic instead of deleting it
+  (ARCHITECTURE.md §14). If you see that diagnostic, rename one of the
+  pair.
