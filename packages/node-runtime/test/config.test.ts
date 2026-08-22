@@ -124,11 +124,14 @@ describe('ConfigStore', () => {
     const id = store.load().vaults[0]!.id;
     store.setToken(id, 'tok');
 
-    // Same path with a trailing slash resolves to the same id.
+    // Same path with a trailing separator resolves to the same id. `/` is a
+    // separator on every platform; `\` only on Windows (on POSIX it is a
+    // literal filename character, where it must NOT match).
     expect(store.getToken(`${id}/`)).toBe('tok');
-    expect(store.getToken(`${id}\\`)).toBe('tok');
+    if (process.platform === 'win32') {
+      expect(store.getToken(`${id}\\`)).toBe('tok');
+    }
     expect(store.findVault(id)).toBeDefined();
-    expect(store.findVault(`${id}${join('') === '' ? '' : ''}`)).toBeDefined();
   });
 });
 
@@ -139,9 +142,13 @@ describe('resolveConfigDir', () => {
     );
   });
 
-  it('APPDATA is used on Windows-style envs without XDG', () => {
-    expect(resolveConfigDir({ APPDATA: 'C:\\Users\\me\\AppData\\Roaming' })).toBe(
-      join('C:\\Users\\me\\AppData\\Roaming', 'vaultsyncforagents'),
+  it('APPDATA is honored when absolute for this platform; otherwise ~/.config', () => {
+    // `C:\…` is an absolute path only on Windows — on POSIX the value is not
+    // a usable directory and the HOME fallback must win.
+    expect(resolveConfigDir({ APPDATA: 'C:\\Users\\me\\AppData\\Roaming', HOME: '/home/jitu' })).toBe(
+      process.platform === 'win32'
+        ? join('C:\\Users\\me\\AppData\\Roaming', 'vaultsyncforagents')
+        : join('/home/jitu', '.config', 'vaultsyncforagents'),
     );
   });
 
