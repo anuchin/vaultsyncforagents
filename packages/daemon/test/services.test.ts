@@ -74,7 +74,11 @@ describe('systemd unit generation', () => {
 
   it('unit dir prefers $XDG_CONFIG_HOME', () => {
     const posix = (p: string): string => p.replaceAll('\\', '/');
-    expect(posix(systemdUnitDir('/home/jitu', undefined))).toBe('/home/jitu/.config/systemd/user');
+    // Explicit '' counts as unset → home fallback. (Do NOT assert the home
+    // branch for `undefined`: the impl then reads process.env.XDG_CONFIG_HOME,
+    // which GitHub's ubuntu runners export — /home/runner/.config — and env
+    // legitimately wins there.)
+    expect(posix(systemdUnitDir('/home/jitu', ''))).toBe('/home/jitu/.config/systemd/user');
     expect(posix(systemdUnitDir('/home/jitu', '/home/jitu/xdg'))).toBe('/home/jitu/xdg/systemd/user');
   });
 });
