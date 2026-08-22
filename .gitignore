@@ -4,3 +4,8 @@ dist/
 *.log
 .DS_Store
 scripts/e2e/report-*.json
+scripts/e2e/report.json
+scripts/e2e/*.png
+.env
+.env.*
+*.tgz

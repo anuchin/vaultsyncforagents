@@ -213,23 +213,31 @@ vsa logs                  # recent events from the worker's event log
 ## 12. Repository layout & CI
 
 ```
-vaultsyncforagents/            # monorepo (pnpm workspaces + turbo)
+vaultsyncforagents/            # monorepo (npm workspaces)
 ├── packages/
 │   ├── core/                  # shared sync engine + protocol client
 │   ├── worker/                # DO + routes + embedded dashboard build
-│   ├── plugin/                # Obsidian plugin
+│   ├── plugin/                # Obsidian plugin (manifest.json/main.js/styles.css
+│   │                          # build in place; the community-directory submission
+│   │                          # is assembled from packages/plugin, not repo root)
 │   ├── daemon/                # headless client + service installers
-│   ├── cli/                   # `vsa`
-│   └── dashboard/             # SPA source (build output embedded into worker)
-├── manifest.json, main.js, styles.css   # CI-copied plugin artifacts (Obsidian
-│                                         # submission requires these at repo root)
+│   ├── cli/                   # `vsa` (published to npm as `vaultsyncforagents`)
+│   ├── dashboard/             # SPA source (build output embedded into worker)
+│   └── node-runtime/          # Node adapters (fs, HTTP blobs, WS, config)
+│                              # shared by cli + daemon
+├── template/                  # source of the deploy-button repo (published as
+│                              # its own repo; pins VERSION to a release tag)
+├── scripts/                   # release bundle builder + real-Obsidian e2e harness
 └── REQUIREMENTS.md / ARCHITECTURE.md / README / docs/
 
 vaultsyncforagents-template/   # separate repo: deploy-button worker template,
                                # pinned to released worker versions
 ```
 
-CI: typecheck + unit (vitest; `core` gets in-memory adapter tests + two-client simulation) + worker integration via Miniflare + build plugin → copy artifacts to root → GitHub Release (manifest/main.js/styles.css) for the community directory; publish `cli`/`daemon` to npm.
+CI (`.github/workflows/`):
+
+- `ci.yml` — every push to `main` and every PR, on `ubuntu-latest` + `windows-latest` (Node 22): `npm ci` → `npm run typecheck` (every workspace) → `npm test` (all seven vitest suites: `core` in-memory adapter tests + two-client simulation, worker integration via Miniflare, the rest against fakes).
+- `release.yml` — on a `v*` tag: the same typecheck + tests first (a red build never ships), then build `worker-bundle.zip` (worker.js + dashboard/), generate `worker-bundle.zip.sha256`, and attach both to the GitHub Release. The template's CI and `vsa setup` download the zip and verify it against the sidecar (or the CLI's pinned digest — packages/cli/src/cloudflare.ts). The npm publish of the CLI and the Obsidian community-directory submission are owner-run manual steps, not CI.
 
 ## 13. Cloudflare free-tier budget (goal, not hard requirement)
 

@@ -8,14 +8,16 @@ Object as the sync authority and an R2 bucket for content; one shared sync core 
 inside every client — the Obsidian plugin, the headless VPS daemon, and the `vsa` CLI — and the
 worker also serves the vault's status dashboard.
 
-> **Status:** pre-release, dogfooding (`0.1.0`). All seven packages are implemented and unit-tested
-> (`npm test` chains every suite), and the CDP-driven end-to-end harness in `scripts/e2e` has run
-> bidirectional two-vault scenarios against real Obsidian and deployed workers, in both clean and
-> hardened production builds, including large-vault runs. `worker-bundle.zip` releases (`v0.1.0` –
-> `v0.1.2`) already feed the deploy-button template and `vsa setup`. Not yet done: Obsidian
-> community-directory submission and the actual `npm publish` (the `vaultsyncforagents` CLI package
-> is publish-ready — `npm pack` + tarball install verified) — see NFR-2 in
-> [REQUIREMENTS.md](REQUIREMENTS.md).
+> **Status:** pre-release, dogfooding; release `0.1.3` prepared. All seven packages are implemented
+> and unit-tested (`npm test` chains every suite), the CDP-driven end-to-end harness in `scripts/e2e`
+> has run bidirectional two-vault scenarios against real Obsidian and deployed workers, and this
+> release pass added the security hardening of the download/deploy path, an MIT `LICENSE`, and CI
+> (`.github/workflows/ci.yml`: typecheck + tests on every push/PR, ubuntu + windows). The
+> `worker-bundle.zip` releases `v0.1.0` – `v0.1.2` already feed the deploy-button template and
+> `vsa setup`; the pending `v0.1.3` tag ships a `.sha256` sidecar that `vsa setup` verifies before
+> deploying. Not yet done: the actual `npm publish` and the Obsidian community-directory submission
+> (the `vaultsyncforagents` CLI package is publish-ready — `npm pack` + tarball install verified) —
+> see NFR-2 in [REQUIREMENTS.md](REQUIREMENTS.md).
 
 ## What is included
 

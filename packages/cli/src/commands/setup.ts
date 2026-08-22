@@ -7,7 +7,8 @@
  *      non-interactive `--api-token` + `--account-id` path (REST probe +
  *      wrangler env vars).
  *   3. Download the pinned VaultSyncforAgents worker release bundle
- *      (`worker-bundle.zip`) and extract it into a fresh deploy directory.
+ *      (`worker-bundle.zip`, sha-verified + size-capped) and extract it
+ *      into a fresh deploy directory.
  *   4. Generate the deploy directory's wrangler.jsonc (same shape as the
  *      template repo's).
  *   5. Create the R2 bucket if missing, then `wrangler deploy`.
@@ -27,12 +28,21 @@ import {
 } from '../cloudflare.js';
 
 /** Release the template + setup track (see template/VERSION). */
-export const PINNED_RELEASE = 'v0.1.2';
+export const PINNED_RELEASE = 'v0.1.3';
+
+/**
+ * SHA-256 (hex) of the pinned release's `worker-bundle.zip`, baked in by a
+ * build pass once the v0.1.3 bundle exists. Empty until then: the download
+ * path then falls back to the release's `.sha256` sidecar (uploaded by
+ * release.yml) and finally warns when neither is available (older releases).
+ */
+export const PINNED_BUNDLE_SHA256 = '';
 
 /**
  * GitHub release artifact convention: the tag ships `worker-bundle.zip`
  * (worker.js + dashboard/ — the layout scripts/build-release.mjs produces
- * and the template's CI asserts).
+ * and the template's CI asserts) plus a `worker-bundle.zip.sha256` sidecar
+ * since v0.1.3, which the download path verifies when no digest is pinned.
  */
 export const RELEASE_BUNDLE_URL = `https://github.com/anuchin/vaultsyncforagents/releases/download/${PINNED_RELEASE}/worker-bundle.zip`;
 
@@ -182,7 +192,14 @@ export interface SetupResult {
 export async function runSetup(
   runtime: VsRuntime,
   params: SetupParams,
-  cloudflare: CloudflareControl = runtime.cloudflare ?? createCloudflareControl(),
+  cloudflare: CloudflareControl = runtime.cloudflare ??
+    createCloudflareControl({
+      // The release-bundle download must be integrity-verified (pinned
+      // digest, else the release's .sha256 sidecar) and size-capped; the
+      // legacy warn-and-proceed notice lands in the command's output.
+      bundleSha256: PINNED_BUNDLE_SHA256,
+      warn: (message) => runtime.output.warn(message),
+    }),
 ): Promise<SetupResult> {
   const out = runtime.output;
   out.log('VaultSync for Agents — worker setup (deploy into YOUR Cloudflare account).');

@@ -1,0 +1,38 @@
+# CI (ARCHITECTURE.md §12): every push to main and every PR, on the two
+# platforms users actually run (the owner's desktop is Windows) — typecheck
+# every workspace, then run all seven vitest suites. The tag-triggered
+# release workflow re-runs the same gates before shipping a bundle.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (npm ci)
+        run: npm ci
+
+      - name: Typecheck every workspace
+        run: npm run typecheck
+
+      - name: Run the test suites
+        run: npm test

@@ -5,8 +5,9 @@ deployment: pair a local vault directory with your Cloudflare worker, check
 status, manage devices, browse history, restore old versions, and diagnose
 problems. Works on Windows, macOS, and Linux (FR-58).
 
-The CLI speaks the exact same protocol as the Obsidian plugin and the
-(upcoming) VPS daemon — one shared sync core (`@vsa/core`) everywhere.
+The CLI speaks the exact same protocol as the Obsidian plugin and the VPS
+daemon (`@vsa/daemon`, driven via `vsa daemon`) — one shared sync core
+(`@vsa/core`) everywhere.
 
 ## Install
 

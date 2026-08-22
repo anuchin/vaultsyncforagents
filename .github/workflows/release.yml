@@ -1,13 +1,18 @@
 # Release the deploy-button worker bundle (ARCHITECTURE.md §12, FR-21).
 #
-# On every `v*` tag this workflow builds the release artifact consumed by the
-# vaultsyncforagents-template repo's CI (and `vsa setup`):
+# On every `v*` tag this workflow runs the full CI gates (typecheck + all
+# test suites — a red build never ships) and then builds the release
+# artifacts consumed by the vaultsyncforagents-template repo's CI (and
+# `vsa setup`):
 #
-#   worker-bundle.zip
-#   ├── worker.js       # bundled worker entry (ESM; exports VaultRoom)
-#   └── dashboard/      # built dashboard SPA (served at / via ASSETS)
+#   worker-bundle.zip            # the deployable bundle
+#   ├── worker.js                # bundled worker entry (ESM; exports VaultRoom)
+#   └── dashboard/               # built dashboard SPA (served at / via ASSETS)
+#   worker-bundle.zip.sha256     # sha256sum sidecar; `vsa setup` verifies the
+#                                # download against it (or the CLI's pinned
+#                                # digest) before deploying
 #
-# and attaches it to a GitHub Release for the tag. The template downloads
+# and attaches both to a GitHub Release for the tag. The template downloads
 # `https://github.com/<owner>/<repo>/releases/download/<tag>/worker-bundle.zip`
 # anonymously, so the release must be public-readable — it is, on a public
 # repo. VERSION in the template pins one of these tags.
@@ -18,7 +23,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write # create the release, upload the asset
+  contents: write # create the release, upload the assets
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,16 +32,22 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
 
       - run: npm ci
+
+      - name: Typecheck every workspace
+        run: npm run typecheck
+
+      - name: Run the test suites (a red build never ships)
+        run: npm test
 
       - name: Build the dashboard SPA (embedded into the bundle)
         run: npm run build --workspace @vsa/dashboard
@@ -44,14 +55,21 @@ jobs:
       - name: Bundle worker + dashboard into worker-bundle.zip
         run: node scripts/build-release.mjs
 
-      - name: Create the GitHub release with the bundle
+      - name: Generate the bundle checksum (worker-bundle.zip.sha256)
+        run: cd dist && sha256sum worker-bundle.zip > worker-bundle.zip.sha256
+
+      - name: Create the GitHub release with the bundle + checksum
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/worker-bundle.zip
+          files: |
+            dist/worker-bundle.zip
+            dist/worker-bundle.zip.sha256
           fail_on_unmatched_files: true
           body: |
             Deploy-button release bundle (`worker-bundle.zip`):
             `worker.js` (bundled ESM worker entry, exports `VaultRoom`) + `dashboard/` (SPA).
+            `worker-bundle.zip.sha256` is its checksum — `vsa setup` verifies the
+            download against it (see packages/cli/src/cloudflare.ts).
 
             Consumed by [vaultsyncforagents-template](https://github.com/anuchin/vaultsyncforagents-template)
             CI and `vsa setup` — see ARCHITECTURE.md §3/§12 for the artifact convention.
