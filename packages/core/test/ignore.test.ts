@@ -57,6 +57,20 @@ describe('isIgnored — .obsidian/ policy (FR-11)', () => {
     expect(isIgnored('.obsidian/cache/some-cache-file', SYNC_ON)).toBe(true);
     expect(isIgnored('.obsidian/cache/deep/x.json', SYNC_ON)).toBe(true);
   });
+
+  it('NEVER syncs plugin data.json — plugin credentials — even when opted in', () => {
+    // This plugin's own device token lives in
+    // `.obsidian/plugins/vaultsyncforagents/data.json`; other plugins keep
+    // their secrets the same place. None of that may travel through sync.
+    expect(isIgnored('.obsidian/plugins/vaultsyncforagents/data.json', SYNC_ON)).toBe(true);
+    expect(isIgnored('.obsidian/plugins/any-plugin/data.json', SYNC_ON)).toBe(true);
+    expect(isIgnored('.obsidian/plugins/nested/plugin/data.json', SYNC_ON)).toBe(true);
+    expect(isIgnored('.obsidian/Plugins/Some-Plugin/Data.json', SYNC_ON)).toBe(true);
+    // Plugin code and other files still sync under the opt-in…
+    expect(isIgnored('.obsidian/plugins/hotkeys/main.js', SYNC_ON)).toBe(false);
+    // …and a stray data.json directly under plugins/ is not a plugin config.
+    expect(isIgnored('.obsidian/plugins/data.json', SYNC_ON)).toBe(false);
+  });
 });
 
 describe('isIgnored — ordinary content is never ignored', () => {

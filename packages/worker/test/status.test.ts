@@ -44,8 +44,8 @@ beforeEach(async () => {
 
 describe('GET /api/status', () => {
   it('reflects devices, lastEdit, attachments and events after activity', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'personal', deviceName: 'Desktop' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'personal', deviceName: 'Desktop' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Mobile', 'mobile');
     const mobile = await pair(code, 'Mobile', 'mobile');
 

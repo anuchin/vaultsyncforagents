@@ -39,7 +39,7 @@ async function seedEvents(ts: number, rows: number): Promise<void> {
 
 /** One more event write through the real API (device_paired on /pair). */
 async function triggerEventWrite(): Promise<void> {
-  const cookie = await adminLogin('pppp');
+  const cookie = await adminLogin('pppppppp');
   const code = await mintPairingCode(cookie, 'Trigger', 'cli');
   await pair(code, 'Trigger', 'cli');
 }
@@ -53,7 +53,7 @@ beforeEach(async () => {
 
 describe('events pruning', () => {
   it('opportunistically prunes rows older than 30 days on the next event write', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' }); // writes the 'claimed' event
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' }); // writes the 'claimed' event
     const nowMs = Date.now();
     await seedEvents(nowMs - 31 * DAY_MS, 3); // ancient
     await seedEvents(nowMs - 60_000, 2); // recent
@@ -76,7 +76,7 @@ describe('events pruning', () => {
   });
 
   it('keeps at most the 10,000 most recent events; recentEvents(50) unaffected', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     const nowMs = Date.now();
     await seedEvents(nowMs, 10_050); // all fresh, over the cap
     await roomSql(VERSION_ROW);
@@ -104,7 +104,7 @@ describe('events pruning', () => {
   });
 
   it('the weekly GC cron prunes old events too (no event write needed)', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     const nowMs = Date.now();
     await seedEvents(nowMs - 40 * DAY_MS, 3);
     await seedEvents(nowMs - 60_000, 2);

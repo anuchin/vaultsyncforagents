@@ -30,28 +30,38 @@ export type WebSocketFactory = (url: string) => WebSocketLike;
 export interface WebSocketTransportOptions {
   /** Worker origin (`https://personal.x.workers.dev`) or a `ws(s)://` URL. */
   url: string;
-  /** Device token — carried in the query string (the worker's pre-auth path). */
-  token: string;
   /** WS path on the worker (default `/ws`; `/sync` is equivalent). */
   path?: string;
   /** Injectable socket factory (tests). Default: the global `WebSocket`. */
   wsFactory?: WebSocketFactory;
 }
 
+/** Localhost names for which cleartext `ws://` is tolerated (local dev only). */
+function isLocalHost(url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+}
+
 /**
- * Build the authenticated WS URL: `https://x` → `wss://x/ws?token=…`.
- * Throws on non-HTTP(S)/WS schemes or unparsable input.
+ * Build the WS URL: `https://x` → `wss://x/ws`. The device token is
+ * deliberately NOT carried in the URL — URLs land in request logs; the token
+ * rides the `hello` frame only. Cleartext `ws://` is refused except for
+ * localhost (local dev); throws on foreign schemes or unparsable input.
  */
-export function toWebSocketUrl(baseUrl: string, token: string, path = '/ws'): string {
+export function toWebSocketUrl(baseUrl: string, path = '/ws'): string {
   const url = new URL(baseUrl);
   if (url.protocol === 'http:') url.protocol = 'ws:';
   else if (url.protocol === 'https:') url.protocol = 'wss:';
   else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
     throw new NetworkError(`worker URL must be http(s):// or ws(s)://, got ${url.protocol}`);
   }
+  if (url.protocol === 'ws:' && !isLocalHost(url)) {
+    throw new NetworkError(
+      'worker URL must use https:// — cleartext http/ws is only allowed for localhost',
+    );
+  }
   url.pathname = path;
   url.search = '';
-  url.searchParams.set('token', token);
   return url.toString();
 }
 
@@ -79,7 +89,7 @@ export class WebSocketTransport implements Transport {
 
   constructor(options: WebSocketTransportOptions) {
     const factory = options.wsFactory ?? defaultWebSocketFactory;
-    const url = toWebSocketUrl(options.url, options.token, options.path ?? '/ws');
+    const url = toWebSocketUrl(options.url, options.path ?? '/ws');
     this.socket = factory(url);
 
     this.socket.addEventListener('open', () => {

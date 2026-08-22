@@ -139,7 +139,7 @@ export function createNodeClientBundle(
 
   const dial = overrides.dial ??
     ((): Transport => {
-      const transport = new WebSocketTransport({ url: vault.url, token });
+      const transport = new WebSocketTransport({ url: vault.url });
       transport.onClose((reason) => {
         if (reason.code === 1000 && reason.reason === 'closed by caller') return; // our own close
         const detail = reason.reason !== undefined && reason.reason !== ''

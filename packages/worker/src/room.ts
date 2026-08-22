@@ -94,6 +94,29 @@ const ARGON2_PARAMS = { t: 2, m: 19456, p: 1, dkLen: 32 } as const;
 /** Alphabet for pairing codes — no I/L/O/0/1 (transcription-safe). */
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 8;
+/**
+ * Largest multiple of the alphabet size (31) that fits in a byte: bytes at or
+ * above it are redrawn (rejection sampling), so every code character is
+ * exactly uniform — `byte % 31` alone would favor the first 8 letters.
+ */
+const CODE_ALPHABET_CEILING = 248;
+
+/** Admin passphrase minimum length (claim and passphrase-change). */
+const PASSPHRASE_MIN_CHARS = 8;
+/** Disconnect a socket after this many protocol violations (§14 abuse bound). */
+const PROTOCOL_ERROR_LIMIT = 3;
+/**
+ * `meta` key for the session revocation floor (epoch ms): admin sessions
+ * minted before it are dead. Logout bumps it (sign-out kills EVERY session),
+ * and passphrase-change bumps it alongside the secret rotation.
+ */
+const SESSIONS_NOT_BEFORE_KEY = 'sessions_not_before';
+/** Device display names: 1–30 chars, no control characters. */
+const DEVICE_NAME_MAX_CHARS = 30;
+/** Vault display name cap (claim). */
+const VAULT_NAME_MAX_CHARS = 60;
+/** Snapshot label cap (snapshotCreate). */
+const SNAPSHOT_NAME_MAX_CHARS = 100;
 
 export const ADMIN_COOKIE_NAME = 'vsa_admin';
 const CLIENT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
@@ -189,6 +212,20 @@ function isDeviceType(value: unknown): value is DeviceType {
   return value === 'desktop' || value === 'mobile' || value === 'daemon' || value === 'cli';
 }
 
+/** Valid device display name: 1–30 chars, no control characters. */
+function isValidDeviceName(name: string): boolean {
+  return (
+    name.length >= 1 &&
+    name.length <= DEVICE_NAME_MAX_CHARS &&
+    !/[\u0000-\u001f\u007f]/.test(name)
+  );
+}
+
+/** Bounded path echo for protocol-error messages (never echo unbounded input). */
+function previewPath(path: string): string {
+  return JSON.stringify(path).slice(0, 120);
+}
+
 // --- persisted shapes -------------------------------------------------------------------
 
 interface DeviceRow {
@@ -213,6 +250,8 @@ interface PairRow {
 /** Per-socket auth state (hibernation-safe attachment). */
 interface SocketAttachment {
   deviceId: string | null;
+  /** Protocol violations so far (disconnect at PROTOCOL_ERROR_LIMIT). */
+  protocolErrors: number;
 }
 
 /**
@@ -282,8 +321,10 @@ export class VaultRoom extends DurableObject<Env> {
   private async handleUpgrade(url: URL): Promise<Response> {
     const token = url.searchParams.get('token');
     if (token !== null) {
-      // Optional pre-auth: reject bad/revoked tokens before the 101 so plain
-      // HTTP clients get a clean 401 instead of an opaque WS failure.
+      // Legacy pre-auth (clients ≤ 0.1.3 put the token in the URL; current
+      // clients authenticate via the hello frame only). Kept so old deployed
+      // clients keep failing fast on bad/revoked tokens with a clean 401
+      // instead of an opaque WS close.
       const device = await this.lookupDeviceByToken(token);
       if (device === undefined || device.revoked === 1) {
         return json(401, { error: device !== undefined ? 'device revoked' : 'invalid token' });
@@ -292,7 +333,7 @@ export class VaultRoom extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ deviceId: null } satisfies SocketAttachment);
+    server.serializeAttachment({ deviceId: null, protocolErrors: 0 } satisfies SocketAttachment);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -409,7 +450,7 @@ export class VaultRoom extends DurableObject<Env> {
       return;
     }
     const now = this.now();
-    ws.serializeAttachment({ deviceId: device.id } satisfies SocketAttachment);
+    ws.serializeAttachment({ deviceId: device.id, protocolErrors: 0 } satisfies SocketAttachment);
     this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', now, device.id);
     const vaultName = (await this.getMeta('vault_name')) ?? '';
     this.safeSend(ws, {
@@ -557,20 +598,29 @@ export class VaultRoom extends DurableObject<Env> {
 
   /**
    * Validate a commit's shape before anything durable touches it: paths must
-   * normalize as vault paths and fit in 1024 code units, hash must be empty
-   * or lowercase sha256 hex, and size (when present) an integer within the
-   * blob cap. Returns the first violation's message, or `null` if well-formed.
+   * be CANONICAL vault paths (`normalizeVaultPath(p) === p` — so the stored
+   * key can never diverge from the form every client normalizes to) that fit
+   * in 1024 code units, hash must be empty or lowercase sha256 hex, and size
+   * (when present) an integer within the blob cap. Returns the first
+   * violation's message, or `null` if well-formed.
    */
   private commitShapeViolation(message: CommitMessage): string | null {
     try {
-      if (normalizeVaultPath(message.path).length > COMMIT_PATH_MAX_LENGTH) {
+      const path = normalizeVaultPath(message.path);
+      if (message.path !== path) {
+        return `commit path must be a canonical vault path, got ${previewPath(message.path)}`;
+      }
+      if (path.length > COMMIT_PATH_MAX_LENGTH) {
         return `commit path exceeds ${COMMIT_PATH_MAX_LENGTH} UTF-16 code units`;
       }
-      if (
-        message.fromPath !== undefined &&
-        normalizeVaultPath(message.fromPath).length > COMMIT_PATH_MAX_LENGTH
-      ) {
-        return `commit fromPath exceeds ${COMMIT_PATH_MAX_LENGTH} UTF-16 code units`;
+      if (message.fromPath !== undefined) {
+        const fromPath = normalizeVaultPath(message.fromPath);
+        if (message.fromPath !== fromPath) {
+          return `commit fromPath must be a canonical vault path, got ${previewPath(message.fromPath)}`;
+        }
+        if (fromPath.length > COMMIT_PATH_MAX_LENGTH) {
+          return `commit fromPath exceeds ${COMMIT_PATH_MAX_LENGTH} UTF-16 code units`;
+        }
       }
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
@@ -690,6 +740,10 @@ export class VaultRoom extends DurableObject<Env> {
     // Safe under runExclusive: snapshot creation cannot interleave.
     const id = `s${(count ?? 0) + 1}`;
     const name = message.name ?? '';
+    if (name.length > SNAPSHOT_NAME_MAX_CHARS) {
+      this.failWs(ws, 'PROTOCOL', `snapshot name exceeds ${SNAPSHOT_NAME_MAX_CHARS} characters`);
+      return;
+    }
     this.sql(
       'INSERT INTO snapshots (id, name, ts, device_id, seq, file_count, heads) VALUES (?, ?, ?, ?, ?, ?, ?)',
       id,
@@ -821,6 +875,7 @@ export class VaultRoom extends DurableObject<Env> {
     }
     if (request.method === 'POST' && path === '/claim') return this.httpClaim(request);
     if (request.method === 'POST' && path === '/admin/login') return this.httpAdminLogin(request);
+    if (request.method === 'POST' && path === '/admin/logout') return this.httpAdminLogout(request);
     if (request.method === 'POST' && path === '/admin/passphrase-change') {
       return this.httpAdminPassphraseChange(request);
     }
@@ -847,11 +902,14 @@ export class VaultRoom extends DurableObject<Env> {
     if (
       body === null ||
       typeof body.passphrase !== 'string' ||
-      body.passphrase.length < 4 ||
+      body.passphrase.length < PASSPHRASE_MIN_CHARS ||
       typeof body.vaultName !== 'string' ||
-      body.vaultName.trim().length === 0
+      body.vaultName.trim().length === 0 ||
+      body.vaultName.trim().length > VAULT_NAME_MAX_CHARS
     ) {
-      return json(400, { error: 'passphrase (min 4 chars) and vaultName are required' });
+      return json(400, {
+        error: `passphrase (min ${PASSPHRASE_MIN_CHARS} chars) and vaultName (max ${VAULT_NAME_MAX_CHARS} chars) are required`,
+      });
     }
     if (await this.isClaimed()) {
       return json(409, { error: 'this worker has already been claimed' });
@@ -870,6 +928,11 @@ export class VaultRoom extends DurableObject<Env> {
       typeof body.deviceName === 'string' && body.deviceName.trim().length > 0
         ? body.deviceName.trim()
         : 'admin-device';
+    if (!isValidDeviceName(deviceName)) {
+      return json(400, {
+        error: `deviceName must be 1-${DEVICE_NAME_MAX_CHARS} characters, without control characters`,
+      });
+    }
     const deviceType = isDeviceType(body.deviceType) ? body.deviceType : 'desktop';
     const { token, deviceId } = await this.registerDevice(deviceName, deviceType, now);
     this.appendEvent(now, deviceId, 'claimed', body.vaultName.trim(), null);
@@ -904,7 +967,9 @@ export class VaultRoom extends DurableObject<Env> {
    *    become an unlimited passphrase-guessing surface);
    *  - success clears that budget (same as a successful login);
    *  - the new hash REPLACES `admin_argon` and the session secret ROTATES, so
-   *    every admin cookie issued before this moment dies instantly — the
+   *    every admin cookie issued before this moment dies instantly — and the
+   *    revocation floor (`sessions_not_before`) rises to NOW as well, so
+   *    revocation does not silently depend on the secret rotation alone; the
    *    acting admin gets a fresh cookie back and stays signed in;
    *  - `next` may equal `current` (simpler semantics): it is still a real
    *    rotation — fresh salt, fresh session secret;
@@ -924,9 +989,11 @@ export class VaultRoom extends DurableObject<Env> {
       body === null ||
       typeof body.current !== 'string' ||
       typeof body.next !== 'string' ||
-      body.next.length < 4
+      body.next.length < PASSPHRASE_MIN_CHARS
     ) {
-      return json(400, { error: 'current and next passphrase (min 4 chars) are required' });
+      return json(400, {
+        error: `current and next passphrase (min ${PASSPHRASE_MIN_CHARS} chars) are required`,
+      });
     }
     if (!(await this.verifyAdminPassphrase(body.current))) {
       // The error text names the CURRENT passphrase on purpose: the dashboard
@@ -939,12 +1006,28 @@ export class VaultRoom extends DurableObject<Env> {
 
     const now = this.now();
     await this.setAdminPassphrase(body.next);
-    // Rotate the session secret: any cookie signed with the old one (other
-    // admin tabs, a stolen copy) fails HMAC verification on its next use.
+    // Rotate the session secret (any cookie signed with the old one — other
+    // admin tabs, a stolen copy — fails HMAC verification on its next use)
+    // AND raise the revocation floor: mint-then-verify, two independent kills.
     await this.setMeta('session_secret', randomToken64url(32));
+    await this.setMeta(SESSIONS_NOT_BEFORE_KEY, String(now));
     this.appendEvent(now, null, 'passphrase_changed', null, null);
     const { value, expiresAt } = await this.signSession();
     return json(200, { ok: true, cookie: value, expiresAt });
+  }
+
+  /**
+   * `POST /admin/logout` — server-side revocation, not just cookie clearing:
+   * a VALID session bumps the revocation floor, so every outstanding admin
+   * cookie (other tabs, stolen copies) dies at once. Unauthenticated calls
+   * are no-ops that still answer 200 — logout stays idempotent, and a caller
+   * without a valid session has no floor to bump.
+   */
+  private async httpAdminLogout(request: Request): Promise<Response> {
+    if (await this.requireAdmin(request)) {
+      await this.setMeta(SESSIONS_NOT_BEFORE_KEY, String(this.now()));
+    }
+    return json(200, { ok: true });
   }
 
   private async httpAdminPair(request: Request): Promise<Response> {
@@ -955,15 +1038,29 @@ export class VaultRoom extends DurableObject<Env> {
     if (body === null || typeof body.deviceName !== 'string' || body.deviceName.trim().length === 0) {
       return json(400, { error: 'deviceName is required' });
     }
+    const deviceName = body.deviceName.trim();
+    if (!isValidDeviceName(deviceName)) {
+      return json(400, {
+        error: `deviceName must be 1-${DEVICE_NAME_MAX_CHARS} characters, without control characters`,
+      });
+    }
     const deviceType = isDeviceType(body.deviceType) ? body.deviceType : 'desktop';
     const now = this.now();
-    // Mint an unambiguous one-time code, XXXX-XXXX (FR-23).
+    // Mint an unambiguous one-time code, XXXX-XXXX (FR-23). Characters are
+    // drawn with rejection sampling (see CODE_ALPHABET_CEILING) so the 31-way
+    // choice is exactly uniform per byte.
     let code = '';
     let codeHash = '';
     for (;;) {
-      const raw = randomBytes(CODE_LENGTH);
       let normalized = '';
-      for (const byte of raw) normalized += CODE_ALPHABET[byte % CODE_ALPHABET.length]!;
+      while (normalized.length < CODE_LENGTH) {
+        for (const byte of randomBytes(CODE_LENGTH * 2)) {
+          if (normalized.length >= CODE_LENGTH) break;
+          if (byte < CODE_ALPHABET_CEILING) {
+            normalized += CODE_ALPHABET[byte % CODE_ALPHABET.length]!;
+          }
+        }
+      }
       codeHash = await sha256Hex(normalized);
       if (this.sql('SELECT code_hash FROM pairs WHERE code_hash = ?', codeHash).toArray().length === 0) {
         code = `${normalized.slice(0, 4)}-${normalized.slice(4)}`;
@@ -973,7 +1070,7 @@ export class VaultRoom extends DurableObject<Env> {
     this.sql(
       'INSERT INTO pairs (code_hash, device_name, device_type, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
       codeHash,
-      body.deviceName.trim(),
+      deviceName,
       deviceType,
       now + PAIR_TTL_MS,
       now,
@@ -1022,6 +1119,12 @@ export class VaultRoom extends DurableObject<Env> {
     ) {
       return json(400, { error: 'code and deviceName are required' });
     }
+    const deviceName = body.deviceName.trim();
+    if (!isValidDeviceName(deviceName)) {
+      return json(400, {
+        error: `deviceName must be 1-${DEVICE_NAME_MAX_CHARS} characters, without control characters`,
+      });
+    }
     if (!(await this.isClaimed())) {
       return json(421, { error: 'worker is not claimed' });
     }
@@ -1042,8 +1145,8 @@ export class VaultRoom extends DurableObject<Env> {
       : isDeviceType(pair.device_type)
         ? pair.device_type
         : 'desktop';
-    const { token, deviceId } = await this.registerDevice(body.deviceName.trim(), deviceType, now);
-    this.appendEvent(now, deviceId, 'device_paired', body.deviceName.trim(), null);
+    const { token, deviceId } = await this.registerDevice(deviceName, deviceType, now);
+    this.appendEvent(now, deviceId, 'device_paired', deviceName, null);
     this.authFailures.delete(ip);
     return json(200, { ok: true, token, deviceId });
   }
@@ -1063,8 +1166,10 @@ export class VaultRoom extends DurableObject<Env> {
     }
     const body = (await request.json().catch(() => null)) as { name?: unknown } | null;
     const name = typeof body?.name === 'string' ? body.name.trim() : '';
-    if (name === '' || name.length > 30 || /[\u0000-\u001f\u007f]/.test(name)) {
-      return json(400, { error: 'name must be 1-30 characters, without control characters' });
+    if (!isValidDeviceName(name)) {
+      return json(400, {
+        error: `name must be 1-${DEVICE_NAME_MAX_CHARS} characters, without control characters`,
+      });
     }
     const now = this.now();
     const row = this.sql('SELECT name FROM devices WHERE id = ?', auth.deviceId).toArray()[0];
@@ -1334,15 +1439,30 @@ export class VaultRoom extends DurableObject<Env> {
     );
   }
 
+  /**
+   * Mint an admin session: a random 128-bit session id plus the expiry,
+   * MAC-ed together (`admin:<sessionId>:<expiresAt>`). The id makes every
+   * session's cookie distinct; revocation rides the floor in requireAdmin,
+   * checked against the implied issue time (`expiresAt − SESSION_TTL_MS`), so
+   * the cookie stays fully self-describing with no server-side session state.
+   */
   private async signSession(): Promise<{ value: string; expiresAt: number }> {
     const secretB64 = await this.getMeta('session_secret');
     if (secretB64 === null) throw new Error('worker is not claimed');
+    const sessionId = randomToken64url(16);
     const expiresAt = this.now() + SESSION_TTL_MS;
-    const mac = await hmacHex(base64UrlToBytes(secretB64), `admin:${expiresAt}`);
-    return { value: `${expiresAt}.${mac}`, expiresAt };
+    const mac = await hmacHex(base64UrlToBytes(secretB64), `admin:${sessionId}:${expiresAt}`);
+    return { value: `${sessionId}.${expiresAt}.${mac}`, expiresAt };
   }
 
-  /** Valid admin session cookie on the request? (HMAC-SHA256, §3.) */
+  /**
+   * Valid admin session cookie on the request? (HMAC-SHA256, §3.)
+   *
+   * A cookie is dead when its expiry passed OR when it was minted before the
+   * revocation floor (`meta.sessions_not_before`, epoch ms): `logout` bumps
+   * the floor (sign-out kills EVERY outstanding session — other tabs, stolen
+   * copies), and `passphrase-change` bumps it alongside the secret rotation.
+   */
   private async requireAdmin(request: Request): Promise<boolean> {
     const cookie = request.headers.get('cookie');
     if (cookie === null) return false;
@@ -1351,15 +1471,17 @@ export class VaultRoom extends DurableObject<Env> {
       .map((part) => part.trim())
       .find((part) => part.startsWith(`${ADMIN_COOKIE_NAME}=`));
     if (match === undefined) return false;
-    const value = match.slice(ADMIN_COOKIE_NAME.length + 1);
-    const dot = value.indexOf('.');
-    if (dot <= 0) return false;
-    const expiresAt = Number(value.slice(0, dot));
-    const mac = value.slice(dot + 1);
+    const parts = match.slice(ADMIN_COOKIE_NAME.length + 1).split('.');
+    if (parts.length !== 3) return false;
+    const [sessionId, expiresRaw, mac] = parts as [string, string, string];
+    if (!/^[A-Za-z0-9_-]{16,}$/.test(sessionId)) return false;
+    const expiresAt = Number(expiresRaw);
     if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) return false;
+    const notBefore = Number((await this.getMeta(SESSIONS_NOT_BEFORE_KEY)) ?? '0');
+    if (Number.isFinite(notBefore) && expiresAt - SESSION_TTL_MS < notBefore) return false;
     const secretB64 = await this.getMeta('session_secret');
     if (secretB64 === null) return false;
-    const expected = await hmacHex(base64UrlToBytes(secretB64), `admin:${expiresAt}`);
+    const expected = await hmacHex(base64UrlToBytes(secretB64), `admin:${sessionId}:${expiresAt}`);
     return timingSafeEqualHex(mac, expected);
   }
 
@@ -1672,12 +1794,15 @@ export class VaultRoom extends DurableObject<Env> {
         value !== null &&
         (value.deviceId === null || typeof value.deviceId === 'string')
       ) {
-        return value as SocketAttachment;
+        return {
+          deviceId: value.deviceId,
+          protocolErrors: typeof value.protocolErrors === 'number' ? value.protocolErrors : 0,
+        };
       }
     } catch {
       // no attachment yet
     }
-    return { deviceId: null };
+    return { deviceId: null, protocolErrors: 0 };
   }
 
   private safeSend(ws: WebSocket, message: ServerMessage): void {
@@ -1707,6 +1832,21 @@ export class VaultRoom extends DurableObject<Env> {
     message: string,
   ): void {
     this.safeSend(ws, { type: 'error', code, message });
+    if (code === 'PROTOCOL') {
+      // Count and disconnect: a socket that keeps violating the protocol is
+      // broken or abusive — either way it may not linger (pre-auth included).
+      const attachment = this.readAttachment(ws);
+      const protocolErrors = attachment.protocolErrors + 1;
+      ws.serializeAttachment({ ...attachment, protocolErrors } satisfies SocketAttachment);
+      if (protocolErrors >= PROTOCOL_ERROR_LIMIT) {
+        try {
+          ws.close(1002, 'too many protocol violations');
+        } catch {
+          // already closed
+        }
+      }
+      return;
+    }
     if (code === 'UNAUTHORIZED' || code === 'REVOKED') {
       try {
         ws.close(1008, code);

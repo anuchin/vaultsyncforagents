@@ -23,8 +23,8 @@ beforeEach(async () => {
 
 describe('pairing', () => {
   it('mints a XXXX-XXXX code (stored hashed) and redeems it for a working device token', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Pixel', 'mobile');
     expect(code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
 
@@ -55,9 +55,9 @@ describe('pairing', () => {
   });
 
   it('rejects an expired code with a clear error', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     void claimed;
-    const cookie = await adminLogin('pppp');
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Late', 'desktop');
     // Fast-forward past the 10-minute TTL directly in the DO.
     await roomSql('UPDATE pairs SET expires_at = 1');
@@ -69,9 +69,9 @@ describe('pairing', () => {
   });
 
   it('burns the code on use — a second redeem is rejected', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     void claimed;
-    const cookie = await adminLogin('pppp');
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'OneShot', 'daemon');
     const first = await post('/pair', { code, deviceName: 'OneShot', deviceType: 'daemon' });
     expect(first.status).toBe(200);
@@ -82,14 +82,14 @@ describe('pairing', () => {
   });
 
   it('rejects a garbage code', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     const res = await post('/pair', { code: 'ZZZZ-ZZZZ', deviceName: 'X', deviceType: 'cli' });
     expect(res.status).toBe(401);
   });
 
   it('a revoked device is rejected everywhere (WS hello + HTTP)', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Gone', 'desktop');
     const { token, deviceId } = await pair(code, 'Gone', 'desktop');
 
@@ -113,8 +113,8 @@ describe('pairing', () => {
   });
 
   it('revoking a device kills its LIVE socket (close 4003 revoked); other devices keep syncing', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Doomed', 'desktop');
     const { token, deviceId } = await pair(code, 'Doomed', 'desktop');
 
@@ -141,7 +141,7 @@ describe('pairing', () => {
   });
 
   it('WS hello with an unknown token is rejected and the socket closed', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     const ws = await WsClient.connect();
     const reply = await hello(ws, 'not-a-real-token');
     expect(reply).toMatchObject({ type: 'error', code: 'UNAUTHORIZED' });
@@ -150,7 +150,7 @@ describe('pairing', () => {
   });
 
   it('messages before hello are rejected', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     const ws = await WsClient.connect();
     ws.send({ type: 'getManifest' });
     const reply = await ws.next((m) => m.type === 'error');

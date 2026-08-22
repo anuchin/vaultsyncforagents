@@ -44,8 +44,10 @@ const OBSIDIAN_VOLATILE_FILES: ReadonlySet<string> = new Set([
  * dot/space — they can never be materialized on a Windows peer, see
  * `paths.ts`). `.obsidian/` is ignored entirely when `settings.obsidianSync`
  * is false; when true, everything under it syncs except `workspace.json`,
- * `workspace-mobile.json`, and `.obsidian/cache/`. Finally, every pattern in
- * `settings.extraIgnores` is matched (glob-lite — see `IgnoreSettings`).
+ * `workspace-mobile.json`, `.obsidian/cache/`, and every plugin's
+ * `data.json` — plugin credentials (this plugin's own device token included)
+ * must never travel through sync, whatever the opt-in. Finally, every pattern
+ * in `settings.extraIgnores` is matched (glob-lite — see `IgnoreSettings`).
  */
 export function isIgnored(vaultPath: string, settings: IgnoreSettings): boolean {
   if (isWindowsUnsafePath(vaultPath)) return true;
@@ -63,6 +65,17 @@ export function isIgnored(vaultPath: string, settings: IgnoreSettings): boolean 
     if (!settings.obsidianSync) return true;
     if (OBSIDIAN_VOLATILE_FILES.has(lower)) return true;
     if (segments[1] === 'cache') return true; // the dir itself and anything under it
+    // Plugin credential files never sync, even with `.obsidian/` opted in:
+    // Obsidian keeps every plugin's settings/secrets in `<plugin>/data.json`
+    // (this plugin's own device token included) — and a second device's copy
+    // would clobber this one's pairing identity on arrival.
+    if (
+      segments[1] === 'plugins' &&
+      segments.length >= 4 &&
+      segments[segments.length - 1] === 'data.json'
+    ) {
+      return true;
+    }
   }
 
   const extras = settings.extraIgnores;

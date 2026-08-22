@@ -80,7 +80,6 @@ function makeTransport(url = 'https://worker.example'): { transport: WebSocketTr
   let socket: FakeWebSocket | undefined;
   const transport = new WebSocketTransport({
     url,
-    token: 'tok-1',
     wsFactory: (socketUrl) => {
       socket = new FakeWebSocket(socketUrl);
       return socket;
@@ -90,28 +89,32 @@ function makeTransport(url = 'https://worker.example'): { transport: WebSocketTr
 }
 
 describe('toWebSocketUrl', () => {
-  it('maps http→ws and https→wss onto /ws with the token in the query', () => {
-    expect(toWebSocketUrl('https://personal.x.workers.dev', 't 1')).toBe(
-      'wss://personal.x.workers.dev/ws?token=t+1',
+  it('maps http→ws and https→wss onto /ws, with NO token in the URL', () => {
+    expect(toWebSocketUrl('https://personal.x.workers.dev')).toBe(
+      'wss://personal.x.workers.dev/ws',
     );
-    expect(toWebSocketUrl('http://localhost:8787/', 'abc')).toBe(
-      'ws://localhost:8787/ws?token=abc',
-    );
+    expect(toWebSocketUrl('http://localhost:8787/')).toBe('ws://localhost:8787/ws');
   });
 
-  it('keeps ws:// URLs and honors a custom path', () => {
-    expect(toWebSocketUrl('wss://x.example', 't', '/sync')).toBe('wss://x.example/sync?token=t');
+  it('keeps wss:// URLs and honors a custom path', () => {
+    expect(toWebSocketUrl('wss://x.example', '/sync')).toBe('wss://x.example/sync');
   });
 
   it('rejects non-web schemes', () => {
-    expect(() => toWebSocketUrl('ftp://x.example', 't')).toThrow(/http\(s\)|ws\(s\)/);
+    expect(() => toWebSocketUrl('ftp://x.example')).toThrow(/http\(s\)|ws\(s\)/);
+  });
+
+  it('refuses cleartext ws for anything but localhost', () => {
+    expect(() => toWebSocketUrl('http://worker.example')).toThrow(/https/);
+    expect(() => toWebSocketUrl('ws://worker.example')).toThrow(/https/);
+    expect(toWebSocketUrl('http://127.0.0.1:8787')).toBe('ws://127.0.0.1:8787/ws');
   });
 });
 
 describe('WebSocketTransport', () => {
-  it('dials the token-authenticated /ws URL', () => {
+  it('dials the /ws URL (token-free; auth rides the hello frame)', () => {
     const { socket } = makeTransport('https://worker.example');
-    expect(socket.url).toBe('wss://worker.example/ws?token=tok-1');
+    expect(socket.url).toBe('wss://worker.example/ws');
   });
 
   it('queues sends before open and flushes in order once open', () => {
@@ -202,7 +205,6 @@ describe('WebSocketTransport', () => {
         () =>
           new WebSocketTransport({
             url: 'https://worker.example',
-            token: 't',
           }),
       ).toThrow(/WebSocket is not available.*Node 22+/s);
     } finally {

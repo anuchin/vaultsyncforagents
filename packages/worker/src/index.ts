@@ -188,7 +188,7 @@ export default {
       return handleAdminLogin(request, env);
     }
     if (request.method === 'POST' && path === '/admin/logout') {
-      return handleAdminLogout();
+      return handleAdminLogout(request, env);
     }
     if (request.method === 'POST' && path === '/admin/passphrase-change') {
       return handleAdminPassphraseChange(request, env);
@@ -307,11 +307,14 @@ async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
 }
 
 /**
- * `POST /admin/logout` — clear the admin session cookie. Idempotent for
- * unauthenticated callers (200 + clearing cookie): the signed cookie value
- * itself is the session, so there is nothing to revoke server-side.
+ * `POST /admin/logout` — clear the admin session cookie AND revoke
+ * server-side: the DO bumps the session revocation floor, so every
+ * outstanding admin cookie (other tabs, stolen copies) dies at once.
+ * Unauthenticated callers still get the clearing 200 — idempotent, and
+ * without a valid session there is no floor to bump.
  */
-function handleAdminLogout(): Response {
+async function handleAdminLogout(request: Request, env: Env): Promise<Response> {
+  await roomPost(env, '/admin/logout', {}, cookieHeader(request)).catch(() => {});
   const response = json(200, { ok: true });
   response.headers.append(
     'set-cookie',
@@ -365,7 +368,10 @@ async function blobAuth(request: Request, env: Env): Promise<boolean> {
  * (`crypto.DigestStream`). An object already under the key IS the blob
  * (content-addressability), so a re-upload never overwrites it — which also
  * means a garbage upload can no longer destroy a referenced blob. On mismatch
- * only the object THIS request wrote is deleted and the client gets 422.
+ * only the object THIS request wrote is deleted and the client gets 422: the
+ * upload carries a random ownership tag in its R2 custom metadata, and the
+ * reject path deletes only while that tag still owns the key — a racing
+ * uploader's verified object can never be evicted by an impostor's cleanup.
  * Oversize bodies are rejected with 413 mid-stream.
  */
 async function handleBlobPut(request: Request, env: Env, hash: string): Promise<Response> {
@@ -384,6 +390,7 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
   }
 
   const key = blobKey(hash);
+  const uploadTag = hexOf(crypto.getRandomValues(new Uint8Array(16)));
   const existing = await env.BUCKET.head(key);
   if (existing !== null) {
     await request.body.cancel().catch(() => {});
@@ -413,6 +420,7 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
 
   const putPromise = env.BUCKET.put(key, toR2, {
     httpMetadata: { contentType: 'application/octet-stream' },
+    customMetadata: { 'vsa-upload': uploadTag },
   });
 
   let digest: string;
@@ -422,9 +430,10 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
     await putPromise.catch(() => {});
     // Nothing may remain stored after a rejected upload (CAS contract): the
     // mid-stream oversize path completes the R2 put before we can bail, so
-    // evict it exactly like a hash mismatch.
+    // evict it exactly like a hash mismatch — but only if this request's
+    // upload still owns the key (see the ownership tag).
     if (oversize) {
-      await env.BUCKET.delete(key);
+      await deleteIfOwned(env, key, uploadTag);
       return json(413, { error: `blob exceeds the ${BLOB_MAX_BYTES} byte cap` });
     }
     return json(400, { error: 'failed to hash request body' });
@@ -432,9 +441,10 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
   if (digest !== hash) {
     // Same hash ⇒ same content is the CAS contract; evict the impostor this
     // request wrote (put-if-absent above guarantees a pre-existing object was
-    // never touched).
+    // never touched) — unless a concurrent verified upload already took the
+    // key back, which the ownership tag proves.
     await putPromise.catch(() => {});
-    await env.BUCKET.delete(key);
+    await deleteIfOwned(env, key, uploadTag);
     return json(422, { error: 'content does not hash to the claimed hash' });
   }
   try {
@@ -449,6 +459,14 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
   }
   await roomPost(env, '/internal/blob-uploaded', { hash, size: total });
   return json(201, { ok: true, hash, size: total });
+}
+
+/** Delete `key` only while it still carries this upload's ownership tag. */
+async function deleteIfOwned(env: Env, key: string, uploadTag: string): Promise<void> {
+  const head = await env.BUCKET.head(key).catch(() => null);
+  if (head?.customMetadata?.['vsa-upload'] === uploadTag) {
+    await env.BUCKET.delete(key);
+  }
 }
 
 /** `GET /blob/:hash` — stream back, immutable (content is addressable). */
@@ -467,15 +485,17 @@ async function handleBlobGet(request: Request, env: Env, hash: string): Promise<
     status: 200,
     headers: {
       'content-type': 'application/octet-stream',
-      'cache-control': 'public, max-age=31536000, immutable',
+      // Content-addressed and immutable, but the response is authorized —
+      // `private` keeps shared caches from ever storing it.
+      'cache-control': 'private, max-age=31536000, immutable',
       etag: obj.httpEtag,
     },
   });
 }
 
-/** ArrayBuffer → lowercase hex. */
-function hexOf(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
+/** ArrayBuffer or view → lowercase hex. */
+function hexOf(input: ArrayBuffer | Uint8Array): string {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   let out = '';
   for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
   return out;

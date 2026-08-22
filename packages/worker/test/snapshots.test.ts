@@ -34,8 +34,8 @@ interface TwoDevices {
 }
 
 async function rig(): Promise<TwoDevices & { wsDesktop: WsClient; wsMobile: WsClient }> {
-  const desktop = await claim({ passphrase: 'pppp', vaultName: 'personal', deviceName: 'Desktop' });
-  const cookie = await adminLogin('pppp');
+  const desktop = await claim({ passphrase: 'pppppppp', vaultName: 'personal', deviceName: 'Desktop' });
+  const cookie = await adminLogin('pppppppp');
   const code = await mintPairingCode(cookie, 'Mobile', 'mobile');
   const mobile = await pair(code, 'Mobile', 'mobile');
   const wsDesktop = await WsClient.connect();
@@ -391,8 +391,8 @@ describe('GET /api/snapshots', () => {
   });
 
   it('accepts the admin session cookie (the /api/status auth pattern)', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'personal', deviceName: 'Desktop' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'personal', deviceName: 'Desktop' });
+    const cookie = await adminLogin('pppppppp');
     const wsDesktop = await WsClient.connect();
     await hello(wsDesktop, claimed.token);
     const snapReply = wsDesktop.next((m) => m.type === 'snapshotCreateAck');

@@ -69,7 +69,7 @@ describe('plugin-facing routes: preflights (both claim states)', () => {
   });
 
   it('OPTIONS on /health, /pair, /api/status and /blob/:hash still answers 204 after claim', async () => {
-    await claim({ passphrase: 'pppp' });
+    await claim({ passphrase: 'pppppppp' });
     for (const path of ['/health', '/pair', '/api/status', '/blob/' + 'b'.repeat(64)]) {
       const res = await preflight(path);
       expect(res.status, path).toBe(204);
@@ -83,7 +83,7 @@ describe('plugin-facing routes: preflights (both claim states)', () => {
     expect(unclaimed.status).toBe(204);
     expectCorsHeaders(unclaimed);
 
-    await claim({ passphrase: 'pppp' });
+    await claim({ passphrase: 'pppppppp' });
     const claimed = await preflight(`/blob/${hash}`, 'PUT');
     expect(claimed.status).toBe(204);
     expectCorsHeaders(claimed);
@@ -104,8 +104,8 @@ describe('plugin-facing routes: actual responses carry the headers', () => {
   });
 
   it('POST /pair carries the headers (claimed worker, real pairing flow)', async () => {
-    await claim({ passphrase: 'pppp' });
-    const cookie = await adminLogin('pppp');
+    await claim({ passphrase: 'pppppppp' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Obsidian', 'plugin');
     const res = await post(
       '/pair',
@@ -187,7 +187,7 @@ describe('dashboard surface stays same-origin (no CORS headers)', () => {
   });
 
   it('OPTIONS on /api/history and /ws do not get permissive CORS', async () => {
-    await claim({ passphrase: 'pppp' });
+    await claim({ passphrase: 'pppppppp' });
     for (const path of ['/api/history', '/ws']) {
       const res = await preflight(path);
       expect(res.status, path).not.toBe(204); // falls through the router: no preflight there
@@ -196,8 +196,8 @@ describe('dashboard surface stays same-origin (no CORS headers)', () => {
   });
 
   it('POST /admin/login responses contain no Access-Control-* headers', async () => {
-    await claim({ passphrase: 'pppp' });
-    const res = await post('/admin/login', { passphrase: 'pppp' }, { origin: PLUGIN_ORIGIN });
+    await claim({ passphrase: 'pppppppp' });
+    const res = await post('/admin/login', { passphrase: 'pppppppp' }, { origin: PLUGIN_ORIGIN });
     expect(res.status).toBe(200);
     expectNoCorsHeaders(res);
   });
@@ -205,7 +205,7 @@ describe('dashboard surface stays same-origin (no CORS headers)', () => {
   it('POST /claim responses contain no Access-Control-* headers', async () => {
     const res = await post(
       '/claim',
-      { passphrase: 'pppp', vaultName: 'v' },
+      { passphrase: 'pppppppp', vaultName: 'v' },
       { origin: PLUGIN_ORIGIN },
     );
     expect(res.status).toBe(200);
@@ -213,7 +213,7 @@ describe('dashboard surface stays same-origin (no CORS headers)', () => {
   });
 
   it('OPTIONS on /admin/login does not get permissive CORS', async () => {
-    await claim({ passphrase: 'pppp' });
+    await claim({ passphrase: 'pppppppp' });
     const res = await preflight('/admin/login', 'POST');
     expect(res.status).not.toBe(204); // falls through the router: no preflight there
     expectNoCorsHeaders(res);

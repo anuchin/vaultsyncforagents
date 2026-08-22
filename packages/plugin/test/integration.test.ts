@@ -158,8 +158,9 @@ describe('plugin ↔ InMemorySyncServer integration', () => {
       plugin.onunload();
     }
 
-    // The transport dialed exactly the authenticated worker URL.
-    expect(FakeSocket.opened[0]!.url).toBe('wss://w.example/ws?token=tok-dev-1');
+    // The transport dialed exactly the worker /ws URL — token-free (the
+    // device token rides the hello frame, never the URL).
+    expect(FakeSocket.opened[0]!.url).toBe('wss://w.example/ws');
   }, 15000);
 
   // The "Ignore patterns" setting, end to end: patterns parsed from the

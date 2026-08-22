@@ -116,7 +116,7 @@ describe('admin session', () => {
     const login = await post('/admin/login', { passphrase: 'right-one' });
     expect(login.status).toBe(200);
     const setCookie = login.headers.get('set-cookie');
-    expect(setCookie).toMatch(/^vsa_admin=\d+\.[0-9a-f]{64};/);
+    expect(setCookie).toMatch(/^vsa_admin=[A-Za-z0-9_-]+\.\d+\.[0-9a-f]{64};/);
     expect(setCookie).toContain('HttpOnly');
     expect(setCookie).toContain('Secure');
     expect(setCookie).toContain('SameSite=Lax');

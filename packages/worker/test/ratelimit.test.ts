@@ -34,7 +34,7 @@ async function wrongPairAttempts(n: number): Promise<void> {
 
 describe('rate limiting on POST /pair', () => {
   it('after 10 failed attempts the surface closes: 429 + Retry-After + error body', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
     await wrongPairAttempts(10);
 
     const blocked = await post('/pair', { code: 'ZZZZ-ZZZZ', deviceName: 'X' }, IP);
@@ -47,7 +47,7 @@ describe('rate limiting on POST /pair', () => {
 
     // Even the CORRECT code is refused while throttled (the guessing surface
     // is closed, not just wrong guesses).
-    const cookie = await adminLogin('pppp');
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Late', 'desktop');
     expect((await post('/pair', { code, deviceName: 'Late' }, IP)).status).toBe(429);
 
@@ -56,8 +56,8 @@ describe('rate limiting on POST /pair', () => {
   });
 
   it('a correct code still succeeds before the cap and clears the counter', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
-    const cookie = await adminLogin('pppp');
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Real', 'desktop');
 
     await wrongPairAttempts(9); // one guess left in the budget
@@ -70,8 +70,8 @@ describe('rate limiting on POST /pair', () => {
   });
 
   it('expired and already-used codes count as failures too', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
-    const cookie = await adminLogin('pppp');
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppppppp');
 
     // Expired: the 10th failure is an expired code, and it closes the door.
     const expired = await mintPairingCode(cookie, 'Late', 'desktop');
@@ -91,8 +91,8 @@ describe('rate limiting on POST /pair', () => {
   });
 
   it('the counter resets once the 15-minute window closes (injected time)', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'v' });
-    const cookie = await adminLogin('pppp');
+    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppppppp');
     await wrongPairAttempts(10);
     expect((await post('/pair', { code: 'ZZZZ-ZZZZ', deviceName: 'X' }, IP)).status).toBe(429);
 

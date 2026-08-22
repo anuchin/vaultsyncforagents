@@ -228,6 +228,11 @@ export class WsClient {
     this.ws.send(JSON.stringify(message));
   }
 
+  /** Send a raw text frame (protocol-violation tests bypass the typed API). */
+  sendRaw(frame: string): void {
+    this.ws.send(frame);
+  }
+
   /** Next message matching `match` (buffered first, then live), or throws. */
   next(match: (message: ServerMessage) => boolean = () => true, timeoutMs = 4000): Promise<ServerMessage> {
     const index = this.buffer.findIndex(match);

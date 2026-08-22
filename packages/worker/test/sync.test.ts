@@ -36,8 +36,8 @@ interface TwoDevices {
 }
 
 async function rig(): Promise<TwoDevices & { wsDesktop: WsClient; wsMobile: WsClient }> {
-  const desktop = await claim({ passphrase: 'pppp', vaultName: 'personal', deviceName: 'Desktop' });
-  const cookie = await adminLogin('pppp');
+  const desktop = await claim({ passphrase: 'pppppppp', vaultName: 'personal', deviceName: 'Desktop' });
+  const cookie = await adminLogin('pppppppp');
   const code = await mintPairingCode(cookie, 'Mobile', 'mobile');
   const mobile = await pair(code, 'Mobile', 'mobile');
   const wsDesktop = await WsClient.connect();
@@ -539,11 +539,22 @@ describe('commit validation and edge kinds', () => {
 });
 
 describe('server-side commit shape validation', () => {
-  async function rigSolo(): Promise<WsClient> {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'personal', deviceName: 'Solo' });
+  /** Claim once for the solo rig (a second claim on a claimed worker is 409). */
+  async function rigSoloClaim(): Promise<string> {
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'personal', deviceName: 'Solo' });
+    return claimed.token;
+  }
+
+  /** A fresh hello'd socket on an existing solo claim — the 3-strike protocol
+   *  disconnect means one socket cannot absorb a whole test's rejects. */
+  async function rigSoloSocket(token: string): Promise<WsClient> {
     const ws = await WsClient.connect();
-    await hello(ws, claimed.token);
+    await hello(ws, token);
     return ws;
+  }
+
+  async function rigSolo(): Promise<WsClient> {
+    return rigSoloSocket(await rigSoloClaim());
   }
 
   /** Send a possibly malformed commit; assert it bounces as PROTOCOL. */
@@ -554,7 +565,11 @@ describe('server-side commit shape validation', () => {
   }
 
   it('rejects traversal paths, host-absolute paths, and non-string paths', async () => {
-    const ws = await rigSolo();
+    // Two violations on one socket (the 3-strike disconnect policy closes a
+    // socket at three — see protocol-errors.test.ts), then a third case on a
+    // fresh connection.
+    const token = await rigSoloClaim();
+    const ws = await rigSoloSocket(token);
     await expectRejected(ws, {
       type: 'commit',
       path: '/../evil.md',
@@ -571,7 +586,13 @@ describe('server-side commit shape validation', () => {
       size: 1,
       kind: 'edit',
     });
-    await expectRejected(ws, {
+    // Nothing durable landed; the socket stays alive and consistent.
+    const manifest = await manifestOf(ws);
+    expect(manifest.entries).toEqual({});
+    ws.close();
+
+    const again = await rigSoloSocket(token);
+    await expectRejected(again, {
       type: 'commit',
       path: 123,
       parentVersion: null,
@@ -579,10 +600,7 @@ describe('server-side commit shape validation', () => {
       size: 1,
       kind: 'edit',
     });
-    // Nothing durable landed; the socket stays alive and consistent.
-    const manifest = await manifestOf(ws);
-    expect(manifest.entries).toEqual({});
-    ws.close();
+    again.close();
   });
 
   it('rejects paths (and rename fromPaths) over 1024 code units after normalization', async () => {
@@ -651,8 +669,9 @@ describe('server-side commit shape validation', () => {
   });
 
   it('rejects sizes that are not non-negative integers within the blob cap', async () => {
-    const ws = await rigSolo();
-    for (const size of [-1, 1.5, 100 * 1024 * 1024 + 1]) {
+    const token = await rigSoloClaim();
+    const ws = await rigSoloSocket(token);
+    for (const size of [-1, 1.5]) {
       await expectRejected(ws, {
         type: 'commit',
         path: '/a.md',
@@ -665,5 +684,18 @@ describe('server-side commit shape validation', () => {
     const manifest = await manifestOf(ws);
     expect(manifest.entries).toEqual({});
     ws.close();
+
+    // The cap itself, on a fresh socket (a third strike would disconnect —
+    // see protocol-errors.test.ts).
+    const ws2 = await rigSoloSocket(token);
+    await expectRejected(ws2, {
+      type: 'commit',
+      path: '/a.md',
+      parentVersion: null,
+      hash: 'a'.repeat(64),
+      size: 100 * 1024 * 1024 + 1,
+      kind: 'edit',
+    });
+    ws2.close();
   });
 });

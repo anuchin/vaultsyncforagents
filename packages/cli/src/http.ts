@@ -89,6 +89,12 @@ export interface WorkerApiOptions {
   now?: () => number;
 }
 
+/** Localhost names for which cleartext `http://` is tolerated (local dev only). */
+function isLocalHost(url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+}
+
 export class WorkerApi {
   private readonly base: string;
   private readonly doFetch: typeof fetch;
@@ -99,8 +105,15 @@ export class WorkerApi {
     if (base !== '' && !/^https?:\/\//i.test(base)) base = `https://${base}`;
     try {
       // Validate + normalize (also tolerates a trailing path, which we drop).
-      base = new URL(base).origin;
-    } catch {
+      const parsed = new URL(base);
+      if (parsed.protocol === 'http:' && !isLocalHost(parsed)) {
+        throw new CommandError(
+          `worker URL must use https:// (cleartext http is only allowed for localhost): ${JSON.stringify(options.baseUrl)}`,
+        );
+      }
+      base = parsed.origin;
+    } catch (error) {
+      if (error instanceof CommandError) throw error;
       throw new CommandError(`invalid worker URL: ${JSON.stringify(options.baseUrl)}`);
     }
     this.base = base;

@@ -35,7 +35,7 @@ export function createVaultClient(
   const dial = (): Transport =>
     runtime.transportFactory !== undefined
       ? runtime.transportFactory(vault, token)
-      : new WebSocketTransport({ url: vault.url, token });
+      : new WebSocketTransport({ url: vault.url });
   const client = new SyncClient({
     deviceId: vault.deviceId,
     deviceName,

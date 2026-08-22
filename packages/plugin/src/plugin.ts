@@ -331,7 +331,7 @@ export class VaultSyncPlugin extends Plugin {
       token,
       transport: () =>
         withRoundTripLogging(
-          new WebSocketTransport({ url, token, wsFactory: this.overrides.wsFactory }),
+          new WebSocketTransport({ url, wsFactory: this.overrides.wsFactory }),
           { log: this.syncLog, shouldLog: () => this.syncLog.debugEnabled },
         ),
       blobStore: new HttpBlobStore({ baseUrl: url, token, fetchImpl: this.fetchImpl }),

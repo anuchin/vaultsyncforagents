@@ -5,36 +5,36 @@ import { FakeFetch, FakeSocket, jsonResult } from './helpers/network-fakes.js';
 import { NetworkError } from '@vsa/core';
 
 describe('toWebSocketUrl', () => {
-  it('converts https origins to authenticated wss worker URLs', () => {
-    expect(toWebSocketUrl('https://personal.x.workers.dev', 'tok-1')).toBe(
-      'wss://personal.x.workers.dev/ws?token=tok-1',
+  it('converts https origins to wss worker URLs (token-free)', () => {
+    expect(toWebSocketUrl('https://personal.x.workers.dev')).toBe(
+      'wss://personal.x.workers.dev/ws',
     );
   });
 
-  it('upgrades http to ws and honors an explicit /sync path', () => {
-    expect(toWebSocketUrl('http://localhost:8787/', 't', '/sync')).toBe(
-      'ws://localhost:8787/sync?token=t',
-    );
+  it('upgrades http to ws for localhost and honors an explicit /sync path', () => {
+    expect(toWebSocketUrl('http://localhost:8787/', '/sync')).toBe('ws://localhost:8787/sync');
   });
 
-  it('passes ws(s) schemes through, dropping any query the input carried', () => {
-    expect(toWebSocketUrl('wss://example.com/whatever?x=1', 't')).toBe(
-      'wss://example.com/ws?token=t',
-    );
+  it('passes wss schemes through, dropping any query the input carried', () => {
+    expect(toWebSocketUrl('wss://example.com/whatever?x=1')).toBe('wss://example.com/ws');
   });
 
   it('rejects non-web schemes', () => {
-    expect(() => toWebSocketUrl('ftp://example.com', 't')).toThrow(NetworkError);
-    expect(() => toWebSocketUrl('not a url', 't')).toThrow();
+    expect(() => toWebSocketUrl('ftp://example.com')).toThrow(NetworkError);
+    expect(() => toWebSocketUrl('not a url')).toThrow();
+  });
+
+  it('refuses cleartext ws for anything but localhost', () => {
+    expect(() => toWebSocketUrl('http://worker.example')).toThrow(/https/);
+    expect(() => toWebSocketUrl('ws://worker.example')).toThrow(/https/);
   });
 });
 
 describe('WebSocketTransport', () => {
-  function dial(url = 'https://w.example', token = 'tok') {
+  function dial(url = 'https://w.example') {
     let socket: FakeSocket | null = null;
     const transport = new WebSocketTransport({
       url,
-      token,
       wsFactory: (dialUrl) => {
         socket = new FakeSocket(dialUrl);
         return socket;
@@ -44,9 +44,9 @@ describe('WebSocketTransport', () => {
     return { transport, socket: socket as FakeSocket };
   }
 
-  it('dials the authenticated worker URL', () => {
-    const { socket } = dial('https://w.example', 'tok-9');
-    expect(socket.url).toBe('wss://w.example/ws?token=tok-9');
+  it('dials the /ws URL (token-free; auth rides the hello frame)', () => {
+    const { socket } = dial('https://w.example');
+    expect(socket.url).toBe('wss://w.example/ws');
   });
 
   it('queues sends before open and flushes them on open', () => {

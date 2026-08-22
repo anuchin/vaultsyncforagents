@@ -47,8 +47,8 @@ beforeEach(async () => {
 
 describe('PATCH /device', () => {
   it('renames the calling device and is reflected in /api/status + events', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'vault', deviceName: 'Desktop' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'vault', deviceName: 'Desktop' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Old name', 'mobile');
     const mobile = await pair(code, 'Old name', 'mobile');
 
@@ -78,8 +78,8 @@ describe('PATCH /device', () => {
   });
 
   it('a device token can only rename itself — other devices are unreachable', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'vault', deviceName: 'Desktop' });
-    const cookie = await adminLogin('pppp');
+    await claim({ passphrase: 'pppppppp', vaultName: 'vault', deviceName: 'Desktop' });
+    const cookie = await adminLogin('pppppppp');
     const codeA = await mintPairingCode(cookie, 'A', 'desktop');
     const a = await pair(codeA, 'A', 'desktop');
     const codeB = await mintPairingCode(cookie, 'B', 'desktop');
@@ -103,7 +103,7 @@ describe('PATCH /device', () => {
   });
 
   it('rejects invalid names with 400', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'vault' });
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'vault' });
     const tooLong = 'x'.repeat(31);
     for (const name of ['', '   ', tooLong, 'bad\u0007name', 'line\nbreak']) {
       const res = await patch('/device', { name }, bearer(claimed.token));
@@ -118,8 +118,8 @@ describe('PATCH /device', () => {
   });
 
   it('an admin session cookie does NOT authorize the route', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'vault', deviceName: 'Desktop' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'vault', deviceName: 'Desktop' });
+    const cookie = await adminLogin('pppppppp');
     const res = await patch('/device', { name: 'Via admin' }, { cookie });
     expect(res.status).toBe(401);
     // The claiming device's own token still works after the refusal.
@@ -127,8 +127,8 @@ describe('PATCH /device', () => {
   });
 
   it('a revoked token is rejected with 401', async () => {
-    const claimed = await claim({ passphrase: 'pppp', vaultName: 'vault' });
-    const cookie = await adminLogin('pppp');
+    const claimed = await claim({ passphrase: 'pppppppp', vaultName: 'vault' });
+    const cookie = await adminLogin('pppppppp');
     const code = await mintPairingCode(cookie, 'Doomed', 'desktop');
     const doomed = await pair(code, 'Doomed', 'desktop');
     const revoke = await SELF.fetch(`${TEST_ORIGIN}/admin/revoke`, {

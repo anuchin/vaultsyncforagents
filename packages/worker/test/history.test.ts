@@ -67,7 +67,7 @@ beforeEach(async () => {
 
 describe('GET /api/history', () => {
   it('returns the full version chain newest-first with the head flagged', async () => {
-    const { token, deviceId } = await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    const { token, deviceId } = await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const ws = await WsClient.connect();
     await hello(ws, token);
 
@@ -100,7 +100,7 @@ describe('GET /api/history', () => {
   });
 
   it('includes delete tombstones and flags the deleted head', async () => {
-    const { token } = await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    const { token } = await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const ws = await WsClient.connect();
     await hello(ws, token);
     const first = await commitInline(ws, '/gone.md', null, 'content');
@@ -116,7 +116,7 @@ describe('GET /api/history', () => {
   });
 
   it('accepts the admin session cookie as an alternative to a device token', async () => {
-    const { token, passphrase } = await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    const { token, passphrase } = await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const ws = await WsClient.connect();
     await hello(ws, token);
     await commitInline(ws, '/a.md', null, 'x');
@@ -128,7 +128,7 @@ describe('GET /api/history', () => {
   });
 
   it('requires auth: no token, garbage token, and revoked devices all 401', async () => {
-    const { token, passphrase } = await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    const { token, passphrase } = await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const ws = await WsClient.connect();
     await hello(ws, token);
     await commitInline(ws, '/a.md', null, 'x');
@@ -155,7 +155,7 @@ describe('GET /api/history', () => {
   });
 
   it('rejects a missing or non-absolute path parameter with 400', async () => {
-    const { token } = await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    const { token } = await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const auth = { authorization: `Bearer ${token}` };
     expect((await get('/api/history', auth)).status).toBe(400);
     expect((await get('/api/history?path=', auth)).status).toBe(400);
@@ -163,7 +163,7 @@ describe('GET /api/history', () => {
   });
 
   it('returns an empty chain for an unknown path (not an error)', async () => {
-    const { token } = await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    const { token } = await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const res = await get(`/api/history?path=${encodeURIComponent('/never.md')}`, {
       authorization: `Bearer ${token}`,
     });

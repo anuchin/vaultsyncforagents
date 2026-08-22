@@ -39,7 +39,7 @@ describe('dashboard assets', () => {
   });
 
   it('serves the SPA at / after claiming too', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const res = await get('/');
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
@@ -47,7 +47,7 @@ describe('dashboard assets', () => {
   });
 
   it('unknown non-GET paths stay JSON 404s, not HTML', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     const res = await request('POST', '/nope');
     expect(res.status).toBe(404);
     expect(res.headers.get('content-type')).toContain('application/json');
@@ -89,12 +89,12 @@ describe('unclaimed gate vs. assets (§14)', () => {
       protocolVersion: 1,
     });
 
-    const claimRes = await post('/claim', { passphrase: 'abcd', vaultName: 'v' });
+    const claimRes = await post('/claim', { passphrase: 'abcdwxyz', vaultName: 'v' });
     expect(claimRes.status).toBe(200);
   });
 
   it('the gate lifts exactly on the API surface after claiming', async () => {
-    await claim({ passphrase: 'pppp', vaultName: 'personal' });
+    await claim({ passphrase: 'pppppppp', vaultName: 'personal' });
     // 421 -> 401 (auth now decides, not claim state):
     expect((await get('/api/status')).status).toBe(401);
     expect((await get('/blob/' + 'a'.repeat(64))).status).toBe(401);
