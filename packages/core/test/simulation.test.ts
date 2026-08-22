@@ -502,7 +502,9 @@ describe('simulation — scenario (f): large attachments ride the blob store', (
     expect(desktop.blobStore.map.has(hash!)).toBe(true); // uploaded
     expect(mobile.blobStore.map.has(hash!)).toBe(true); // downloaded + cached
     expect(server.blobs.get(hash!)).toEqual(big);
-  });
+    // Generous budget: hashing + blob round-trips of 300 KB exceed the 5 s
+    // default on slow single-core machines (observed on a VPS).
+  }, 30_000);
 });
 
 describe('simulation — reconnection and status', () => {
