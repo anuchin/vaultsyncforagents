@@ -231,12 +231,15 @@ export function registerObsidianProtocolHandler(
 
 export class Modal {
   static instances: Array<{ onOpenCalled: boolean; openCalled: boolean }> = [];
+  /** The modal objects themselves, so tests can dismiss them directly. */
+  static opened: Modal[] = [];
   app: unknown;
   contentEl: Record<string, unknown> = {};
   private readonly record = { onOpenCalled: false, openCalled: false };
   constructor(app?: unknown) {
     this.app = app;
     Modal.instances.push(this.record);
+    Modal.opened.push(this);
   }
   open(): void {
     this.record.openCalled = true;
@@ -375,6 +378,7 @@ export function resetObsidianMock(): void {
   Setting.instances = [];
   Notice.messages = [];
   Modal.instances = [];
+  Modal.opened = [];
   for (const action of Object.keys(protocolHandlers)) delete protocolHandlers[action];
   Platform.isDesktopApp = true;
   Platform.isDesktop = true;

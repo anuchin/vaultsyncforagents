@@ -1,7 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App, PluginManifest } from 'obsidian';
 import { VaultSyncPlugin } from '../src/plugin.js';
-import { asMockPlugin, Notice, protocolHandlers, resetObsidianMock } from './helpers/obsidian-mock.js';
+import {
+  asMockPlugin,
+  Modal,
+  Notice,
+  protocolHandlers,
+  resetObsidianMock,
+  Setting,
+  type ButtonRecord,
+  type SettingRecord,
+} from './helpers/obsidian-mock.js';
 import { makeFakeApp, FakeVault } from './helpers/fake-vault.js';
 import { FakeFetch, FakeSocket, jsonResult, offlineWsFactory } from './helpers/network-fakes.js';
 
@@ -32,6 +41,22 @@ function makePlugin(options: {
 
 async function flush(hops = 10): Promise<void> {
   for (let i = 0; i < hops; i++) await Promise.resolve();
+}
+
+/** The deep-link confirmation modal's Setting record (title match). */
+function findModalSetting(name: string): SettingRecord {
+  const record = Setting.instances.find((r) => r.name === name);
+  if (record === undefined) throw new Error(`modal setting not rendered: ${name}`);
+  return record;
+}
+
+/** A button rendered inside the deep-link confirmation modal. */
+function findModalButton(text: string): ButtonRecord {
+  for (const record of [...Setting.instances].reverse()) {
+    const button = record.buttons.find((b) => b.text === text);
+    if (button !== undefined) return button;
+  }
+  throw new Error(`modal button not rendered: ${text}`);
 }
 
 describe('VaultSyncPlugin lifecycle', () => {
@@ -83,7 +108,7 @@ describe('VaultSyncPlugin lifecycle', () => {
     expect(warning!.message).toContain('One sync client per machine per vault');
   });
 
-  it('deep link pairs automatically: obsidian://vaultsyncforagents/pair?url=&code=', async () => {
+  it('deep link on an unlinked vault asks first: modal names the link\u2019s worker, Pair completes pairing', async () => {
     const fetcher = new FakeFetch().health(true).pair(200, { ok: true, token: 'tok-9', deviceId: 'dev-9' });
     const { plugin, vault } = makePlugin({ fetcher });
     await plugin.onload();
@@ -93,15 +118,60 @@ describe('VaultSyncPlugin lifecycle', () => {
       url: 'https://w.example',
       code: '7F3K-Q9M2',
     });
-    // The handler is fire-and-forget; the pair flow (two fetches with real
-    // Response bodies + device-marker write + startSync) resolves over ~30
-    // microtask hops — flush generously and deterministically.
+    await flush(4);
+
+    // The confirmation is the gate: it shows the exact URL the link carried,
+    // and nothing has been sent anywhere yet.
+    expect(findModalSetting('Pair VaultSync?').desc).toContain('https://w.example');
+    expect(fetcher.calls).toHaveLength(0);
+    expect(plugin.data.token).toBe('');
+
+    await findModalButton('Pair').onClick();
+    // The pair flow (two fetches with real Response bodies + device-marker
+    // write + startSync) resolves over ~30 microtask hops — flush generously
+    // and deterministically.
     await flush(64);
 
     expect(plugin.data).toMatchObject({ token: 'tok-9', deviceId: 'dev-9', url: 'https://w.example' });
     expect(plugin.client).not.toBeNull();
     expect(vault.adapter.files.has('.vaultsyncforagents/device.json')).toBe(true);
     expect(Notice.messages.some((n) => n.message.includes('Paired'))).toBe(true);
+  });
+
+  it('deep link declined (Cancel): no pair request, no state change, no Notice', async () => {
+    const fetcher = new FakeFetch().health(true).pair(200, { ok: true, token: 'tok-9', deviceId: 'dev-9' });
+    const { plugin, vault } = makePlugin({ fetcher });
+    await plugin.onload();
+    const before = JSON.stringify(plugin.data);
+
+    protocolHandlers['vaultsyncforagents']!({ url: 'https://attacker.example', code: 'STOLEN-1' });
+    await flush(4);
+    await findModalButton('Cancel').onClick();
+    await flush(64);
+
+    expect(fetcher.calls).toHaveLength(0);
+    expect(JSON.stringify(plugin.data)).toBe(before);
+    expect(plugin.client).toBeNull();
+    expect(vault.adapter.files.has('.vaultsyncforagents/device.json')).toBe(false);
+    expect(Notice.messages).toHaveLength(0);
+  });
+
+  it('deep link modal dismissed without a choice (Escape): nothing happens', async () => {
+    const fetcher = new FakeFetch().health(true).pair(200, { ok: true, token: 'tok-9', deviceId: 'dev-9' });
+    const { plugin } = makePlugin({ fetcher });
+    await plugin.onload();
+
+    protocolHandlers['vaultsyncforagents/pair']!({ url: 'https://w.example', code: '7F3K-Q9M2' });
+    await flush(4);
+    expect(Modal.opened.length).toBe(1);
+
+    Modal.opened.at(-1)!.close(); // Escape / backdrop dismiss — no button chosen
+    await flush(64);
+
+    expect(fetcher.calls).toHaveLength(0);
+    expect(plugin.data.token).toBe('');
+    expect(plugin.client).toBeNull();
+    expect(Notice.messages).toHaveLength(0);
   });
 
   it('deep link is ignored for the already-linked worker; different worker requires unlink', async () => {

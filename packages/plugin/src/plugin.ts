@@ -52,7 +52,7 @@ import { registerPairProtocolHandler } from './protocol-handler.js';
 import { ReconnectSupervisor } from './reconnect.js';
 import type { BackoffOptions } from './reconnect.js';
 import type { StatusBarMode } from './statusbar.js';
-import { VaultSyncSettingTab } from './settings.js';
+import { ConfirmModal, VaultSyncSettingTab } from './settings.js';
 import { StatusBarIndicator } from './statusbar.js';
 import { WebSocketTransport } from './transport.js';
 import type { WebSocketFactory } from './transport.js';
@@ -181,7 +181,12 @@ export class VaultSyncPlugin extends Plugin {
     return outcome;
   }
 
-  /** obsidian://vaultsyncforagents/pair?url=…&code=… (protocol-handler.ts). */
+  /**
+   * obsidian://vaultsyncforagents/pair?url=…&code=… (protocol-handler.ts).
+   * On an unlinked vault the link's origin is untrusted until the user
+   * approves it — pairing would hand the whole vault to whatever host the
+   * link carried — so it goes through a confirmation naming that exact URL.
+   */
   private async handlePairDeepLink(url: string, code: string): Promise<void> {
     if (this.linked) {
       if (normalizeWorkerUrlSafe(url) === normalizeWorkerUrlSafe(this.data.url)) {
@@ -194,6 +199,18 @@ export class VaultSyncPlugin extends Plugin {
       }
       return;
     }
+    new ConfirmModal(this.app, {
+      title: 'Pair VaultSync?',
+      body:
+        `A pairing link asked Obsidian to pair this vault with the worker at:\n\n${url}\n\n` +
+        'Approving pairs this device and sends this vault\u2019s notes to that worker from then on. ' +
+        'Only approve a link you opened from your own worker dashboard — any web page can craft one.',
+      confirmText: 'Pair',
+      onConfirm: () => this.pairFromDeepLink(url, code),
+    }).open();
+  }
+
+  private async pairFromDeepLink(url: string, code: string): Promise<void> {
     const deviceName = this.resolveDeviceName();
     const outcome = await pairWithWorker({
       url,

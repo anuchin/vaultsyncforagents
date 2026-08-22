@@ -1,7 +1,7 @@
 {
   "id": "vaultsyncforagents",
   "name": "VaultSync for Agents",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "minAppVersion": "1.5.0",
   "description": "Self-hosted vault sync through your own Cloudflare Worker. Keeps desktop, mobile, and AI agents working on the same files.",
   "author": "VaultSync for Agents",
