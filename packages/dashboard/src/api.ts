@@ -74,6 +74,11 @@ export const api = {
     return post('/admin/login', { passphrase });
   },
 
+  /** Clear the admin session cookie (idempotent; also works when stale). */
+  adminLogout(): Promise<{ ok: boolean }> {
+    return post('/admin/logout', {});
+  },
+
   /**
    * Rotate the admin passphrase (POST /admin/passphrase-change). The server
    * verifies `current`, replaces the hash, rotates the session secret (every

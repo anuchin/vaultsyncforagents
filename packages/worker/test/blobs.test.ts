@@ -61,6 +61,23 @@ describe('blob routes', () => {
     expect(getRes.status).toBe(404);
   });
 
+  it('re-uploading an existing hash never overwrites the stored content (put-if-absent)', async () => {
+    const claimed = await claim();
+    const auth = { authorization: `Bearer ${claimed.token}` };
+    const good = enc('the real content');
+    const hash = await hashOf(good);
+    expect((await put(`/blob/${hash}`, good, auth)).status).toBe(201);
+
+    // Garbage under the SAME hash is redundant, not destructive: the stored
+    // object IS the blob (CAS), so the upload is a no-op.
+    const res = await put(`/blob/${hash}`, enc('garbage impostor'), auth);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, hash, size: good.byteLength });
+
+    const getRes = await get(`/blob/${hash}`, auth);
+    expect(new Uint8Array(await getRes.arrayBuffer())).toEqual(good);
+  });
+
   it('blob routes require auth (device token or admin cookie)', async () => {
     await claim();
     const hash = await hashOf(enc('secret bytes'));

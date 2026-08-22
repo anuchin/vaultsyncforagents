@@ -125,7 +125,7 @@ export function statusView(ctx: ViewContext): ViewHandle {
         { class: 'page-nav' },
         quietButton('Dashboard', () => ctx.dispatch({ type: 'navigate', view: 'status' }), { 'data-active': true }),
         quietButton('Restore', () => ctx.dispatch({ type: 'navigate', view: 'restore' })),
-        quietButton('Sign out', () => ctx.dispatch({ type: 'logged-out' })),
+        quietButton('Sign out', () => void signOut()),
       ),
     ),
     adminSection,
@@ -285,6 +285,17 @@ export function statusView(ctx: ViewContext): ViewHandle {
     } catch (error) {
       handleApiError(error, 'Revoke failed');
     }
+  }
+
+  async function signOut(): Promise<void> {
+    // Best effort: clear the cookie server-side, then leave regardless — an
+    // unreachable server must not trap the admin in an authenticated view.
+    try {
+      await api.adminLogout();
+    } catch {
+      // the cookie dies on its own 12 h TTL (or the next login)
+    }
+    ctx.dispatch({ type: 'logged-out' });
   }
 
   // --- admin passphrase change (form logic) ------------------------------------------------

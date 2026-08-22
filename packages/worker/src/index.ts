@@ -187,6 +187,9 @@ export default {
     if (request.method === 'POST' && path === '/admin/login') {
       return handleAdminLogin(request, env);
     }
+    if (request.method === 'POST' && path === '/admin/logout') {
+      return handleAdminLogout();
+    }
     if (request.method === 'POST' && path === '/admin/passphrase-change') {
       return handleAdminPassphraseChange(request, env);
     }
@@ -236,9 +239,11 @@ export default {
   //
   // Two jobs ride the same weekly trigger:
   //  - orphan-blob GC: ask the DO for unreferenced hashes (refcount 0, older
-  //    than the grace window), delete them from R2, then tell the DO to drop
-  //    the bookkeeping rows. Referenced blobs are never enumerated, so they
-  //    always survive.
+  //    than the grace window), then have the DO purge the bookkeeping rows
+  //    and CONFIRM which hashes are still orphans (re-checked inside its
+  //    serialized queue — a commit that re-referenced one since listing
+  //    wins), and only then delete the confirmed ones from R2. Referenced
+  //    blobs are never enumerated, so they always survive.
   //  - events pruning (§6): the event log is bounded (30 days / newest 10k);
   //    the DO prunes opportunistically between cron runs as a second net.
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -248,8 +253,9 @@ export default {
         const list = await roomFetch(env, '/internal/gc');
         const { orphans } = (await list.json()) as { orphans: string[] };
         if (orphans.length === 0) return;
-        await Promise.all(orphans.map((hash) => env.BUCKET.delete(blobKey(hash))));
-        await roomPost(env, '/internal/gc-purge', { hashes: orphans });
+        const purge = await roomPost(env, '/internal/gc-purge', { hashes: orphans });
+        const { purged } = (await purge.json()) as { purged: string[] };
+        await Promise.all(purged.map((hash) => env.BUCKET.delete(blobKey(hash))));
       })().catch((error: unknown) => {
         // Cron failures must never propagate; Cloudflare retries the trigger.
         console.error('gc failed', error);
@@ -301,6 +307,20 @@ async function handleAdminLogin(request: Request, env: Env): Promise<Response> {
 }
 
 /**
+ * `POST /admin/logout` — clear the admin session cookie. Idempotent for
+ * unauthenticated callers (200 + clearing cookie): the signed cookie value
+ * itself is the session, so there is nothing to revoke server-side.
+ */
+function handleAdminLogout(): Response {
+  const response = json(200, { ok: true });
+  response.headers.append(
+    'set-cookie',
+    `${ADMIN_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`,
+  );
+  return response;
+}
+
+/**
  * `POST /admin/passphrase-change` → the DO verifies `current` (argon2, with
  * the shared per-IP failure budget), stores the new hash, and ROTATES the
  * session secret so every pre-existing admin cookie dies instantly. The DO
@@ -341,9 +361,12 @@ async function blobAuth(request: Request, env: Env): Promise<boolean> {
 }
 
 /**
- * `PUT /blob/:hash` — stream the body to R2 while hashing it
- * (`crypto.DigestStream`); on mismatch the stored object is deleted and the
- * client gets 422. Oversize bodies are rejected with 413 mid-stream.
+ * `PUT /blob/:hash` — put-if-absent, streamed to R2 while hashing it
+ * (`crypto.DigestStream`). An object already under the key IS the blob
+ * (content-addressability), so a re-upload never overwrites it — which also
+ * means a garbage upload can no longer destroy a referenced blob. On mismatch
+ * only the object THIS request wrote is deleted and the client gets 422.
+ * Oversize bodies are rejected with 413 mid-stream.
  */
 async function handleBlobPut(request: Request, env: Env, hash: string): Promise<Response> {
   if (!/^[0-9a-f]{64}$/.test(hash)) {
@@ -361,6 +384,12 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
   }
 
   const key = blobKey(hash);
+  const existing = await env.BUCKET.head(key);
+  if (existing !== null) {
+    await request.body.cancel().catch(() => {});
+    await roomPost(env, '/internal/blob-uploaded', { hash, size: existing.size });
+    return json(200, { ok: true, hash, size: existing.size });
+  }
   const [toR2, toHash] = request.body.tee();
   const digestStream = new crypto.DigestStream('SHA-256');
   let total = 0;
@@ -401,7 +430,9 @@ async function handleBlobPut(request: Request, env: Env, hash: string): Promise<
     return json(400, { error: 'failed to hash request body' });
   }
   if (digest !== hash) {
-    // Same hash ⇒ same content is the CAS contract; evict the impostor.
+    // Same hash ⇒ same content is the CAS contract; evict the impostor this
+    // request wrote (put-if-absent above guarantees a pre-existing object was
+    // never touched).
     await putPromise.catch(() => {});
     await env.BUCKET.delete(key);
     return json(422, { error: 'content does not hash to the claimed hash' });

@@ -90,6 +90,15 @@ describe('api call shapes', () => {
     expect(JSON.parse(String(init.body))).toEqual({ deviceName: 'Pixel', deviceType: 'mobile' });
   });
 
+  it('adminLogout posts to the logout route with an empty body', async () => {
+    const { calls } = stubFetch(() => jsonResponse(200, { ok: true }));
+    await api.adminLogout();
+    const [input, init] = calls[0]!;
+    expect(input).toBe('/admin/logout');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({});
+  });
+
   it('history URL-encodes the path query parameter', async () => {
     const { calls } = stubFetch(() => jsonResponse(200, { path: '/a b&c.md', head: null, versions: [] }));
     await api.history('/a b&c.md');

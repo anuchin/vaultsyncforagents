@@ -21,7 +21,13 @@ import {
   resetAll,
   setRoomTime,
 } from './helpers.js';
-import type { ChangeMessage, CommitAckMessage, ConflictMessage, ManifestMessage } from '@vsa/core';
+import type {
+  ChangeMessage,
+  ClientMessage,
+  CommitAckMessage,
+  ConflictMessage,
+  ManifestMessage,
+} from '@vsa/core';
 import { SERVER_VERSION } from '../src/version.js';
 
 interface TwoDevices {
@@ -441,5 +447,135 @@ describe('commit validation and edge kinds', () => {
       kind: 'edit',
     });
     expect(await commitReply).toMatchObject({ type: 'commitAck', version: 'v1' });
+  });
+});
+
+describe('server-side commit shape validation', () => {
+  async function rigSolo(): Promise<WsClient> {
+    const claimed = await claim({ passphrase: 'pppp', vaultName: 'personal', deviceName: 'Solo' });
+    const ws = await WsClient.connect();
+    await hello(ws, claimed.token);
+    return ws;
+  }
+
+  /** Send a possibly malformed commit; assert it bounces as PROTOCOL. */
+  async function expectRejected(ws: WsClient, commit: unknown): Promise<void> {
+    const reply = ws.next((m) => m.type === 'error');
+    ws.send(commit as ClientMessage);
+    expect(await reply).toMatchObject({ type: 'error', code: 'PROTOCOL' });
+  }
+
+  it('rejects traversal paths, host-absolute paths, and non-string paths', async () => {
+    const ws = await rigSolo();
+    await expectRejected(ws, {
+      type: 'commit',
+      path: '/../evil.md',
+      parentVersion: null,
+      hash: 'a'.repeat(64),
+      size: 1,
+      kind: 'edit',
+    });
+    await expectRejected(ws, {
+      type: 'commit',
+      path: 'C:\\vault\\a.md',
+      parentVersion: null,
+      hash: 'a'.repeat(64),
+      size: 1,
+      kind: 'edit',
+    });
+    await expectRejected(ws, {
+      type: 'commit',
+      path: 123,
+      parentVersion: null,
+      hash: 'a'.repeat(64),
+      size: 1,
+      kind: 'edit',
+    });
+    // Nothing durable landed; the socket stays alive and consistent.
+    const manifest = await manifestOf(ws);
+    expect(manifest.entries).toEqual({});
+    ws.close();
+  });
+
+  it('rejects paths (and rename fromPaths) over 1024 code units after normalization', async () => {
+    const ws = await rigSolo();
+    await expectRejected(ws, {
+      type: 'commit',
+      path: `/${'a'.repeat(1024)}`,
+      parentVersion: null,
+      hash: 'a'.repeat(64),
+      size: 1,
+      kind: 'edit',
+    });
+    await expectRejected(ws, {
+      type: 'commit',
+      path: '/fine.md',
+      parentVersion: null,
+      hash: 'a'.repeat(64),
+      size: 1,
+      kind: 'rename',
+      fromPath: `/${'b'.repeat(1024)}`,
+    });
+    // The exact boundary (1024 code units) is still accepted.
+    const bytes = enc('edge');
+    const ack = ws.next((m) => m.type === 'commitAck' || m.type === 'error');
+    ws.send({
+      type: 'commit',
+      path: `/${'a'.repeat(1020)}.md`,
+      parentVersion: null,
+      hash: await hashOf(bytes),
+      size: bytes.byteLength,
+      kind: 'edit',
+      inline: b64(bytes),
+    });
+    expect(await ack).toMatchObject({ type: 'commitAck' });
+    ws.close();
+  });
+
+  it('rejects hashes that are neither empty nor lowercase sha256 hex — on every kind', async () => {
+    const ws = await rigSolo();
+    await expectRejected(ws, {
+      type: 'commit',
+      path: '/a.md',
+      parentVersion: null,
+      hash: 'not-hex-at-all',
+      size: 1,
+      kind: 'edit',
+    });
+    await expectRejected(ws, {
+      type: 'commit',
+      path: '/a.md',
+      parentVersion: null,
+      hash: 'A'.repeat(64), // uppercase is not the wire form
+      size: 1,
+      kind: 'edit',
+    });
+    // Content-less kinds are validated too, not just inline claims.
+    await expectRejected(ws, {
+      type: 'commit',
+      path: '/a.md',
+      parentVersion: null,
+      hash: 'zzz',
+      size: 0,
+      kind: 'delete',
+    });
+    ws.close();
+  });
+
+  it('rejects sizes that are not non-negative integers within the blob cap', async () => {
+    const ws = await rigSolo();
+    for (const size of [-1, 1.5, 100 * 1024 * 1024 + 1]) {
+      await expectRejected(ws, {
+        type: 'commit',
+        path: '/a.md',
+        parentVersion: null,
+        hash: 'a'.repeat(64),
+        size,
+        kind: 'edit',
+      });
+    }
+    const manifest = await manifestOf(ws);
+    expect(manifest.entries).toEqual({});
+    ws.close();
   });
 });

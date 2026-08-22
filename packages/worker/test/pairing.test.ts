@@ -112,6 +112,34 @@ describe('pairing', () => {
     void claimed;
   });
 
+  it('revoking a device kills its LIVE socket (close 4003 revoked); other devices keep syncing', async () => {
+    const claimed = await claim({ passphrase: 'pppp', vaultName: 'v' });
+    const cookie = await adminLogin('pppp');
+    const code = await mintPairingCode(cookie, 'Doomed', 'desktop');
+    const { token, deviceId } = await pair(code, 'Doomed', 'desktop');
+
+    const wsDoomed = await WsClient.connect();
+    await hello(wsDoomed, token);
+    const wsAdmin = await WsClient.connect();
+    await hello(wsAdmin, claimed.token);
+
+    const revoke = await post('/admin/revoke', { deviceId }, { cookie });
+    expect(revoke.status).toBe(200);
+
+    // The revoked device learns why, then the socket dies with 4003 'revoked'.
+    const error = await wsDoomed.next((m) => m.type === 'error');
+    expect(error).toMatchObject({ type: 'error', code: 'REVOKED' });
+    await wsDoomed.waitClosed();
+    expect(wsDoomed.closeCode).toBe(4003);
+    expect(wsDoomed.closeReason).toBe('revoked');
+
+    // The admin's live socket is untouched and still answers.
+    const pong = wsAdmin.next((m) => m.type === 'pong');
+    wsAdmin.send({ type: 'ping' });
+    expect(await pong).toEqual({ type: 'pong' });
+    wsAdmin.close();
+  });
+
   it('WS hello with an unknown token is rejected and the socket closed', async () => {
     await claim({ passphrase: 'pppp', vaultName: 'v' });
     const ws = await WsClient.connect();

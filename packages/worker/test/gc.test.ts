@@ -7,6 +7,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src/index.js';
+import { blobKey } from '../src/room.js';
 import {
   WsClient,
   b64,
@@ -17,6 +18,7 @@ import {
   hello,
   put,
   resetAll,
+  roomInternal,
   roomSql,
 } from './helpers.js';
 
@@ -106,6 +108,60 @@ describe('scheduled GC', () => {
 
     expect((await get(`/blob/${hash}`, { authorization: `Bearer ${claimed.token}` })).status).toBe(200);
     expect(await blobRows()).toContainEqual({ hash, refcount: 0 });
+  });
+});
+
+describe('GC survivor semantics (listing -> purge TOCTOU)', () => {
+  it('a commit that re-references a listed orphan between listing and purge keeps its R2 object', async () => {
+    const claimed = await claim();
+    const auth = { authorization: `Bearer ${claimed.token}` };
+
+    const survivorBytes = enc('re-referenced mid-GC');
+    const survivorHash = await hashOf(survivorBytes);
+    const orphanBytes = enc('truly abandoned');
+    const orphanHash = await hashOf(orphanBytes);
+    expect((await put(`/blob/${survivorHash}`, survivorBytes, auth)).status).toBe(201);
+    expect((await put(`/blob/${orphanHash}`, orphanBytes, auth)).status).toBe(201);
+    await roomSql(
+      `UPDATE blobs SET first_seen_at = 1 WHERE hash IN ('${survivorHash}', '${orphanHash}')`,
+    );
+
+    // The cron's listing step: both look like aged orphans.
+    const list = await roomInternal('/internal/gc');
+    const orphans = ((await list.json()) as { orphans: string[] }).orphans.slice().sort();
+    expect(orphans).toEqual([orphanHash, survivorHash].sort());
+
+    // A commit lands between listing and purge and re-references one of them.
+    const ws = await WsClient.connect();
+    await hello(ws, claimed.token);
+    const ack = ws.next((m) => m.type === 'commitAck' || m.type === 'error');
+    ws.send({
+      type: 'commit',
+      path: '/notes/survivor.md',
+      parentVersion: null,
+      hash: survivorHash,
+      size: survivorBytes.byteLength,
+      kind: 'edit',
+    });
+    expect(await ack).toMatchObject({ type: 'commitAck' });
+    ws.close();
+
+    // The purge step re-checks refcounts inside the DO's queue and confirms
+    // only the STILL-orphaned hash; R2 deletion follows the confirmed list.
+    const purge = await roomInternal('/internal/gc-purge', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hashes: [orphanHash, survivorHash] }),
+    });
+    expect(((await purge.json()) as { purged: string[] }).purged).toEqual([orphanHash]);
+    await env.BUCKET.delete(blobKey(orphanHash));
+
+    expect((await get(`/blob/${survivorHash}`, auth)).status).toBe(200);
+    expect(new Uint8Array(await (await get(`/blob/${survivorHash}`, auth)).arrayBuffer())).toEqual(
+      survivorBytes,
+    );
+    expect((await get(`/blob/${orphanHash}`, auth)).status).toBe(404);
+    expect(await blobRows()).toContainEqual({ hash: survivorHash, refcount: 1 });
   });
 });
 

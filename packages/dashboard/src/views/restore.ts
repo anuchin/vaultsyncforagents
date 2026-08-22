@@ -43,7 +43,7 @@ export function restoreView(ctx: ViewContext): ViewHandle {
         { class: 'page-nav' },
         quietButton('Dashboard', () => ctx.dispatch({ type: 'navigate', view: 'status' })),
         quietButton('Restore', () => ctx.dispatch({ type: 'navigate', view: 'restore' }), { 'data-active': true }),
-        quietButton('Sign out', () => ctx.dispatch({ type: 'logged-out' })),
+        quietButton('Sign out', () => void signOut()),
       ),
     ),
     h(
@@ -73,6 +73,17 @@ export function restoreView(ctx: ViewContext): ViewHandle {
       tableWrap,
     ),
   );
+
+  async function signOut(): Promise<void> {
+    // Best effort: clear the cookie server-side, then leave regardless — an
+    // unreachable server must not trap the admin in an authenticated view.
+    try {
+      await api.adminLogout();
+    } catch {
+      // the cookie dies on its own 12 h TTL (or the next login)
+    }
+    ctx.dispatch({ type: 'logged-out' });
+  }
 
   async function loadHistory(): Promise<void> {
     errorLine.textContent = '';

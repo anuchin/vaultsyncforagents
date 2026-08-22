@@ -27,6 +27,7 @@ import {
   base64ToBytes,
   bytesToBase64,
   INLINE_CONTENT_MAX_BYTES,
+  normalizeVaultPath,
   parseMessage,
   planSnapshotRestore,
   ProtocolVersion,
@@ -62,6 +63,8 @@ const ONLINE_WINDOW_MS = 2 * 60 * 1000;
 export const GC_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 /** Blob size cap on the WS channel (the HTTP route enforces its own cap). */
 const WS_BLOB_MAX_BYTES = 100 * 1024 * 1024;
+/** Commit path cap, in UTF-16 code units, after normalization. */
+const COMMIT_PATH_MAX_LENGTH = 1024;
 
 /**
  * Per-IP throttle on the unauthenticated guessing surfaces — `POST /pair`
@@ -473,11 +476,18 @@ export class VaultRoom extends DurableObject<Env> {
     const deviceId = attachment.deviceId as string;
     const now = this.now();
 
-    // 1. Validate the content claim (mirrors InMemorySyncServer exactly).
+    // 1. Validate the commit's shape before anything durable happens.
+    const violation = this.commitShapeViolation(message);
+    if (violation !== null) {
+      this.failWs(ws, 'PROTOCOL', violation);
+      return;
+    }
+
+    // 2. Validate the content claim (mirrors InMemorySyncServer exactly).
     const inlineBytes = await this.verifyCommitContent(ws, message);
     if (inlineBytes === null) return; // error already sent
 
-    // 2. Arbitrate with the shared core brain.
+    // 3. Arbitrate with the shared core brain.
     const state = this.loadArbitrationState();
     const devices = new Map<string, string>(
       this.sql('SELECT id, name FROM devices').toArray().map((r) => [r.id as string, r.name as string]),
@@ -504,10 +514,10 @@ export class VaultRoom extends DurableObject<Env> {
       return;
     }
 
-    // 3. Persist metadata: new versions, changed files rows.
+    // 4. Persist metadata: new versions, changed files rows.
     this.persistVerdict(state, verdict.state);
 
-    // 4. Content: inline bytes go to R2; every newly referenced hash gains a
+    // 5. Content: inline bytes go to R2; every newly referenced hash gains a
     //    refcount (orphan uploads sit at refcount 0; GC handles them).
     if (inlineBytes !== undefined) {
       await this.env.BUCKET.put(blobKey(message.hash), inlineBytes);
@@ -518,7 +528,7 @@ export class VaultRoom extends DurableObject<Env> {
       }
     }
 
-    // 5. Record change events + reply + fan-out (in-memory server semantics:
+    // 6. Record change events + reply + fan-out (in-memory server semantics:
     //    conflict-copy events go to ALL sockets, including the committer).
     const outcome = verdict.outcome;
     const headChanged = outcome.result === 'applied' || outcome.winner.deviceId === deviceId;
@@ -543,6 +553,40 @@ export class VaultRoom extends DurableObject<Env> {
     }
     if (primary !== undefined) this.broadcastOthers(ws, primary);
     if (copy !== undefined) this.broadcastAll(copy);
+  }
+
+  /**
+   * Validate a commit's shape before anything durable touches it: paths must
+   * normalize as vault paths and fit in 1024 code units, hash must be empty
+   * or lowercase sha256 hex, and size (when present) an integer within the
+   * blob cap. Returns the first violation's message, or `null` if well-formed.
+   */
+  private commitShapeViolation(message: CommitMessage): string | null {
+    try {
+      if (normalizeVaultPath(message.path).length > COMMIT_PATH_MAX_LENGTH) {
+        return `commit path exceeds ${COMMIT_PATH_MAX_LENGTH} UTF-16 code units`;
+      }
+      if (
+        message.fromPath !== undefined &&
+        normalizeVaultPath(message.fromPath).length > COMMIT_PATH_MAX_LENGTH
+      ) {
+        return `commit fromPath exceeds ${COMMIT_PATH_MAX_LENGTH} UTF-16 code units`;
+      }
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    const hash: unknown = message.hash;
+    if (hash !== undefined && hash !== '' && !/^[0-9a-f]{64}$/.test(hash as string)) {
+      return 'commit hash must be empty or lowercase sha256 hex';
+    }
+    const size: unknown = message.size;
+    if (
+      size !== undefined &&
+      (typeof size !== 'number' || !Number.isInteger(size) || size < 0 || size > WS_BLOB_MAX_BYTES)
+    ) {
+      return `commit size must be an integer between 0 and ${WS_BLOB_MAX_BYTES}`;
+    }
+    return null;
   }
 
   /**
@@ -947,6 +991,18 @@ export class VaultRoom extends DurableObject<Env> {
     if (rows.length === 0) return json(404, { error: 'unknown device' });
     this.sql('UPDATE devices SET revoked = 1 WHERE id = ?', body.deviceId);
     this.appendEvent(this.now(), body.deviceId, 'device_revoked', body.deviceId, null);
+    // Revocation kills the device's live sockets too — otherwise an already
+    // connected client keeps full access. Close code 4003 distinguishes it
+    // from transport failures (clients re-hello and fail with REVOKED).
+    for (const ws of this.ctx.getWebSockets()) {
+      if (this.readAttachment(ws).deviceId !== body.deviceId) continue;
+      this.safeSend(ws, { type: 'error', code: 'REVOKED', message: 'device was revoked' });
+      try {
+        ws.close(4003, 'revoked');
+      } catch {
+        // already closed
+      }
+    }
     return json(200, { ok: true });
   }
 
@@ -1178,18 +1234,28 @@ export class VaultRoom extends DurableObject<Env> {
     return json(200, { orphans: rows.map((r) => r.hash as string) });
   }
 
+  /**
+   * Drop the bookkeeping rows for GC-listed hashes — but only those whose
+   * refcount is STILL 0 when the purge runs (inside `runExclusive`, so no
+   * commit can interleave with the re-check). The caller deletes R2 content
+   * for the confirmed `purged` list only: a commit that re-referenced a
+   * listed orphan between listing and purge keeps both its row and its blob.
+   */
   private async httpGcPurge(request: Request): Promise<Response> {
     const body = (await request.json().catch(() => null)) as { hashes?: unknown } | null;
     if (body === null || !Array.isArray(body.hashes)) {
       return json(400, { error: 'hashes array is required' });
     }
+    const purged: string[] = [];
     for (const hash of body.hashes) {
-      if (typeof hash === 'string') {
-        // The refcount guard means a concurrent commit's refcount bump wins.
-        this.sql('DELETE FROM blobs WHERE hash = ? AND refcount = 0', hash);
+      if (typeof hash !== 'string') continue;
+      const row = this.sql('SELECT refcount FROM blobs WHERE hash = ?', hash).toArray()[0];
+      if (row !== undefined && (row.refcount as number) === 0) {
+        this.sql('DELETE FROM blobs WHERE hash = ?', hash);
+        purged.push(hash);
       }
     }
-    return json(200, { ok: true, purged: body.hashes.length });
+    return json(200, { ok: true, purged });
   }
 
   /** Cron-driven events pruning (§6); the opportunistic path covers the gaps. */

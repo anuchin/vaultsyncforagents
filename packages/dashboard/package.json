@@ -1,9 +1,9 @@
 {
   "name": "@vsa/dashboard",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "private": true,
   "description": "VaultSync for Agents admin dashboard SPA (claim + status), built to dist/ and served by the worker's static assets binding",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",

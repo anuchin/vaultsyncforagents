@@ -124,6 +124,12 @@ export function callRoom<T>(callback: (instance: never, state: DurableObjectStat
   return inRoom<T>(callback);
 }
 
+/** Fetch the room DO's internal surface directly (GC step driving, seeding). */
+export function roomInternal(path: string, init?: RequestInit): Promise<Response> {
+  const stub = env.ROOM.get(env.ROOM.idFromName('vault'));
+  return stub.fetch(`https://room${path}`, init);
+}
+
 /** Pin (or release, with `null`) the DO's clock — the room.ts time seam. */
 export function setRoomTime(ms: number | null): Promise<void> {
   return inRoom((instance) => {
@@ -179,6 +185,9 @@ export class WsClient {
   }> = [];
   private readonly closeWaiters: Array<() => void> = [];
   closed = false;
+  /** Close frame payload once the server closes the socket (`null` until then). */
+  closeCode: number | null = null;
+  closeReason = '';
 
   private constructor(ws: WebSocket) {
     this.ws = ws;
@@ -195,8 +204,10 @@ export class WsClient {
         this.buffer.push(message);
       }
     });
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (event) => {
       this.closed = true;
+      this.closeCode = event.code;
+      this.closeReason = event.reason;
       for (const notify of this.closeWaiters.splice(0)) notify();
     });
   }
