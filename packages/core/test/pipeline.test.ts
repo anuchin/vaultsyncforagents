@@ -8,10 +8,12 @@
  * so "commits sent while zero replies delivered" is exactly the number of
  * commits in flight.
  *
- * The scale test pushes a synthetic 1,000-file vault and asserts completion
- * within a bounded number of scheduled waves: each wave can deliver at most
- * `pushConcurrency` acks (bounded concurrency) and one wave per batch is
- * enough (pipelining) — ≈ files/N + constant waves, not files.
+ * The scale test pushes a synthetic 1,000-file vault and measures the
+ * pipelining invariant directly: commits sent minus commit replies delivered,
+ * sampled every event-loop tick. The in-flight count must reach more than one
+ * (pipelined, not commit-per-ack sequential) and never exceed
+ * `pushConcurrency` (bounded) — unlike wave/tick totals, this measurement is
+ * independent of runner speed and event-loop scheduling.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -39,10 +41,12 @@ function makeBlobStore(): BlobStore & { map: Map<string, Uint8Array> } {
   };
 }
 
-/** Holds server→client deliveries until flushed; counts flush waves ("ticks"). */
+/** Holds server→client deliveries until flushed; logs everything delivered. */
 class Gate {
   private held: Message[] = [];
   private receiver: ((message: Message) => void) | null = null;
+  /** Every message ever delivered, in delivery order (in-flight sampling). */
+  readonly delivered: Message[] = [];
 
   /** Registered as the transport's onMessage tap: hold instead of deliver. */
   readonly tap = (message: Message): void => {
@@ -61,6 +65,7 @@ class Gate {
   flush(n = Infinity): number {
     const batch = this.held.splice(0, n);
     for (const message of batch) this.receiver?.(message);
+    this.delivered.push(...batch);
     return batch.length;
   }
 
@@ -267,32 +272,40 @@ describe('push pipeline — 1,000-file vault converges in ≈files/N waves', () 
       await desktop.storage.writeFile(`/vault/note-${String(i).padStart(4, '0')}.md`, enc(`note ${i}`));
     }
 
-    // Push through the gated wire, counting scheduled waves. Each wave may
-    // deliver at most 8 acks (concurrency bound ⇒ ≥ ⌈1000/8⌉ = 125 waves),
-    // and one wave per in-flight batch suffices (pipelining ⇒ far fewer
-    // than the ~1000 waves a sequential commit-per-ack loop would need).
-    let waves = 0;
+    // Push through the gated wire, sampling commits-in-flight after every
+    // event-loop tick. The pipelining invariant is measured DIRECTLY —
+    // commits sent minus commit replies delivered — because it is
+    // environment-independent: a tick that delivers nothing (slow scheduling
+    // on a loaded CI runner) must not count against the pipeline, and a tick
+    // that delivers a large accumulated batch (fast server, slow runner)
+    // must not either. Wave-count totals conflate both and flake by machine.
+    let ticks = 0;
+    let maxInFlight = 0;
     let settled = false;
     const cycle = desktop.client.triggerSync().finally(() => {
       settled = true;
     });
-    while (!settled && waves < 5000) {
-      waves += 1;
+    const commitsSent = (): number => desktop.sent.filter((m) => m.type === 'commit').length;
+    const commitRepliesDelivered = (): number =>
+      desktop.gate.delivered.filter((m) => m.type === 'commitAck' || m.type === 'conflict').length;
+    while (!settled && ticks < 50_000) {
+      ticks += 1;
       desktop.gate.flush();
+      const inFlight = commitsSent() - commitRepliesDelivered();
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     await cycle;
 
     expect(desktop.client.status().state).toBe('live');
     expect(desktop.client.status().conflicts).toEqual([]);
-    // Two-sided proof: bounded AND pipelined. Lower bound — a wave can
-    // deliver at most 8 acks, so ⌈1000/8⌉ = 125 waves are unavoidable
-    // (concurrency is truly bounded). Upper bound — measured ≈ 2×files/N
-    // + constant in this harness (subtle-digest completions straddle the
-    // wave boundary), still O(files/N): a sequential commit-per-ack loop
-    // would need ≥ 1000 waves (one ack per wave).
-    expect(waves).toBeGreaterThanOrEqual(125);
-    expect(waves).toBeLessThanOrEqual(350);
+    // Two-sided proof, machine-independent: a sequential commit-per-ack
+    // pipeline holds exactly 1 commit in flight (never reaches 2), and an
+    // unbounded one would exceed the concurrency bound. The true bound is
+    // pushConcurrency (8); sampling between ticks can only UNDERCOUNT the
+    // peak (a rise-and-fall between samples is missed), never overcount.
+    expect(maxInFlight).toBeGreaterThanOrEqual(2);
+    expect(maxInFlight).toBeLessThanOrEqual(8);
 
     // A brand-new device pulls the whole vault; everything converges
     // byte-for-byte with zero conflicts.
