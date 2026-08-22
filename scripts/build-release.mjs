@@ -24,15 +24,42 @@
  * Dependencies: none beyond the monorepo's existing devDependencies — esbuild
  * is a direct devDependency of @vsa/plugin (^0.28.1), hoisted to the root
  * node_modules by npm workspaces, so this script resolves it without adding
- * anything new. Zipping uses platform tools only: Windows' bsdtar
- * (%SystemRoot%\System32\tar.exe, real zip via `-a` + .zip extension), any
- * bsdtar on PATH, `zip`, or PowerShell Compress-Archive as a last resort.
+ * anything new. Zipping is a small in-script deterministic writer (node:zlib
+ * deflate + CRC-32): fixed 1980-01-01 DOS timestamps, entries sorted by
+ * path, no extra fields — identical inputs produce a byte-identical zip (and
+ * sha256) on every machine and in CI, so the CLI's PINNED_BUNDLE_SHA256 is
+ * stable regardless of where the release was built.
  */
-import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deflateRawSync } from 'node:zlib';
 import esbuild from 'esbuild';
+
+// --- deterministic zip checksum/timestamp primitives ----------------------------------------
+
+// Pinned inputs of the zip writer at the bottom of this file: every entry
+// (local header AND central directory) carries the constant DOS date/time
+// 1980-01-01 00:00 — the DOS epoch, the earliest encodable moment, never a
+// real mtime — and the checksum is a table-driven CRC-32 (IEEE 802.3,
+// reflected, poly 0xEDB88320). Defined up here so the top-level build steps
+// below can already call into the writer.
+const DOS_TIME = 0x0000; // 00:00:00 (two-second granularity → 0)
+const DOS_DATE = 0x0021; // 1980-01-01: (1980-1980)<<9 | 1<<5 | 1
+
+const CRC_TABLE = new Int32Array(256);
+for (let n = 0; n < 256; n += 1) {
+  let c = n;
+  for (let k = 0; k < 8; k += 1) c = c & 1 !== 0 ? (0xedb88320 ^ (c >>> 1)) >>> 0 : c >>> 1;
+  CRC_TABLE[n] = c;
+}
+
+function crc32(bytes) {
+  let crc = -1;
+  for (const byte of bytes) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ -1) >>> 0;
+}
+
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workerEntry = path.join(rootDir, 'packages', 'worker', 'src', 'index.ts');
@@ -150,11 +177,11 @@ cpSync(dashboardDist, path.join(stagingDir, 'dashboard'), { recursive: true });
 // --- 3. zip (top-level layout: worker.js + dashboard/) --------------------------------------
 
 rmSync(zipPath, { force: true });
-await createZip();
+createZip();
 
 // --- verify the archive layout --------------------------------------------------------------
 
-const entries = (await listZipEntries()).map((name) => name.replaceAll('\\', '/'));
+const entries = listZipEntries().map((name) => name.replaceAll('\\', '/'));
 const files = entries.filter((name) => !name.endsWith('/'));
 const problems = [];
 if (!files.includes('worker.js')) problems.push('missing top-level worker.js');
@@ -176,103 +203,118 @@ console.log(`worker-bundle.zip ready: ${zipPath} (${(size / 1024).toFixed(1)} Ki
 console.log('layout:');
 for (const name of files.sort()) console.log(`  ${name}`);
 
-// --- zip helpers -----------------------------------------------------------------------------
+// --- zip writer ------------------------------------------------------------------------------
 
 /**
- * Create the zip with `stagingDir` as the archive root so entries land at the
- * top level. Strategy order:
- *   1. Windows bsdtar at %SystemRoot%\System32\tar.exe (`-a` + .zip extension
- *      makes a real zip; ships with Windows 10+),
- *   2. any bsdtar on PATH (macOS default tar),
- *   3. Info-ZIP `zip` (preinstalled on ubuntu runners),
- *   4. PowerShell Compress-Archive (Windows fallback; note PS 5.1 writes
- *      backslash separators some Linux unzip versions mangle — hence last).
+ * Deterministic zip writer: every value a conventional archiver takes from
+ * the environment is pinned instead, so the output is a pure function of the
+ * staged inputs —
+ *
+ *   - timestamps: the constant DOS epoch 1980-01-01 00:00 (DOS_TIME/DOS_DATE
+ *     above) in local headers AND the central directory,
+ *   - order: entries sorted by archive path (readdir order varies by
+ *     filesystem),
+ *   - metadata: no extra fields, no data descriptors (sizes/CRC are written
+ *     up-front from the buffered entry), neutral DOS version/attributes (no
+ *     host permissions), and the UTF-8 name flag (bit 11) only for non-ASCII
+ *     names — the bundle's names are ASCII, so it is never set.
+ *
+ * The whole archive is buffered in memory (the bundle is a few hundred KiB)
+ * and written with a single writeFileSync.
  */
-async function createZip() {
-  const relEntries = ['worker.js', 'dashboard'];
-  const systemTar = process.platform === 'win32' && existsSync(`${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\tar.exe`)
-    ? `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\tar.exe`
-    : null;
-  const attempts = [
-    systemTar && {
-      label: 'bsdtar (System32)',
-      cmd: systemTar,
-      args: ['-a', '-cf', zipPath, '-C', stagingDir, ...relEntries],
-    },
-    (await tarIsBsdtar('tar')) && {
-      label: 'bsdtar (PATH)',
-      cmd: 'tar',
-      args: ['-a', '-cf', zipPath, '-C', stagingDir, ...relEntries],
-    },
-    (await haveCommand('zip')) && {
-      label: 'zip',
-      cmd: 'zip',
-      args: ['-r', '-q', zipPath, ...relEntries],
-      cwd: stagingDir,
-    },
-    process.platform === 'win32' && {
-      label: 'PowerShell Compress-Archive',
-      cmd: 'powershell.exe',
-      args: [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `Compress-Archive -Path @('worker.js','dashboard') -DestinationPath '${zipPath.replaceAll("'", "''")}' -Force`,
-      ],
-      cwd: stagingDir,
-    },
-  ].filter(Boolean);
-
-  for (const attempt of attempts) {
-    const result = spawnSync(attempt.cmd, attempt.args, {
-      cwd: attempt.cwd ?? rootDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    if (result.status === 0) {
-      console.log(`zipped via ${attempt.label}`);
-      return;
-    }
-    console.warn(
-      `${attempt.label} failed (exit ${result.status}):\n${result.stderr || result.stdout || '(no output)'}`,
-    );
+function createZip() {
+  const staged = readdirSync(stagingDir, { recursive: true, withFileTypes: true })
+    .filter((dirent) => dirent.isFile())
+    .map((dirent) => path.relative(stagingDir, path.join(dirent.parentPath, dirent.name)).replaceAll('\\', '/'))
+    .sort();
+  if (staged.length > 0xffff) {
+    console.error('error: zip cannot hold more than 65535 entries');
+    process.exit(1);
   }
-  console.error('error: no usable zip tool (bsdtar / zip / PowerShell Compress-Archive all failed)');
-  process.exit(1);
-}
 
-/** Entry names inside the zip, via bsdtar -tf or unzip -Z1 (whichever exists). */
-async function listZipEntries() {
-  const listers = [];
-  const systemTar = process.platform === 'win32' && existsSync(`${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\tar.exe`)
-    ? `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\tar.exe`
-    : null;
-  if (systemTar) listers.push({ cmd: systemTar, args: ['-tf', zipPath] });
-  if (await tarIsBsdtar('tar')) listers.push({ cmd: 'tar', args: ['-tf', zipPath] });
-  if (await haveCommand('unzip')) listers.push({ cmd: 'unzip', args: ['-Z1', zipPath] });
-  for (const lister of listers) {
-    const result = spawnSync(lister.cmd, lister.args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    if (result.status === 0) {
-      return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '');
-    }
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for (const name of staged) {
+    const data = readFileSync(path.join(stagingDir, ...name.split('/')));
+    const nameBytes = Buffer.from(name, 'utf8');
+    const flags = /[\u0080-\uffff]/.test(name) ? 0x0800 : 0; // bit 11: UTF-8 name
+    const crc = crc32(data);
+    const packed = deflateRawSync(data, { level: 9 });
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); // local file header signature
+    local.writeUInt16LE(20, 4); // version needed to extract (2.0 — deflate)
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(8, 8); // method: deflate
+    local.writeUInt16LE(DOS_TIME, 10);
+    local.writeUInt16LE(DOS_DATE, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(packed.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt16LE(0, 28); // extra field length
+    localParts.push(local, nameBytes, packed);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); // central directory header signature
+    central.writeUInt16LE(0x0014, 4); // version made by (2.0, MS-DOS — neutral)
+    central.writeUInt16LE(20, 6); // version needed to extract
+    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(8, 10); // method: deflate
+    central.writeUInt16LE(DOS_TIME, 12);
+    central.writeUInt16LE(DOS_DATE, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(packed.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt16LE(0, 30); // extra field length
+    central.writeUInt16LE(0, 32); // file comment length
+    central.writeUInt16LE(0, 34); // disk number start
+    central.writeUInt16LE(0, 36); // internal file attributes
+    central.writeUInt32LE(0, 38); // external file attributes (no host perms)
+    central.writeUInt32LE(offset, 42); // local header offset
+    centralParts.push(central, nameBytes);
+
+    offset += local.length + nameBytes.length + packed.length;
   }
-  console.error('error: could not list worker-bundle.zip contents to verify the layout');
-  process.exit(1);
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // end of central directory signature
+  eocd.writeUInt16LE(0, 4); // this disk
+  eocd.writeUInt16LE(0, 6); // disk with the central directory
+  eocd.writeUInt16LE(staged.length, 8);
+  eocd.writeUInt16LE(staged.length, 10);
+  eocd.writeUInt32LE(centralDirectory.length, 12);
+  eocd.writeUInt32LE(offset, 16); // central directory offset
+  eocd.writeUInt16LE(0, 20); // comment length
+
+  writeFileSync(zipPath, Buffer.concat([...localParts, centralDirectory, eocd]));
+  console.log(`zipped ${staged.length} files (deterministic zip writer)`);
 }
 
-/** True iff `tar --version` reports bsdtar (GNU tar cannot write zips). */
-async function tarIsBsdtar(cmd) {
-  const result = spawnSync(cmd, ['--version'], { encoding: 'utf8', windowsHide: true });
-  return result.status === 0 && /bsdtar/i.test(result.stdout);
-}
-
-/** True iff `cmd` resolves (spawn failure — e.g. ENOENT — means absent). */
-async function haveCommand(cmd) {
-  const probe = spawnSync(cmd, ['--version'], { encoding: 'utf8', windowsHide: true });
-  return probe.error === undefined;
+/**
+ * Entry names inside the zip, parsed from the central directory in Node —
+ * the layout check below needs no platform zip tool either.
+ */
+function listZipEntries() {
+  const zip = readFileSync(zipPath);
+  const eocd = zip.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (eocd < 0) {
+    console.error('error: worker-bundle.zip has no end-of-central-directory record');
+    process.exit(1);
+  }
+  const names = [];
+  let pos = zip.readUInt32LE(eocd + 16);
+  for (let i = 0, count = zip.readUInt16LE(eocd + 10); i < count; i += 1) {
+    if (zip.readUInt32LE(pos) !== 0x02014b50) {
+      console.error('error: worker-bundle.zip central directory is corrupt');
+      process.exit(1);
+    }
+    const nameLength = zip.readUInt16LE(pos + 28);
+    names.push(zip.subarray(pos + 46, pos + 46 + nameLength).toString('utf8'));
+    pos += 46 + nameLength + zip.readUInt16LE(pos + 30) + zip.readUInt16LE(pos + 32);
+  }
+  return names;
 }

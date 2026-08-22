@@ -36,7 +36,7 @@ export const PINNED_RELEASE = 'v0.1.3';
  * path then falls back to the release's `.sha256` sidecar (uploaded by
  * release.yml) and finally warns when neither is available (older releases).
  */
-export const PINNED_BUNDLE_SHA256 = '';
+export const PINNED_BUNDLE_SHA256 = '421191e2a401b80a3e3ce537d83646b7ed48c127d86c1c00a2f9498a76e5f9ac';
 
 /**
  * GitHub release artifact convention: the tag ships `worker-bundle.zip`
