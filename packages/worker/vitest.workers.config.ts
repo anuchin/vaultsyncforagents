@@ -22,6 +22,12 @@ import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
 export default defineWorkersConfig({
   test: {
     include: ['test/**/*.test.ts'],
+    // Generous per-test budget: the auth tests run real argon2 derivations
+    // (19 MiB each — the throttling suites alone do 10+), and on slow
+    // single-core machines a single login/verification can take seconds,
+    // blowing the 5 s default long before any logic is wrong.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
     poolOptions: {
       workers: {
         main: 'src/index.ts',
