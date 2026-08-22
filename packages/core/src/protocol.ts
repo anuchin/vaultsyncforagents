@@ -396,6 +396,157 @@ export function parseMessage(data: string): Message {
   return parsed;
 }
 
+// --- server-data field validation ---------------------------------------------
+//
+// `isMessage` triages the `type` discriminant only; these validators check
+// the FIELDS of the server payloads a client folds into its persisted local
+// index (manifest entries, commit/conflict replies, change broadcasts). One
+// malformed field — a missing version id, a non-numeric size, a fractional
+// clock counter — would otherwise be persisted to the state file and then
+// REJECTED by `deserializeLocalState` on every subsequent startup. Clients
+// validate at the ingest boundary, before any field is applied: violations
+// throw `ProtocolError`, the offending message is rejected, nothing persists.
+
+const VERSION_KINDS: ReadonlySet<string> = new Set([
+  'edit',
+  'rename',
+  'delete',
+  'conflictCopy',
+  'restore',
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function expectNonEmptyString(value: unknown, where: string): void {
+  if (typeof value !== 'string' || value === '') {
+    throw new ProtocolError(`${where} must be a non-empty string`);
+  }
+}
+
+function expectNonNegativeInteger(value: unknown, where: string): void {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new ProtocolError(`${where} must be a non-negative integer`);
+  }
+}
+
+function expectClock(value: unknown, where: string): void {
+  if (
+    !isPlainObject(value) ||
+    typeof value.counter !== 'number' ||
+    !Number.isInteger(value.counter) ||
+    value.counter <= 0 ||
+    typeof value.deviceId !== 'string'
+  ) {
+    throw new ProtocolError(
+      `${where} must be a clock { counter: positive integer, deviceId: string }`,
+    );
+  }
+}
+
+/**
+ * Validate one manifest entry's fields. Returns the entry unchanged; throws
+ * `ProtocolError` on a field that could not survive a persist/reload cycle
+ * (`localindex.ts` re-validates strictly on load).
+ */
+export function validateManifestEntry(entry: unknown): ManifestEntry {
+  if (!isPlainObject(entry)) {
+    throw new ProtocolError('Malformed server data: manifest entry is not an object');
+  }
+  const where = `manifest entry ${JSON.stringify(entry.path)}`;
+  expectNonEmptyString(entry.path, `${where}: path`);
+  expectNonEmptyString(entry.version, `${where}: version`);
+  if (typeof entry.hash !== 'string') {
+    throw new ProtocolError(`${where}: hash must be a string`);
+  }
+  expectNonNegativeInteger(entry.size, `${where}: size`);
+  if (typeof entry.deleted !== 'boolean') {
+    throw new ProtocolError(`${where}: deleted must be a boolean`);
+  }
+  expectClock(entry.clock, `${where}: clock`);
+  if (entry.isFolder !== undefined && typeof entry.isFolder !== 'boolean') {
+    throw new ProtocolError(`${where}: isFolder must be a boolean when present`);
+  }
+  if (entry.mtime !== undefined && (typeof entry.mtime !== 'number' || !Number.isFinite(entry.mtime))) {
+    throw new ProtocolError(`${where}: mtime must be a finite number when present`);
+  }
+  return entry as unknown as ManifestEntry;
+}
+
+/** Validate a `manifest` reply (cursor + every entry) before it is projected. */
+export function validateManifestMessage(message: ManifestMessage): void {
+  expectNonNegativeInteger(message.cursor, 'manifest cursor');
+  for (const entry of Object.values(message.entries)) {
+    validateManifestEntry(entry);
+  }
+}
+
+/** Validate a `commitAck` before its version/clock are folded into the index. */
+export function validateCommitAckMessage(message: CommitAckMessage): void {
+  expectNonEmptyString(message.version, 'commitAck.version');
+  expectClock(message.clock, 'commitAck.clock');
+  expectNonNegativeInteger(message.seq, 'commitAck.seq');
+}
+
+/** Validate a `change` broadcast before it is applied or replayed. */
+export function validateChangeMessage(change: ChangeMessage): void {
+  const where = `change ${JSON.stringify(change.path)}`;
+  expectNonEmptyString(change.path, `${where}: path`);
+  expectNonEmptyString(change.version, `${where}: version`);
+  if (typeof change.hash !== 'string') {
+    throw new ProtocolError(`${where}: hash must be a string`);
+  }
+  expectNonNegativeInteger(change.size, `${where}: size`);
+  if (typeof change.deleted !== 'boolean') {
+    throw new ProtocolError(`${where}: deleted must be a boolean`);
+  }
+  if (typeof change.device !== 'string') {
+    throw new ProtocolError(`${where}: device must be a string`);
+  }
+  expectClock(change.clock, `${where}: clock`);
+  if (!VERSION_KINDS.has(change.kind)) {
+    throw new ProtocolError(`${where}: kind must be a VersionKind`);
+  }
+  if (change.fromPath !== undefined && typeof change.fromPath !== 'string') {
+    throw new ProtocolError(`${where}: fromPath must be a string when present`);
+  }
+  if (change.isFolder !== undefined && typeof change.isFolder !== 'boolean') {
+    throw new ProtocolError(`${where}: isFolder must be a boolean when present`);
+  }
+  expectNonNegativeInteger(change.seq, `${where}: seq`);
+}
+
+/** Validate a `conflict` reply's winner before it is materialized or recorded. */
+export function validateConflictMessage(message: ConflictMessage): void {
+  const winner = message.winner as {
+    path?: unknown;
+    id?: unknown;
+    hash?: unknown;
+    size?: unknown;
+    deviceId?: unknown;
+    clock?: unknown;
+    kind?: unknown;
+  };
+  const where = `conflict winner ${JSON.stringify(winner.path)}`;
+  expectNonEmptyString(winner.path, `${where}: path`);
+  expectNonEmptyString(winner.id, `${where}: id`);
+  if (typeof winner.hash !== 'string') {
+    throw new ProtocolError(`${where}: hash must be a string`);
+  }
+  expectNonNegativeInteger(winner.size, `${where}: size`);
+  if (typeof winner.deviceId !== 'string') {
+    throw new ProtocolError(`${where}: deviceId must be a string`);
+  }
+  expectClock(winner.clock, `${where}: clock`);
+  if (typeof winner.kind !== 'string' || !VERSION_KINDS.has(winner.kind)) {
+    throw new ProtocolError(`${where}: kind must be a VersionKind`);
+  }
+  if (message.seq !== undefined) {
+    expectNonNegativeInteger(message.seq, 'conflict.seq');
+  }
+}
+
 // --- wire encoding ------------------------------------------------------------
 //
 // `inline`/`content` fields carry raw bytes as base64. `btoa`/`atob` exist in

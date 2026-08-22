@@ -41,11 +41,16 @@ import {
   type LocalIndex,
   type PersistedSyncState,
 } from './localindex.js';
+import { isWindowsUnsafePath } from './paths.js';
 import {
   base64ToBytes,
   bytesToBase64,
   INLINE_CONTENT_MAX_BYTES,
   ProtocolVersion,
+  validateChangeMessage,
+  validateCommitAckMessage,
+  validateConflictMessage,
+  validateManifestMessage,
   type BlobAckMessage,
   type BlobMessage,
   type ChangeMessage,
@@ -150,6 +155,16 @@ export interface SyncClientStatus {
    */
   caseCollisions?: string[];
   /**
+   * Paths the most recent cycle SKIPPED because their names cannot be
+   * materialized on Windows (reserved device names like `CON`/`NUL`/`COM1`,
+   * or segments ending in `.`/` ` — see `paths.ts`). Local files with such
+   * names are never pushed and remote heads at such paths are never applied;
+   * a later version change at the path is attempted again. Surfaced here
+   * (and via a `warn` log line) until a human renames the path; replaced
+   * every cycle like `conflicts`. Omitted when there are none.
+   */
+  skippedPaths?: string[];
+  /**
    * Server release version as reported by helloAck (null before the first
    * ack — and for legacy servers ≤ 0.1, which never send the field; see
    * `checkServerCompatibility` for the shared skew policy).
@@ -221,6 +236,7 @@ export class SyncClient {
   private pending = 0;
   private conflicts: ConflictOp[] = [];
   private caseCollisions: string[] = [];
+  private skippedPaths: string[] = [];
   private ignoreSettings: IgnoreSettings;
   private watchAdapter: WatchAdapter | null = null;
   private cancelDebounce: (() => void) | null = null;
@@ -343,6 +359,7 @@ export class SyncClient {
       pending: this.pending,
       conflicts: [...this.conflicts],
       ...(this.caseCollisions.length > 0 ? { caseCollisions: [...this.caseCollisions] } : {}),
+      ...(this.skippedPaths.length > 0 ? { skippedPaths: [...this.skippedPaths] } : {}),
       serverVersion: this.serverVersion,
       ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
@@ -373,17 +390,35 @@ export class SyncClient {
     // Restore the index AND the sync-cursor bookkeeping (one atomic file):
     // the persisted cursor lets hello replay only what was missed, and
     // `syncedThrough` decides whether a delta manifest may be requested.
+    // A state file that fails to parse or validate is moved aside (the
+    // config-store recovery pattern) and the client resyncs from a FULL
+    // manifest off a fresh index — one corrupt field must not wedge every
+    // future startup.
     if (await this.safeStorageExists(LOCAL_INDEX_STATE_PATH)) {
-      const loaded = await loadLocalState(this.options.storage);
-      this.index = loaded.index;
-      this.cursor = loaded.state.cursor;
-      this.syncedThrough = loaded.state.syncedThrough;
-      this.needsFullManifest = loaded.state.needsFullManifest;
+      try {
+        const loaded = await loadLocalState(this.options.storage);
+        this.index = loaded.index;
+        this.cursor = loaded.state.cursor;
+        this.syncedThrough = loaded.state.syncedThrough;
+        this.needsFullManifest = loaded.state.needsFullManifest;
+      } catch (error) {
+        try {
+          await this.options.storage.renameFile(
+            LOCAL_INDEX_STATE_PATH,
+            `${LOCAL_INDEX_STATE_PATH}.corrupt.bak`,
+          );
+        } catch {
+          // Could not move the bad file aside; the first persist below
+          // overwrites it, so the client can still operate.
+        }
+        this.log.warn(
+          'local index state is corrupt; quarantined to state.corrupt.bak and resyncing from a full manifest',
+          error,
+        );
+        this.resetLocalState();
+      }
     } else {
-      this.index = {};
-      this.cursor = 0;
-      this.syncedThrough = null;
-      this.needsFullManifest = false;
+      this.resetLocalState();
     }
     this.serverOldestRetainedSeq = null;
     // Version skew is re-assessed per connection: reset before the ack so a
@@ -459,6 +494,14 @@ export class SyncClient {
     }
   }
 
+  /** Fresh index + cursor bookkeeping: no prior knowledge, full manifest. */
+  private resetLocalState(): void {
+    this.index = {};
+    this.cursor = 0;
+    this.syncedThrough = null;
+    this.needsFullManifest = false;
+  }
+
   private onTransportClose(reason: { code?: number; reason?: string }): void {
     this.log.warn('transport closed', reason);
     this.state = 'disconnected';
@@ -524,7 +567,22 @@ export class SyncClient {
   }
 
   private async handleChange(change: ChangeMessage): Promise<void> {
+    validateChangeMessage(change);
     if (change.seq > this.cursor) this.cursor = change.seq;
+    // Windows-unsafe paths can never be materialized here: skip the head
+    // (diagnosed, not applied) instead of failing the handler every time.
+    // Checked before the ignore rules — an unsyncable path is never ignored
+    // silently.
+    const unsafe = firstUnsafePath(
+      change.fromPath !== undefined ? [change.path, change.fromPath] : [change.path],
+    );
+    if (unsafe !== undefined) {
+      this.recordSkippedPath(unsafe);
+      // The head is resolved — by skipping — so the completion watermark
+      // advances with the feed like an applied change would.
+      if (change.seq > (this.syncedThrough ?? 0)) this.syncedThrough = change.seq;
+      return;
+    }
     if (isIgnored(change.path, this.ignoreSettings)) return;
     if (change.fromPath !== undefined && isIgnored(change.fromPath, this.ignoreSettings)) return;
 
@@ -630,10 +688,22 @@ export class SyncClient {
     pulls: ReadonlyArray<PullOp>,
     progress?: { onProgress: (done: number, total: number) => void },
   ): Promise<LocalIndex> {
+    // Pulls whose target path is Windows-unsafe would throw in the adapter
+    // every cycle; they are skipped and diagnosed instead (a later version
+    // change at the path is attempted again).
+    const materializable: PullOp[] = [];
+    for (const pull of pulls) {
+      const unsafe = firstUnsafePath(pullTargets(pull));
+      if (unsafe === undefined) {
+        materializable.push(pull);
+        continue;
+      }
+      this.recordSkippedPath(unsafe);
+    }
     return applyPull(
       this.options.storage,
       this.index,
-      { pushes: [], pulls: [...pulls], conflicts: [], folderPushes: [] },
+      { pushes: [], pulls: materializable, conflicts: [], folderPushes: [] },
       this.fetchBlob,
       {
         now: this.now(),
@@ -652,6 +722,21 @@ export class SyncClient {
       syncedThrough: this.syncedThrough,
       needsFullManifest: this.needsFullManifest,
     };
+  }
+
+  /**
+   * Record a path the cycle could not sync because its name is
+   * Windows-unsafe (`paths.ts`): surfaced on `status().skippedPaths` and
+   * logged once per record until a human renames it. Deduped; replaced at
+   * the start of every cycle.
+   */
+  private recordSkippedPath(path: string): void {
+    if (this.skippedPaths.includes(path)) return;
+    this.skippedPaths.push(path);
+    this.log.warn(
+      'skipping a Windows-unsafe path (reserved device name or trailing dot/space); rename it to sync',
+      path,
+    );
   }
 
   /**
@@ -696,6 +781,7 @@ export class SyncClient {
     if (this.transport === null || this.isDisconnected()) return;
     this.state = 'syncing';
     this.progress = null;
+    this.skippedPaths = [];
     try {
       const manifest = await this.fetchManifest();
       const localChanges = await scanVault(
@@ -732,6 +818,11 @@ export class SyncClient {
           'case-colliding file pair: these files differ only by name case and one is invisible on this filesystem; rename one of them',
           this.caseCollisions,
         );
+      }
+      // Windows-unsafe local names (never pushed — see `paths.ts`) surface
+      // through the same diagnostics channel.
+      for (const path of localChanges.unsafePaths ?? []) {
+        this.recordSkippedPath(path);
       }
 
       // Stage push contents BEFORE pulls overwrite the working tree (a
@@ -882,10 +973,11 @@ export class SyncClient {
       () => transport.send({ type: 'getManifest', ...(since !== undefined ? { since } : {}) }),
     );
     if (reply.type === 'error') throw this.toError(reply);
+    validateManifestMessage(reply);
     if (reply.cursor > this.cursor) this.cursor = reply.cursor;
     this.manifestCursorOfCycle = reply.cursor;
     if (!useDelta) {
-      return Object.values(reply.entries).map((entry) => ({ ...entry }));
+      return this.toRemoteFiles(Object.values(reply.entries));
     }
     // Delta: merge the changed heads over an INDEX PROJECTION of the full
     // manifest. computeSyncPlan needs the complete remote view — Phase B
@@ -910,7 +1002,25 @@ export class SyncClient {
     for (const [path, entry] of Object.entries(reply.entries)) {
       merged.set(path, { ...entry });
     }
-    return [...merged.values()];
+    return this.toRemoteFiles([...merged.values()]);
+  }
+
+  /**
+   * Project manifest-side entries to `RemoteFile`s, skipping Windows-unsafe
+   * paths (diagnosed via `recordSkippedPath`, never handed to the planner —
+   * materializing them is impossible, so planning them would only produce a
+   * pull that fails every cycle).
+   */
+  private toRemoteFiles(entries: readonly RemoteFile[]): RemoteFile[] {
+    const remote: RemoteFile[] = [];
+    for (const entry of entries) {
+      if (isWindowsUnsafePath(entry.path)) {
+        this.recordSkippedPath(entry.path);
+        continue;
+      }
+      remote.push({ ...entry });
+    }
+    return remote;
   }
 
   private async stagePushes(
@@ -1079,6 +1189,11 @@ export class SyncClient {
       () => transport.send(message),
     );
     if (reply.type === 'error') throw this.toError(reply);
+    if (reply.type === 'commitAck') {
+      validateCommitAckMessage(reply);
+    } else {
+      validateConflictMessage(reply);
+    }
 
     // Fold the reply into shared state behind the ack chain: concurrent
     // slots must not read-modify-write `this.index` at the same time.
@@ -1342,3 +1457,13 @@ export class SyncClient {
 // --- module-private type aliases ---------------------------------------------------------
 
 type ServerErrorMessage = Extract<ServerMessage, { type: 'error' }>;
+
+/** Every vault path a pull would touch on disk (both ends of a rename). */
+function pullTargets(pull: PullOp): string[] {
+  return pull.kind === 'rename' ? [pull.fromPath, pull.toPath] : [pull.path];
+}
+
+/** The first Windows-unsafe path among `paths`; undefined when all are safe. */
+function firstUnsafePath(paths: readonly string[]): string | undefined {
+  return paths.find((path) => isWindowsUnsafePath(path));
+}

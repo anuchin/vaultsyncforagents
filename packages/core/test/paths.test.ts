@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   InvalidVaultPathError,
   basename,
+  isWindowsUnsafePath,
   joinPath,
   normalizeVaultPath,
   parentPath,
@@ -57,6 +58,57 @@ describe('normalizeVaultPath', () => {
 
   it('rejects NUL bytes', () => {
     expect(() => normalizeVaultPath('a\0b.md')).toThrow(InvalidVaultPathError);
+  });
+
+  it('rejects Windows reserved device names in any segment, case and extension insensitive', () => {
+    for (const input of [
+      'CON',
+      'con',
+      'Con.md',
+      'NUL',
+      'nul.txt',
+      'PRN.a.b',
+      'aux',
+      'COM1',
+      'com3.tar.gz',
+      'LPT9',
+      'lpt2',
+      'notes/CON.md',
+      '/notes/con',
+      'a/COM5/b.md',
+      'nul/.obsidian.json',
+    ]) {
+      expect(() => normalizeVaultPath(input)).toThrow(InvalidVaultPathError);
+    }
+  });
+
+  it('accepts names that merely resemble reserved device names', () => {
+    expect(normalizeVaultPath('console.md')).toBe('/console.md');
+    expect(normalizeVaultPath('notes/communication.md')).toBe('/notes/communication.md');
+    expect(normalizeVaultPath('COM10.md')).toBe('/COM10.md');
+    expect(normalizeVaultPath('contact.md')).toBe('/contact.md');
+    expect(normalizeVaultPath('notes/prolpt1x.md')).toBe('/notes/prolpt1x.md');
+  });
+
+  it('rejects segments ending with a dot or a space', () => {
+    for (const input of ['a.', 'a ', 'notes/b.', 'notes/b ', 'notes/c. ', 'trailing./x.md']) {
+      expect(() => normalizeVaultPath(input)).toThrow(InvalidVaultPathError);
+    }
+    // Interior/leading dots and interior spaces stay legal.
+    expect(normalizeVaultPath('notes/.hidden')).toBe('/notes/.hidden');
+    expect(normalizeVaultPath('note name.md')).toBe('/note name.md');
+    expect(normalizeVaultPath('a..b.md')).toBe('/a..b.md');
+  });
+
+  it('isWindowsUnsafePath flags reserved and trailing dot/space segments without throwing', () => {
+    expect(isWindowsUnsafePath('/NUL')).toBe(true);
+    expect(isWindowsUnsafePath('/notes/CON.md')).toBe(true);
+    expect(isWindowsUnsafePath('/notes/ b.md')).toBe(false);
+    expect(isWindowsUnsafePath('/notes/b.')).toBe(true);
+    expect(isWindowsUnsafePath('/')).toBe(false);
+    expect(isWindowsUnsafePath('/notes/todo.md')).toBe(false);
+    // Normalization tokens never reach the predicate as real names.
+    expect(isWindowsUnsafePath('/a/../b.md')).toBe(false);
   });
 
   it('is idempotent', () => {

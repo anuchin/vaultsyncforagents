@@ -33,7 +33,9 @@ export class InvalidVaultPathError extends Error {
  *
  * Rejected: `..` escaping the root (`/../a`, `/a/../..`), absolute Windows
  * drive paths (`C:/vault/a.md`, `C:\vault\a.md`), UNC paths (`\\srv\share`),
- * leading `//`, NUL bytes.
+ * leading `//`, NUL bytes, and Windows-unsafe segments — reserved device
+ * names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, any
+ * extension, any case) and segments ending in `.` or ` `.
  */
 export function normalizeVaultPath(input: string): VaultPath {
   if (typeof input !== 'string') {
@@ -71,6 +73,11 @@ export function normalizeVaultPath(input: string): VaultPath {
       }
       segments.pop();
       continue;
+    }
+    if (isWindowsUnsafeSegment(segment)) {
+      throw new InvalidVaultPathError(
+        `Vault path segment is a Windows-reserved device name or ends with a dot/space: ${JSON.stringify(segment)}`,
+      );
     }
     segments.push(segment);
   }
@@ -126,4 +133,59 @@ export function basename(path: string): VaultPath {
 export function isStrictlyBeneath(child: string, ancestor: string): boolean {
   if (ancestor === '/') return child !== '/';
   return child.length > ancestor.length && child.startsWith(`${ancestor}/`);
+}
+
+// --- Windows-unsafe names ------------------------------------------------------
+
+/** Reserved DOS device base names (matched case-insensitively, any extension). */
+const WINDOWS_RESERVED_BASE_NAMES: ReadonlySet<string> = new Set([
+  'con',
+  'prn',
+  'aux',
+  'nul',
+  'com1',
+  'com2',
+  'com3',
+  'com4',
+  'com5',
+  'com6',
+  'com7',
+  'com8',
+  'com9',
+  'lpt1',
+  'lpt2',
+  'lpt3',
+  'lpt4',
+  'lpt5',
+  'lpt6',
+  'lpt7',
+  'lpt8',
+  'lpt9',
+]);
+
+/**
+ * Whether one path segment can never be materialized on Windows: a reserved
+ * device base name — the segment up to its first dot, case-insensitive, so
+ * `CON`, `nul.txt` and `COM3.tar.gz` all match — or a trailing dot/space,
+ * which Windows strips when creating the file (the on-disk name would
+ * silently differ from the synced one).
+ */
+function isWindowsUnsafeSegment(segment: string): boolean {
+  // `.`/`..` are normalization tokens, never real segment names; they are
+  // resolved (or rejected) by `normalizeVaultPath` itself.
+  if (segment === '.' || segment === '..') return false;
+  if (segment.endsWith('.') || segment.endsWith(' ')) return true;
+  const dot = segment.indexOf('.');
+  const base = (dot === -1 ? segment : segment.slice(0, dot)).toLowerCase();
+  return WINDOWS_RESERVED_BASE_NAMES.has(base);
+}
+
+/**
+ * Whether any segment of a vault path is Windows-unsafe (see
+ * `isWindowsUnsafeSegment`). Such paths are rejected by `normalizeVaultPath`
+ * and must never be pushed or pulled: a Windows client cannot materialize
+ * them, so attempting the write would fail every sync cycle.
+ */
+export function isWindowsUnsafePath(path: string): boolean {
+  return path.split('/').some((segment) => isWindowsUnsafeSegment(segment));
 }

@@ -7,7 +7,7 @@
  * `.Trash/foo.md` must not sneak past the `.trash/` rule).
  */
 
-import { normalizeVaultPath } from './paths.js';
+import { isWindowsUnsafePath, normalizeVaultPath } from './paths.js';
 
 /** Settings subset `isIgnored` needs; `VaultSettings` satisfies it. */
 export interface IgnoreSettings {
@@ -40,12 +40,15 @@ const OBSIDIAN_VOLATILE_FILES: ReadonlySet<string> = new Set([
  * Whether `vaultPath` must be excluded from sync.
  *
  * Always ignored: `.trash/`, `.DS_Store`, `Thumbs.db`, `.vaultsyncforagents/`
- * (any depth). `.obsidian/` is ignored entirely when `settings.obsidianSync`
+ * (any depth), and Windows-unsafe names (reserved device names, trailing
+ * dot/space — they can never be materialized on a Windows peer, see
+ * `paths.ts`). `.obsidian/` is ignored entirely when `settings.obsidianSync`
  * is false; when true, everything under it syncs except `workspace.json`,
  * `workspace-mobile.json`, and `.obsidian/cache/`. Finally, every pattern in
  * `settings.extraIgnores` is matched (glob-lite — see `IgnoreSettings`).
  */
 export function isIgnored(vaultPath: string, settings: IgnoreSettings): boolean {
+  if (isWindowsUnsafePath(vaultPath)) return true;
   const normalized = normalizeVaultPath(vaultPath);
   if (normalized === '/') return false;
 

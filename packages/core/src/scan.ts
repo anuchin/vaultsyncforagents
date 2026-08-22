@@ -52,6 +52,10 @@
  *                  emitting a tombstone would destroy the twin on the server
  *                  and on case-sensitive peers. Surfaced as a diagnostic
  *                  only; the collision stays unresolved by design.
+ *   - `unsafePaths` — files and directories whose names are Windows-unsafe
+ *                  (reserved device names, trailing dot/space — `paths.ts`).
+ *                  Like case collisions they are never pushed and never
+ *                  treated as deletions; surfaced as a diagnostic only.
  *
  * ## The mtime+size pre-filter (fast mode, the default)
  *
@@ -77,7 +81,7 @@ import type { FileStat, StorageAdapter } from './adapters.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
 import type { LocalIndex, LocalIndexEntry } from './localindex.js';
-import { parentPath } from './paths.js';
+import { isWindowsUnsafePath, parentPath } from './paths.js';
 
 /** Injectable content hash (the default is sha256, same as blob addressing). */
 export type HashFn = (bytes: Uint8Array) => Promise<string>;
@@ -192,6 +196,16 @@ export interface LocalChanges {
    * (`SyncClientStatus.caseCollisions`). Omitted when there are none.
    */
   caseCollisions?: string[];
+  /**
+   * Files and directories present in storage whose names cannot be synced:
+   * Windows-reserved device names (CON, NUL, COM1-9, …) or segments ending
+   * in `.`/` ` (`paths.ts`). They are never pushed (a Windows peer could
+   * not materialize them), never hashed, and never treated as deletions of
+   * their index entries; surfaced as a diagnostic
+   * (`SyncClientStatus.skippedPaths`) until a human renames them. Omitted
+   * when there are none.
+   */
+  unsafePaths?: string[];
   /** Every file the scan hashed (fast mode's skipped files are absent), sorted by path. */
   hashed: HashedFile[];
 }
@@ -218,8 +232,19 @@ export async function scanVault(
 
   const files = await storage.listFiles();
 
-  const kept: FileStat[] = [];
+  // Windows-unsafe names never enter the diff (nor the directory
+  // representation walk below): they cannot be pushed, and emitting a
+  // deletion or placeholder for them would churn against a server that
+  // rejects the path. They surface as diagnostics instead.
+  const unsafePaths: string[] = [];
+  const syncable: FileStat[] = [];
   for (const file of files) {
+    if (isWindowsUnsafePath(file.path)) unsafePaths.push(file.path);
+    else syncable.push(file);
+  }
+
+  const kept: FileStat[] = [];
+  for (const file of syncable) {
     if (!isIgnored(file.path, settings)) kept.push(file);
   }
   const keptPaths = new Set(kept.map((f) => f.path));
@@ -276,8 +301,19 @@ export async function scanVault(
     new Set([...unmatchedAdded.map((c) => c.path), ...modified.map((c) => c.path), ...renamed.map((r) => r.to)]),
   );
   const dirs = await storage.listDirs();
-  const { emptyFolders, staleDirs } = detectEmptyFolders(index, settings, files, dirs, thisDeviceId);
-  const folderDeletions = detectFolderDeletions(index, settings, dirs);
+  const syncableDirs: string[] = [];
+  for (const dir of dirs) {
+    if (isWindowsUnsafePath(dir)) unsafePaths.push(dir);
+    else syncableDirs.push(dir);
+  }
+  const { emptyFolders, staleDirs } = detectEmptyFolders(
+    index,
+    settings,
+    syncable,
+    syncableDirs,
+    thisDeviceId,
+  );
+  const folderDeletions = detectFolderDeletions(index, settings, syncableDirs);
 
   return {
     scannedAt: now,
@@ -290,6 +326,7 @@ export async function scanVault(
     // Omitted when empty (not `[]`) — see the field's doc.
     ...(staleDirs.length > 0 ? { staleDirs } : {}),
     ...(caseCollisions.length > 0 ? { caseCollisions } : {}),
+    ...(unsafePaths.length > 0 ? { unsafePaths: unsafePaths.sort(compareStrings) } : {}),
     hashed: [...hashed].sort(byPath),
   };
 }

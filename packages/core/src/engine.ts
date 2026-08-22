@@ -328,7 +328,8 @@ async function persistIndex(
  * Load the persisted index AND its sync-cursor bookkeeping (the client's
  * startup path — the cursor powers delta-manifest reconnects). Throws
  * `ProtocolError` (via `deserializeLocalState`) on corrupt or future-schema
- * state — callers surface that instead of silently re-syncing from scratch.
+ * state; the client recovers by quarantining the file and resyncing from a
+ * full manifest (`client.ts` startup).
  */
 export async function loadLocalState(storage: StorageAdapter): Promise<DeserializedLocalState> {
   const bytes = await storage.readFile(LOCAL_INDEX_STATE_PATH);
