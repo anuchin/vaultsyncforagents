@@ -523,6 +523,51 @@ describe('SyncClient — folder lifecycle via change application (removeDir invo
     expect(b.client.currentIndex()['/prunedir']).toBeUndefined();
   });
 
+  it('a file deletion that empties the folder pushes ONLY the file tombstone — the manifest never gains a placeholder', async () => {
+    const { server, make } = rig();
+    const a = make('dev-a', 'Alpha');
+    const b = make('dev-b', 'Beta');
+    await a.client.connect();
+    await b.client.connect();
+    await settle(a, b);
+
+    await a.storage.writeFile('/evac/last.md', enc('the last file'));
+    await a.client.triggerSync();
+    await settle(a, b);
+    expect(await b.storage.exists('/evac/last.md')).toBe(true);
+
+    const marker = a.sent.length;
+    await a.storage.deleteFile('/evac/last.md');
+    await a.client.triggerSync();
+    await settle(a, b);
+    // Repeated cycles on both sides: the resurrection window this test pins.
+    await a.client.triggerSync();
+    await b.client.triggerSync();
+    await settle(a, b);
+
+    // Exactly ONE commit left A for the whole evacuation: the FILE tombstone…
+    const evacCommits = a.sent.slice(marker).filter(
+      (m) => m.type === 'commit' && (m as { path?: string }).path?.startsWith('/evac'),
+    );
+    expect(evacCommits).toHaveLength(1);
+    expect((evacCommits[0] as { path?: string }).path).toBe('/evac/last.md');
+    expect((evacCommits[0] as { kind?: string }).kind).toBe('delete');
+    // …no folder-placeholder commit was ever sent by either side…
+    for (const r of [a, b]) {
+      expect(
+        r.sent.filter((m) => m.type === 'commit' && (m as { path?: string }).path === '/evac'),
+      ).toEqual([]);
+    }
+    // …so the authoritative manifest has NO placeholder for the folder (the
+    // E2E's `change:/projects` resurrection is structurally impossible), and
+    // neither disk nor index holds one at rest.
+    expect(server.snapshot().files.filter((f) => f.path === '/evac')).toEqual([]);
+    expect(await a.storage.exists('/evac')).toBe(false);
+    expect(await b.storage.exists('/evac')).toBe(false);
+    expect(a.client.currentIndex()['/evac']).toBeUndefined();
+    expect(b.client.currentIndex()['/evac']).toBeUndefined();
+  });
+
   it('non-empty parent: a remote file deletion never invokes removeDir', async () => {
     const { make } = rig();
     const a = make('dev-a', 'Alpha');

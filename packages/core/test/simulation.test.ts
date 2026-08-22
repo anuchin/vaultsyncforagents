@@ -775,3 +775,109 @@ describe('simulation — scenario (g): empty-folder deletion never ping-pongs (F
     expect(head?.deleted).toBe(true);
   });
 });
+
+// --- scenario (h): the full folder lifecycle across ALL THREE devices ----------------------
+
+describe('simulation — scenario (h): folder lifecycle converges on every device', () => {
+  const FOLDER_H = '/lifecycle';
+  const allDevices = (rig: Awaited<ReturnType<typeof makeRig>>): Device[] => [
+    rig.desktop,
+    rig.mobile,
+    rig.daemon,
+  ];
+
+  it('create folder → add files → delete files: zero placeholders at rest, on every device and in the manifest', async () => {
+    const rig = await makeRig();
+    const { server, desktop, settle } = rig;
+    const devices = allDevices(rig);
+    await connectAll(...devices);
+
+    // Create the folder explicitly (FR-10): the placeholder reaches all three.
+    await desktop.storage.ensureDir(FOLDER_H);
+    await desktop.client.triggerSync();
+    await settle();
+    for (const device of devices) {
+      expect(await device.storage.exists(FOLDER_H)).toBe(true);
+      expect(device.client.currentIndex()[FOLDER_H]?.isFolder).toBe(true);
+    }
+
+    // Files arrive beneath it…
+    await edit(desktop, `${FOLDER_H}/one.md`, 'one');
+    await edit(desktop, `${FOLDER_H}/two.md`, 'two');
+    await settle();
+    for (const device of devices) {
+      expect(text(await device.storage.readFile(`${FOLDER_H}/one.md`))).toBe('one');
+      expect(text(await device.storage.readFile(`${FOLDER_H}/two.md`))).toBe('two');
+    }
+
+    // …and are deleted. The pruned folder's tombstone rides a follow-up cycle,
+    // so run explicit cycles everywhere until the system is quiet.
+    for (const path of [`${FOLDER_H}/one.md`, `${FOLDER_H}/two.md`]) {
+      await desktop.storage.deleteFile(path);
+      desktop.watch.emit([{ kind: 'delete', path }]);
+    }
+    desktop.scheduler.flush();
+    await settle();
+    for (let round = 0; round < 3; round++) {
+      for (const device of devices) await device.client.triggerSync();
+      await settle();
+    }
+
+    // Zero placeholders AT REST: no directory on any device…
+    for (const device of devices) {
+      expect(await device.storage.exists(FOLDER_H)).toBe(false);
+      // …no LIVE folder entry in any index (the placeholder became a tombstone)…
+      expect(device.client.currentIndex()[FOLDER_H]?.deletedAt).toBeDefined();
+      // …and the file tombstones landed everywhere too.
+      expect(device.client.currentIndex()[`${FOLDER_H}/one.md`]?.deletedAt).toBeDefined();
+      expect(device.client.currentIndex()[`${FOLDER_H}/two.md`]?.deletedAt).toBeDefined();
+    }
+    // …and no live placeholder anywhere in the authoritative manifest.
+    expect(server.snapshot().files.filter((f) => f.isFolder && !f.deleted)).toEqual([]);
+    expect(server.snapshot().files.find((f) => f.path === FOLDER_H)?.deleted).toBe(true);
+
+    // Quiet: further cycles commit nothing more for the folder on any device.
+    const markers = new Map(devices.map((d) => [d.id, d.sent.length]));
+    for (const device of devices) await device.client.triggerSync();
+    await settle();
+    for (const device of devices) {
+      const commits = device.sent
+        .slice(markers.get(device.id) ?? 0)
+        .filter((m) => m.type === 'commit' && (m as { path?: string }).path === FOLDER_H);
+      expect(commits).toEqual([]);
+    }
+  });
+
+  it('an explicit empty-folder delete propagates to ALL THREE devices (tombstone everywhere, dir removed everywhere)', async () => {
+    const rig = await makeRig();
+    const { server, desktop, settle } = rig;
+    const devices = allDevices(rig);
+    await connectAll(...devices);
+
+    const folder = '/vanisher';
+    await desktop.storage.ensureDir(folder);
+    await desktop.client.triggerSync();
+    await settle();
+    for (const device of devices) {
+      expect(await device.storage.exists(folder)).toBe(true);
+      expect(device.client.currentIndex()[folder]?.isFolder).toBe(true);
+    }
+
+    await desktop.storage.removeDir(folder);
+    desktop.watch.emit([{ kind: 'delete', path: folder }]);
+    desktop.scheduler.flush();
+    await settle();
+    for (let round = 0; round < 2; round++) {
+      for (const device of devices) await device.client.triggerSync();
+      await settle();
+    }
+
+    for (const device of devices) {
+      expect(await device.storage.exists(folder)).toBe(false);
+      expect(device.client.currentIndex()[folder]?.deletedAt).toBeDefined();
+    }
+    const head = server.snapshot().files.find((f) => f.path === folder);
+    expect(head?.deleted).toBe(true);
+    expect(head?.clock.deviceId).toBe('dev-desktop'); // authored by the deleting side
+  });
+});
