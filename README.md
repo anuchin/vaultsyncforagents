@@ -118,9 +118,10 @@ everything below runs today.
 For a new vault, the intended path:
 
 1. Install the Obsidian plugin ([packages/plugin/README.md](packages/plugin/README.md)).
-2. Deploy a worker into your Cloudflare account — `npx vaultsyncforagents setup`
-   (the terminal path), the plugin's **Deploy your worker** button, or the
-   template's deploy button.
+2. Deploy a worker into your Cloudflare account — the plugin's in-app
+   **Set up a new worker…** wizard (API token in, worker URL out — no GitHub,
+   no terminal), `npx vaultsyncforagents setup` (the terminal path), or the
+   template's deploy button (GitHub/GitLab connected).
 3. Open the worker URL and claim it: set the admin passphrase and name the vault.
 4. Pair devices from the dashboard (*Devices → Pair new device*): paste the code into plugin
    settings, scan the QR, or click the `obsidian://` deep link.

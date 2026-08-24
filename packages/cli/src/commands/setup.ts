@@ -26,60 +26,30 @@ import {
   type CloudflareAccount,
   type CloudflareControl,
 } from '../cloudflare.js';
+import {
+  PINNED_BUNDLE_SHA256,
+  PINNED_RELEASE,
+  RELEASE_BUNDLE_URL,
+  WORKER_COMPATIBILITY_DATE,
+  randomSuffix,
+  deriveWorkerName,
+} from '@vsa/core';
 
-/** Release the template + setup track (see template/VERSION). */
-export const PINNED_RELEASE = 'v0.1.4';
-
-/**
- * SHA-256 (hex) of the pinned release's `worker-bundle.zip`, baked in by the
- * release build pass (deterministic: local and CI builds hash identically —
- * verified for v0.1.3 and v0.1.4). When empty, the download path falls back
- * to the release's `.sha256` sidecar (uploaded by release.yml) and finally
- * warns when neither is available (older releases).
- */
-export const PINNED_BUNDLE_SHA256 = '211b27d01b3ec76af5d4b01feda18dddd1226128fbb1041740c3d088711a8591';
-
-/**
- * GitHub release artifact convention: the tag ships `worker-bundle.zip`
- * (worker.js + dashboard/ — the layout scripts/build-release.mjs produces
- * and the template's CI asserts) plus a `worker-bundle.zip.sha256` sidecar
- * since v0.1.3, which the download path verifies when no digest is pinned.
- */
-export const RELEASE_BUNDLE_URL = `https://github.com/anuchin/vaultsyncforagents/releases/download/${PINNED_RELEASE}/worker-bundle.zip`;
-
-/** Must match packages/worker/wrangler.jsonc (and template/wrangler.jsonc). */
-export const WORKER_COMPATIBILITY_DATE = '2026-08-01';
-
-// --- naming ---------------------------------------------------------------------------------
-
-/** Slugify a vault name for worker/bucket identifiers (lowercase [a-z0-9-]). */
-export function slugify(name: string): string {
-  const slug = name
-    .normalize('NFKD')
-    // Strip combining marks left by the decomposition (Ü → u + marks).
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 32)
-    .replace(/-+$/g, '');
-  return slug === '' ? 'vault' : slug;
-}
-
-/** Random 4-char [a-z0-9] suffix, e.g. `x7q2` (worker names are per-account; the suffix keeps two vaults apart). */
-export function randomSuffix(random: () => number = Math.random): string {
-  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
-  let suffix = '';
-  for (let i = 0; i < 4; i += 1) {
-    suffix += alphabet[Math.floor(random() * alphabet.length)];
-  }
-  return suffix;
-}
-
-/** `personal` → `vaultsync-personal-x7q2` (worker and bucket share the name). */
-export function deriveWorkerName(vaultName: string, suffix: string): string {
-  return `vaultsync-${slugify(vaultName)}-${suffix}`;
-}
+// The pin, the bundle URL, and the worker/bucket naming live in `@vsa/core`
+// (core/src/deploy.ts) — the single source of truth shared with the plugin's
+// in-app setup wizard, so the two provisioners cannot drift onto different
+// releases or name shapes. Re-exported here for the CLI's own tests and
+// callers; `renderWranglerConfig` below consumes the two values it needs.
+export {
+  PINNED_RELEASE,
+  PINNED_BUNDLE_SHA256,
+  RELEASE_BUNDLE_URL,
+  WORKER_COMPATIBILITY_DATE,
+  slugify,
+  randomSuffix,
+  deriveWorkerName,
+  deriveBucketName,
+} from '@vsa/core';
 
 // --- config generation ----------------------------------------------------------------------
 

@@ -42,10 +42,19 @@ Copy `main.js`, `manifest.json`, and `styles.css` into
 
 ## Pairing walkthrough
 
-You need a claimed worker first. If you don't have one, the plugin can make it:
-open *Settings → VaultSync for Agents* and press **Deploy your worker** —
-Cloudflare's Deploy Button provisions a preconfigured worker + storage in your
-own account (no wrangler, no config editing).
+You need a claimed worker first. If you don't have one, the plugin can make
+it — two ways, from *Settings → VaultSync for Agents*:
+
+- **Set up a new worker…** (recommended) — the in-app wizard. Name the vault,
+  paste a Cloudflare API token (the **Create token** button opens Cloudflare's
+  token page — the *"Edit Cloudflare Workers"* template has exactly the right
+  permissions), and the plugin deploys the released worker + R2 storage into
+  your account directly over the Cloudflare API: no GitHub, no terminal, no
+  wrangler. The token is used for that deploy only and never stored. Multi-account
+  tokens get an account picker.
+- **Deploy via Cloudflare** — the web fallback. Cloudflare's Deploy Button
+  provisions the same worker from a GitHub template (requires a GitHub or
+  GitLab account).
 
 ### 1. Claim the worker (once, in a browser)
 

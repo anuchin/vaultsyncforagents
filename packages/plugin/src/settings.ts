@@ -25,6 +25,7 @@ import { pairOutcomeMessage } from './pairing.js';
 import { formatBytes, PROTOCOL_VERSION } from './diagnostics.js';
 import { formatSince } from './statusbar.js';
 import type { VaultSyncPlugin } from './plugin.js';
+import { SetupWizardModal } from './wizard-modal.js';
 
 /**
  * Cloudflare Deploy Button target (FR-21): provisions a preconfigured worker
@@ -234,14 +235,24 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       .setClass('vsa-settings-hint')
       .setDesc(
         [
-          '1. Deploy your own worker with the button below (your Cloudflare account, preconfigured — no wrangler).',
+          '1. Deploy your own worker with a button below — from right here (no GitHub, no terminal) or via Cloudflare\'s web page.',
           '2. Open the worker URL in a browser and set the admin passphrase (claim).',
           '3. Create a pairing code on the dashboard, paste it above, and pair.',
           'On a phone, scanning the dashboard QR or tapping its obsidian:// link pairs without typing.',
         ].join('\n'),
       )
       .addButton((button) =>
-        button.setButtonText('Deploy your worker').onClick(() => openDeployPage()),
+        button
+          .setCta()
+          .setButtonText('Set up a new worker…')
+          .onClick(() => {
+            new SetupWizardModal(this.app, this.plugin, {
+              onApplied: () => this.display(),
+            }).open();
+          }),
+      )
+      .addButton((button) =>
+        button.setButtonText('Deploy via Cloudflare').onClick(() => openDeployPage()),
       );
   }
 

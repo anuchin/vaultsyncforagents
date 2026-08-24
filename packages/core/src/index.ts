@@ -11,6 +11,7 @@ export * from './client.js';
 export * from './clock.js';
 export * from './compat.js';
 export * from './conflictnames.js';
+export * from './deploy.js';
 export * from './engine.js';
 export * from './errors.js';
 export * from './hashing.js';

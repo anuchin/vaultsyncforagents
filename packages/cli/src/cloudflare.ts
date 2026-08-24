@@ -25,6 +25,16 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { unzip, type Unzipped } from 'fflate';
+import { MAX_BUNDLE_DOWNLOAD_BYTES, assertWithinZipCaps } from '@vsa/core';
+
+// Deploy-domain size caps and the zip-bomb gate moved to @vsa/core
+// (core/src/deploy.ts) — shared verbatim with the plugin's in-app wizard.
+// Re-exported for the CLI's own tests and callers.
+export {
+  MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+  MAX_BUNDLE_DOWNLOAD_BYTES,
+  MAX_ENTRY_UNCOMPRESSED_BYTES,
+} from '@vsa/core';
 
 /** Result of one command invocation (exit status + captured output). */
 export interface ExecResult {
@@ -337,13 +347,6 @@ export function createCloudflareControl(options: WranglerCliOptions = {}): Cloud
 
 // --- release-bundle download (integrity + caps) ----------------------------------------------
 
-/** Refuse bundle downloads above this size (100 MB). */
-export const MAX_BUNDLE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
-/** Refuse any zip entry whose declared uncompressed size exceeds this (100 MB). */
-export const MAX_ENTRY_UNCOMPRESSED_BYTES = 100 * 1024 * 1024;
-/** Refuse archives whose declared uncompressed sizes sum above this (250 MB). */
-export const MAX_ARCHIVE_UNCOMPRESSED_BYTES = 250 * 1024 * 1024;
-
 export interface BundleDownloadOptions {
   fetchImpl: typeof fetch;
   /**
@@ -502,151 +505,6 @@ function unzipFile(data: Uint8Array): Promise<Unzipped> {
       else resolve(unzipped);
     });
   });
-}
-
-// --- zip-bomb gate (declared sizes, checked before inflating) ---------------------------------
-
-/** One central-directory entry's name and DECLARED uncompressed size. */
-export interface ZipEntrySize {
-  name: string;
-  uncompressedSize: number;
-}
-
-/**
- * Zip-bomb gate: reject archives whose declared per-entry uncompressed size
- * exceeds 100 MB or whose declared sizes sum above 250 MB — BEFORE a single
- * entry is inflated. fflate's unzip materializes every entry fully in memory,
- * so a small archive lying about its sizes could otherwise exhaust the
- * machine; lying about the sizes is exactly what a bomb must do, which makes
- * this the cheap place to stop it.
- */
-function assertWithinZipCaps(data: Uint8Array): void {
-  const entries = readZipDeclaredSizes(data);
-  let total = 0;
-  for (const entry of entries) {
-    if (entry.uncompressedSize > MAX_ENTRY_UNCOMPRESSED_BYTES) {
-      throw new Error(
-        `refusing to extract ${entry.name}: declares ${formatBytes(entry.uncompressedSize)} uncompressed, over the ${formatBytes(MAX_ENTRY_UNCOMPRESSED_BYTES)} per-entry cap (possible zip bomb)`,
-      );
-    }
-    total += entry.uncompressedSize;
-  }
-  if (total > MAX_ARCHIVE_UNCOMPRESSED_BYTES) {
-    throw new Error(
-      `refusing to extract the archive: entries declare ${formatBytes(total)} uncompressed in total, over the ${formatBytes(MAX_ARCHIVE_UNCOMPRESSED_BYTES)} cap (possible zip bomb)`,
-    );
-  }
-}
-
-/**
- * Walk the zip central directory and return each entry's declared
- * uncompressed size (zip64-aware) without decompressing anything. Structural
- * oddities are hard errors — the caller treats them like a corrupt archive.
- */
-export function readZipDeclaredSizes(data: Uint8Array): ZipEntrySize[] {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const u16 = (offset: number) => view.getUint16(offset, true);
-  const u32 = (offset: number) => view.getUint32(offset, true);
-
-  // End of central directory: scan backwards over the possible zip comment
-  // (up to 64 KiB) for its 0x06054b50 signature; the LAST hit wins.
-  const eocdFloor = Math.max(0, data.length - (65_536 + 22));
-  let eocd = -1;
-  for (let i = data.length - 22; i >= eocdFloor; i -= 1) {
-    if (u32(i) === 0x0605_4b50) {
-      eocd = i;
-      break;
-    }
-  }
-  if (eocd === -1) throw new Error('invalid zip archive: no end-of-central-directory record');
-
-  let entryCount = u16(eocd + 10);
-  let cdOffset = u32(eocd + 16);
-  // ZIP64 overflow markers redirect to the zip64 EOCD record.
-  if (cdOffset === 0xffff_ffff || entryCount === 0xffff) {
-    const zip64 = readZip64Directory(view, eocd, data.length);
-    entryCount = zip64.entryCount;
-    cdOffset = zip64.cdOffset;
-  }
-  if (cdOffset + 46 > data.length) {
-    throw new Error('invalid zip archive: central directory offset out of bounds');
-  }
-
-  const entries: ZipEntrySize[] = [];
-  const decoder = new TextDecoder();
-  let offset = cdOffset;
-  for (let index = 0; index < entryCount; index += 1) {
-    if (offset + 46 > data.length) {
-      throw new Error('invalid zip archive: truncated central directory');
-    }
-    if (u32(offset) !== 0x0201_4b50) {
-      throw new Error('invalid zip archive: bad central-directory entry signature');
-    }
-    let uncompressedSize = u32(offset + 24);
-    const nameLength = u16(offset + 28);
-    const extraLength = u16(offset + 30);
-    const commentLength = u16(offset + 32);
-    const recordEnd = offset + 46 + nameLength + extraLength + commentLength;
-    if (recordEnd > data.length) {
-      throw new Error('invalid zip archive: truncated central directory');
-    }
-    if (uncompressedSize === 0xffff_ffff) {
-      uncompressedSize = readZip64EntrySize(view, offset + 46 + nameLength, extraLength);
-    }
-    entries.push({
-      name: decoder.decode(data.subarray(offset + 46, offset + 46 + nameLength)),
-      uncompressedSize,
-    });
-    offset = recordEnd;
-  }
-  return entries;
-}
-
-/** Entry count + central-directory offset from the zip64 EOCD record. */
-function readZip64Directory(
-  view: DataView,
-  eocd: number,
-  dataLength: number,
-): { entryCount: number; cdOffset: number } {
-  // The zip64 EOCD locator sits immediately before the classic EOCD.
-  const locator = eocd - 20;
-  if (locator < 0 || view.getUint32(locator, true) !== 0x0706_4b50) {
-    throw new Error('invalid zip archive: zip64 markers without a zip64 locator');
-  }
-  const zip64Offset = Number(view.getBigUint64(locator + 8, true));
-  if (zip64Offset + 56 > dataLength || view.getUint32(zip64Offset, true) !== 0x0606_4b50) {
-    throw new Error('invalid zip archive: zip64 end-of-central-directory record out of bounds');
-  }
-  return {
-    entryCount: Number(view.getBigUint64(zip64Offset + 32, true)),
-    cdOffset: Number(view.getBigUint64(zip64Offset + 48, true)),
-  };
-}
-
-/**
- * Original (uncompressed) size from a ZIP64 extended-information extra
- * field. Reached only when the fixed header overflowed (0xFFFFFFFF), and in
- * that case the spec places the original size FIRST in the extra field —
- * the compressed-size/offset/disk fields follow only when they overflowed
- * too. Sizes past 2^53 lose Number precision; MAX_SAFE_INTEGER overflows
- * every cap, which is the correct verdict for such a claim.
- */
-function readZip64EntrySize(view: DataView, extraOffset: number, extraLength: number): number {
-  let cursor = extraOffset;
-  const end = extraOffset + extraLength;
-  while (cursor + 4 <= end) {
-    const headerId = view.getUint16(cursor, true);
-    const dataSize = view.getUint16(cursor + 2, true);
-    if (headerId === 0x0001) {
-      if (dataSize < 8 || cursor + 12 > end) {
-        throw new Error('invalid zip archive: zip64 entry with a malformed extra field');
-      }
-      const size = Number(view.getBigUint64(cursor + 4, true));
-      return Number.isSafeInteger(size) ? size : Number.MAX_SAFE_INTEGER;
-    }
-    cursor += 4 + dataSize;
-  }
-  throw new Error('invalid zip archive: entry claims zip64 sizes but carries no zip64 extra field');
 }
 
 function parse(result: ExecResult): WhoamiInfo {

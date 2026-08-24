@@ -1,6 +1,6 @@
 {
   "name": "@vsa/worker",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "VaultSync for Agents Cloudflare Worker: VaultRoom Durable Object, blob routes, claim/pairing, GC cron",
   "license": "MIT",

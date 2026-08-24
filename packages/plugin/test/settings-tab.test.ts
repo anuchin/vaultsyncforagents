@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App, PluginManifest } from 'obsidian';
 import { VaultSyncPlugin } from '../src/plugin.js';
 import { DEPLOY_URL, VaultSyncSettingTab } from '../src/settings.js';
-import { asMockPlugin, Notice, Platform, resetObsidianMock, Setting, type SettingRecord } from './helpers/obsidian-mock.js';
+import { asMockPlugin, Modal, Notice, Platform, resetObsidianMock, Setting, type SettingRecord } from './helpers/obsidian-mock.js';
 import { makeFakeApp, FakeVault } from './helpers/fake-vault.js';
 import { FakeFetch, offlineWsFactory } from './helpers/network-fakes.js';
 
@@ -211,14 +211,18 @@ describe('VaultSyncSettingTab', () => {
     linkedTab.hide();
   });
 
-  it('FR-21: Getting started offers the one-click Cloudflare deploy button', async () => {
+  it('FR-21: Getting started offers the Cloudflare web deploy button and the in-app wizard', async () => {
     const open = vi.fn();
     vi.stubGlobal('window', { open });
     try {
       tab.display();
       expect(findSetting('Getting started').desc).toContain('Deploy');
-      await findButton('Deploy your worker').click();
+      await findButton('Deploy via Cloudflare').click();
       expect(open).toHaveBeenCalledWith(DEPLOY_URL, '_blank');
+      // The wizard button opens the setup modal (no browser, no GitHub).
+      Modal.opened.length = 0;
+      await findButton('Set up a new worker…').click();
+      expect(Modal.opened.length).toBe(1);
     } finally {
       vi.unstubAllGlobals();
     }

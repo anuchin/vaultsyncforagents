@@ -1,6 +1,6 @@
 {
   "name": "@vsa/plugin",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "VaultSync for Agents Obsidian plugin (desktop + mobile): pairing UI, live sync, status indicator, obsidian:// deep links",
   "license": "MIT",
@@ -17,7 +17,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@vsa/core": "^0.1.0"
+    "@noble/hashes": "^2.3.0",
+    "@vsa/core": "^0.1.0",
+    "fflate": "^0.8.3"
   },
   "devDependencies": {
     "esbuild": "^0.28.1",
