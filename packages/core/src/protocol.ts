@@ -240,8 +240,14 @@ export interface BlobMessage {
   content: string;
 }
 
-/** Machine-readable codes carried by `error` messages (HTTP-equivalent). */
-export type ServerErrorCode = 'UNAUTHORIZED' | 'REVOKED' | 'NOT_FOUND' | 'PROTOCOL';
+/**
+ * Machine-readable codes carried by `error` messages (HTTP-equivalent).
+ * `PATH_COLLIDES` names the §14 path-safety refusal: a NEW live path whose
+ * fold key (NFC + lowercasing) already belongs to another live entry. Modern
+ * clients drop the offending commit into their skipped-path diagnostics
+ * instead of wedging the cycle (`client.ts` commit replies).
+ */
+export type ServerErrorCode = 'UNAUTHORIZED' | 'REVOKED' | 'NOT_FOUND' | 'PROTOCOL' | 'PATH_COLLIDES';
 
 /** Negative reply (auth failure, unknown blob, protocol violation, …). */
 export interface ErrorMessage {

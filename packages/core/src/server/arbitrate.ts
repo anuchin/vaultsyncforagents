@@ -32,8 +32,70 @@
 import { compareClocks, nextClock } from '../clock.js';
 import { conflictCopyPath } from '../conflictnames.js';
 import { ProtocolError } from '../errors.js';
+import { foldKeyForPath, isNFCPath } from '../paths.js';
 import type { ChangePayload, ConflictWinner } from '../protocol.js';
 import type { LogicalClock, Version, VersionKind } from '../types.js';
+
+// --- path safety (§14) ---------------------------------------------------------
+
+/**
+ * The admission rule that keeps two active entries from ever sharing a fold
+ * key — v1's collisionKey, now enforced server-side (ARCHITECTURE §14).
+ * Both servers (this module's wrappers: the DO room, the in-memory test
+ * server) consult it before arbitration, so a non-conforming client cannot
+ * fork the vault into case/canonical twins no matter which backend it hits:
+ *
+ *   - paths must be in NFC canonical form (PROTOCOL — the worker's shape
+ *     gate rejects non-canonical paths identically; named here so the
+ *     in-memory server enforces parity);
+ *   - a commit that would create a NEW live path (no row, or only a
+ *     tombstone) must not fold (`foldKeyForPath`: NFC + case-fold) to any
+ *     OTHER live entry (PATH_COLLIDES). Edits to an existing head flow
+ *     unchanged, so legacy pairs already admitted before the rule stay
+ *     syncable — the gate stops NEW colliders from forming, it does not
+ *     retroactively punish old ones. A case-only rename is exempt by
+ *     construction: the source row folds to the destination's key and is
+ *     skipped (`fromPath`).
+ */
+export function pathSafetyViolation(
+  files: ReadonlyMap<string, ArbitrationFileState>,
+  commit: { path: string; fromPath?: string },
+): { code: 'PROTOCOL' | 'PATH_COLLIDES'; message: string } | null {
+  if (!isNFCPath(commit.path)) {
+    return {
+      code: 'PROTOCOL',
+      message: `commit path must be NFC canonical form, got ${previewForViolation(commit.path)}`,
+    };
+  }
+  if (commit.fromPath !== undefined && !isNFCPath(commit.fromPath)) {
+    return {
+      code: 'PROTOCOL',
+      message: `commit fromPath must be NFC canonical form, got ${previewForViolation(commit.fromPath)}`,
+    };
+  }
+  const existing = files.get(commit.path);
+  const createsNewLivePath = existing === undefined || existing.deleted;
+  if (!createsNewLivePath) return null;
+  const key = foldKeyForPath(commit.path);
+  for (const [path, row] of files) {
+    if (row.deleted) continue;
+    if (path === commit.path || path === commit.fromPath) continue;
+    if (foldKeyForPath(path) === key) {
+      return {
+        code: 'PATH_COLLIDES',
+        message:
+          `path ${previewForViolation(commit.path)} collides with live path ${previewForViolation(path)} ` +
+          `under the case/canonical fold — rename one of them`,
+      };
+    }
+  }
+  return null;
+}
+
+/** Short, log-safe path rendering for violation messages. */
+function previewForViolation(path: string): string {
+  return JSON.stringify(path.length > 80 ? `${path.slice(0, 77)}…` : path);
+}
 
 // --- state --------------------------------------------------------------------
 

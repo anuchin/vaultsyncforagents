@@ -328,23 +328,29 @@ describe('case collisions — (a) rename+edit pulled onto a case-insensitive cli
 // --- (b) a true case-colliding pair: never a tombstone, diagnostic instead -----
 
 describe('case collisions — (b) invisible twin is never deleted, diagnostic surfaced', () => {
-  it('Linux-created Note.md + NOTE.md: Windows client pushes no tombstone, reports caseCollisions', async () => {
-    const { server, desktop, mobile, settle } = await makeRig();
+  it('legacy colliding pair (seeded pre-gate): Windows client pushes no tombstone, reports caseCollisions', async () => {
+    // A colliding pair can no longer be CREATED through commits (the §14
+    // admission gate refuses the second one), so this rigs the state of a
+    // LEGACY vault — exactly what pre-gate servers synced: both heads live,
+    // seeded directly past admission.
+    let t = 1_000_000;
+    const now = (): number => ++t;
+    const server = new InMemorySyncServer({ now, vaultName: 'personal' });
+    server.register('dev-daemon', 'Daemon', 'daemon');
+    await server.seedLegacyFileForTests('/notes/Note.md', enc('lowercase note'), { deviceId: 'dev-daemon' });
+    await server.seedLegacyFileForTests('/notes/NOTE.md', enc('uppercase note'), { deviceId: 'dev-daemon' });
 
-    // The case-sensitive desktop creates BOTH files (the "Linux daemon"
-    // origin of a colliding pair). The live add of the second case is
-    // DEFERRED by mobile's divergence guard (the case-insensitive `exists`
-    // sees the twin), so a plan cycle — not the live path — materializes it.
-    await edit(desktop, '/notes/Note.md', 'lowercase note');
-    await settle();
-    await edit(desktop, '/notes/NOTE.md', 'uppercase note');
+    const mobile = makeDevice(server, 'dev-mobile', 'Mobile', new CaseInsensitiveStorage(now), now);
+    await mobile.client.connect(); // fresh connect — the full manifest carries the pair
+    mobile.client.startWatching(mobile.watch);
+    const settle = async (): Promise<void> => {
+      for (let round = 0; round < 4; round++) await mobile.client.waitIdle();
+    };
     await settle();
 
-    // Cycle 1 pulls the second head: mobile's index now holds both live
+    // The pull materialized both heads: mobile's index holds both live
     // entries while its filesystem shows exactly one directory entry.
     const marker = mobile.sent.length;
-    await mobile.client.triggerSync();
-    await settle();
     const index = mobile.client.currentIndex();
     expect(index['/notes/Note.md']).toBeDefined();
     expect(index['/notes/NOTE.md']).toBeDefined();
@@ -352,23 +358,23 @@ describe('case collisions — (b) invisible twin is never deleted, diagnostic su
       (await mobile.storage.listFiles())
         .map((f) => f.path)
         .filter((p) => p !== '/.vaultsyncforagents/state'),
-    ).toEqual(['/notes/NOTE.md']);
+    ).toEqual(['/notes/Note.md']);
     expect(mobile.sent.slice(marker).filter((m) => m.type === 'commit')).toEqual([]);
 
-    // THE bug: mobile's next scan saw /notes/Note.md "gone" and pushed a
-    // tombstone that deleted it server-side and on the desktop. Now the
-    // deletion is suppressed and surfaced as a diagnostic instead.
+    // THE bug this guards: mobile's next scan saw the invisible twin (the
+    // NOTE.md entry — not the disk's casing) "gone" and pushed a tombstone
+    // that deleted it server-side. The deletion is suppressed and surfaced
+    // as a diagnostic instead.
     await mobile.client.triggerSync();
     await settle();
-    expect(mobile.client.status().caseCollisions).toEqual(['/notes/Note.md']);
+    expect(mobile.client.status().caseCollisions).toEqual(['/notes/NOTE.md']);
     expect(mobile.sent.slice(marker).filter((m) => m.type === 'commit')).toEqual([]);
 
-    // The twin survived everywhere: server head not tombstoned, desktop's
-    // file still on disk — and repeated cycles keep pushing nothing.
+    // The twin survived server-side — and repeated cycles keep pushing nothing.
     await mobile.client.triggerSync();
     await settle();
+    expect(server.snapshot().files.find((f) => f.path === '/notes/NOTE.md')?.deleted).toBe(false);
     expect(server.snapshot().files.find((f) => f.path === '/notes/Note.md')?.deleted).toBe(false);
-    expect(text(await desktop.storage.readFile('/notes/Note.md'))).toBe('lowercase note');
     expect(mobile.sent.slice(marker).filter((m) => m.type === 'commit')).toEqual([]);
   });
 });

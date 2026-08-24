@@ -46,12 +46,19 @@
  *                  beneath the directory, this is genuine local recreation:
  *                  the dir lands in `emptyFolders` instead, restoring the
  *                  placeholder — local wins is correct there.
- *   - `caseCollisions` — live index entries whose path differs only by case
- *                  from a file present on disk: the invisible twin of a
- *                  case-colliding pair (ARCHITECTURE §14). NEVER deleted —
- *                  emitting a tombstone would destroy the twin on the server
- *                  and on case-sensitive peers. Surfaced as a diagnostic
- *                  only; the collision stays unresolved by design.
+ *   - `caseCollisions` — live index entries whose path folds (case-insensibly
+ *                  AND canonically — `foldKeyForPath`) to the same key as a
+ *                  file present on disk under a DIFFERENT name: the invisible
+ *                  twin of a fold-colliding pair (ARCHITECTURE §14). NEVER
+ *                  deleted — emitting a tombstone would destroy the twin on
+ *                  the server and on case-sensitive peers. Listed disk files
+ *                  are canonicalized to NFC before diffing (macOS's NFD and
+ *                  a Windows file of the same name are ONE synchronized path),
+ *                  and where two disk entries fold to one canonical path the
+ *                  deterministic loser lands in this bucket too. Surfaced as
+ *                  a diagnostic only; the collision stays unresolved until a
+ *                  human renames, and the server independently refuses to
+ *                  admit a second live path sharing the key (§14).
   *   - `unsafePaths` — files and directories whose names are Windows-unsafe
   *                  (reserved device names, trailing dot/space — `paths.ts`).
   *                  Like case collisions they are never pushed and never
@@ -88,7 +95,7 @@ import type { FileStat, StorageAdapter } from './adapters.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
 import type { LocalIndex, LocalIndexEntry } from './localindex.js';
-import { isStrictlyBeneath, isWindowsUnsafePath, parentPath } from './paths.js';
+import { foldKeyForPath, isStrictlyBeneath, isWindowsUnsafePath, parentPath } from './paths.js';
 
 /** Injectable content hash (the default is sha256, same as blob addressing). */
 export type HashFn = (bytes: Uint8Array) => Promise<string>;
@@ -248,6 +255,30 @@ export async function scanVault(
 
   const files = await storage.listFiles();
 
+  // Canonicalize every listed path to NFC (the system's canonical form —
+  // `paths.ts`): a macOS client listing `Cafe\u0301.md` (NFD) and a Windows
+  // client listing `Café.md` (NFC) are ONE synchronized path, so the two
+  // vaults converge instead of forking byte-distinct twins. READS keep the
+  // raw disk name (on case-sensitive filesystems the raw form is the only
+  // one that opens); every keyed structure (index diffs, buckets) uses the
+  // canonical form. Two disk entries folding to the SAME canonical path
+  // (real on ext4, impossible on case- or normalization-insensitive fs) are
+  // a fold collision: the deterministic first (by raw name) syncs, the rest
+  // are surfaced as diagnostics — never merged, never silently chosen.
+  type CanonFile = { rawPath: string; canon: string; size: number; mtime: number };
+  const canonFiles: CanonFile[] = [];
+  const canonSeen = new Map<string, string>(); // canon → first raw (sorted input)
+  const foldCollisionTwins: string[] = [];
+  for (const file of [...files].sort((a, b) => compareStrings(a.path, b.path))) {
+    const canon = canonVaultPath(file.path);
+    if (canonSeen.has(canon)) {
+      foldCollisionTwins.push(file.path);
+      continue;
+    }
+    canonSeen.set(canon, file.path);
+    canonFiles.push({ rawPath: file.path, canon, size: file.size, mtime: file.mtime });
+  }
+
   // Symlink policy (see `StorageAdapter.listSymlinks`): links are never
   // followed, so content beneath a link simply does not appear in `files` —
   // which the deletion pass below would otherwise misread as "the user
@@ -268,17 +299,17 @@ export async function scanVault(
   // deletion or placeholder for them would churn against a server that
   // rejects the path. They surface as diagnostics instead.
   const unsafePaths: string[] = [];
-  const syncable: FileStat[] = [];
-  for (const file of files) {
-    if (isWindowsUnsafePath(file.path)) unsafePaths.push(file.path);
+  const syncable: CanonFile[] = [];
+  for (const file of canonFiles) {
+    if (isWindowsUnsafePath(file.canon)) unsafePaths.push(file.canon);
     else syncable.push(file);
   }
 
-  const kept: FileStat[] = [];
+  const kept: CanonFile[] = [];
   for (const file of syncable) {
-    if (!isIgnored(file.path, settings)) kept.push(file);
+    if (!isIgnored(file.canon, settings)) kept.push(file);
   }
-  const keptPaths = new Set(kept.map((f) => f.path));
+  const keptPaths = new Set(kept.map((f) => f.canon));
 
   const added: ScanCandidate[] = [];
   const modified: ScanCandidate[] = [];
@@ -287,29 +318,31 @@ export async function scanVault(
   onProgress?.(0, kept.length);
   let scanned = 0;
   for (const file of kept) {
-    const entry = index[file.path];
+    const entry = index[file.canon];
     if (mode === 'fast' && statMatchesEntry(entry, file)) {
       scanned += 1;
       onProgress?.(scanned, kept.length);
       continue; // size+mtime unchanged since the recorded hash — trust it
     }
-    const hash = await hashFn(await storage.readFile(file.path));
-    hashed.push({ path: file.path, hash, size: file.size, mtime: file.mtime });
+    // Reads use the RAW disk name (the only one that opens on a
+    // case-sensitive fs); the hash is keyed under the CANONICAL path.
+    const hash = await hashFn(await storage.readFile(file.rawPath));
+    hashed.push({ path: file.canon, hash, size: file.size, mtime: file.mtime });
     scanned += 1;
     onProgress?.(scanned, kept.length);
     if (entry === undefined) {
-      added.push({ path: file.path, hash, size: file.size });
+      added.push({ path: file.canon, hash, size: file.size });
       continue;
     }
     if (entry.isFolder) {
       // A real file replaced a folder placeholder: treat as content change.
-      modified.push({ path: file.path, hash, size: file.size });
+      modified.push({ path: file.canon, hash, size: file.size });
       continue;
     }
     // Tombstoned entry with the file back ⇒ modified (resurrect or
     // edit-of-deleted — both resolve the same way downstream).
     if (entry.deletedAt !== undefined || entry.hash !== hash) {
-      modified.push({ path: file.path, hash, size: file.size });
+      modified.push({ path: file.canon, hash, size: file.size });
     }
   }
 
@@ -329,22 +362,33 @@ export async function scanVault(
     deleted.push({ path, hash: entry.hash, size: entry.size, versionId: entry.versionId });
   }
 
+  // Directories canonicalize too (before the fold-collision split, which
+  // consumes the twin list).
+  const rawDirs = await storage.listDirs();
+  const canonDirsSeen = new Set<string>();
+  const syncableDirs: string[] = [];
+  for (const dir of rawDirs) {
+    const canon = canonVaultPath(dir);
+    if (canonDirsSeen.has(canon)) {
+      foldCollisionTwins.push(dir);
+      continue;
+    }
+    canonDirsSeen.add(canon);
+    if (isWindowsUnsafePath(canon)) unsafePaths.push(canon);
+    else syncableDirs.push(canon);
+  }
+
   const { renamed, deleted: unmatchedDeleted, added: unmatchedAdded } = detectRenames(deleted, added);
-  const { deleted: safeDeleted, caseCollisions } = splitCaseCollisions(
+  const { deleted: safeDeleted, caseCollisions } = splitFoldCollisions(
     unmatchedDeleted,
     keptPaths,
     new Set([...unmatchedAdded.map((c) => c.path), ...modified.map((c) => c.path), ...renamed.map((r) => r.to)]),
+    foldCollisionTwins,
   );
-  const dirs = await storage.listDirs();
-  const syncableDirs: string[] = [];
-  for (const dir of dirs) {
-    if (isWindowsUnsafePath(dir)) unsafePaths.push(dir);
-    else syncableDirs.push(dir);
-  }
   const { emptyFolders, staleDirs } = detectEmptyFolders(
     index,
     settings,
-    syncable,
+    syncable.map((f) => f.canon),
     syncableDirs,
     thisDeviceId,
   );
@@ -368,36 +412,43 @@ export async function scanVault(
 }
 
 /**
- * Case-collision guard (ARCHITECTURE §14): an unmatched deletion whose path
- * differs only by case from a file PRESENT on disk is not a deletion the user
- * made — it is the invisible twin of a case-colliding pair (creatable from a
- * case-sensitive client, e.g. the Linux daemon). This case-insensitive
- * filesystem shows only one directory entry for both, so emitting the delete
- * would push a tombstone that destroys the twin server-side and on every
- * case-sensitive peer. Instead the path is surfaced as a `caseCollisions`
- * diagnostic (never a deletion push); the collision itself stays unresolved
- * until a human renames one of the pair.
+ * Fold-collision guard (ARCHITECTURE §14): an unmatched deletion whose path
+ * folds (case + canonical form — `foldKeyForPath`) to a file PRESENT on disk
+ * under a different name is not a deletion the user made — it is the
+ * invisible twin of a fold-colliding pair (creatable from a case-sensitive
+ * client, e.g. the Linux daemon). This filesystem shows only one directory
+ * entry for both, so emitting the delete would push a tombstone that
+ * destroys the twin server-side and on every case-sensitive peer. Instead
+ * the path is surfaced as a `caseCollisions` diagnostic (never a deletion
+ * push); the collision itself stays unresolved until a human renames one of
+ * the pair (and since the protocol revision, a NEW colliding path is refused
+ * by the server outright — this guard covers legacy pairs and reports).
+ *
+ * Also appended: `twins` — the losing raw names of fold-canonicalization
+ * (two disk entries mapping to one canonical path); same human-visible
+ * disease (only one can sync), same treatment (report, never touch).
  *
  * The guard deliberately runs AFTER rename correlation and skips twins that
- * this scan reports as added/modified/renamed-to: a case-only rename (or
- * rename+edit) the user performed on THIS device produces exactly that
+ * this scan reports as added/modified/renamed-to: a case-only (or canonical)
+ * rename the user performed on THIS device produces exactly that
  * delete+twin-changed shape, and its decomposition into delete+add is the
  * documented, correct behavior (applyPull orders case-colliding pulls
  * delete-first, `resolve.ts`). Only a twin that is otherwise UNCHANGED —
  * meaning it is a genuinely separate remote file this disk can only show one
  * of — suppresses the deletion.
  */
-function splitCaseCollisions(
+function splitFoldCollisions(
   deleted: readonly DeletedCandidate[],
   keptPaths: ReadonlySet<string>,
   changedPaths: ReadonlySet<string>,
+  twins: readonly string[],
 ): { deleted: DeletedCandidate[]; caseCollisions: string[] } {
-  const keptByLower = new Map<string, string>();
-  for (const path of keptPaths) keptByLower.set(path.toLowerCase(), path);
+  const keptByFold = new Map<string, string>();
+  for (const path of keptPaths) keptByFold.set(foldKeyForPath(path), path);
   const safeDeleted: DeletedCandidate[] = [];
-  const caseCollisions: string[] = [];
+  const caseCollisions: string[] = [...twins];
   for (const candidate of deleted) {
-    const twin = keptByLower.get(candidate.path.toLowerCase());
+    const twin = keptByFold.get(foldKeyForPath(candidate.path));
     if (twin !== undefined && !changedPaths.has(twin)) {
       caseCollisions.push(candidate.path);
       continue;
@@ -406,7 +457,7 @@ function splitCaseCollisions(
   }
   return {
     deleted: safeDeleted,
-    caseCollisions: caseCollisions.sort(compareStrings),
+    caseCollisions: [...new Set(caseCollisions)].sort(compareStrings),
   };
 }
 
@@ -415,12 +466,24 @@ function compareStrings(a: string, b: string): number {
 }
 
 /**
+ * The scan's canonical form for a listed path: NFC. Whole-path normalization
+ * is equivalent to segment-wise here (`/` is ASCII), and it never throws —
+ * raw names come from disk, and canonicalization must not be able to fail.
+ */
+function canonVaultPath(path: string): string {
+  return path.normalize('NFC');
+}
+
+/**
  * Whether the file's stat exactly matches its live index entry — the fast
  * mode pre-filter. Requires a known recorded `mtime` (legacy entries and
  * pull-written entries have none ⇒ hashed, then recorded) and never fires
  * for tombstones (a resurrect must always surface) or folder placeholders.
  */
-function statMatchesEntry(entry: LocalIndexEntry | undefined, file: FileStat): boolean {
+function statMatchesEntry(
+  entry: LocalIndexEntry | undefined,
+  file: { size: number; mtime: number },
+): boolean {
   return (
     entry !== undefined &&
     entry.deletedAt === undefined &&
@@ -539,13 +602,13 @@ function detectRenames(
 function detectEmptyFolders(
   index: LocalIndex,
   settings: IgnoreSettings,
-  files: readonly FileStat[],
+  files: readonly string[],
   dirs: readonly string[],
   thisDeviceId?: string,
 ): { emptyFolders: string[]; staleDirs: string[] } {
   const representedDirs = new Set<string>();
-  for (const file of files) {
-    for (let dir = parentPath(file.path); dir !== '/'; dir = parentPath(dir)) {
+  for (const filePath of files) {
+    for (let dir = parentPath(filePath); dir !== '/'; dir = parentPath(dir)) {
       representedDirs.add(dir);
     }
   }

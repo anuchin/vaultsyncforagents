@@ -1,11 +1,15 @@
 /**
  * Vault path utilities.
  *
- * Vault-internal paths are POSIX-normalized strings relative to the vault root:
+ * Vault-internal paths are POSIX-normalized strings relative to the vault root,
+ * in CANONICAL Unicode form:
  *   - always start with `/` (`/a/b.md`); the vault root itself is `/`
  *   - segments separated by `/`; no trailing slash, no `.`/`..` segments,
  *     no duplicate slashes
  *   - never escape the root: any `..` that would pop above `/` is rejected
+ *   - every segment is NFC-normalized (Unicode canonical composition), so
+ *     canonically-equal names (macOS's NFD vs everyone's NFC) fold to ONE
+ *     path everywhere in the system — see `foldKeyForPath`
  *
  * Backslashes are converted to `/` (Windows callers routinely hand us
  * `dir\file.md`), but absolute Windows paths (drive letters like `C:/`, UNC
@@ -36,6 +40,11 @@ export class InvalidVaultPathError extends Error {
  * leading `//`, NUL bytes, and Windows-unsafe segments — reserved device
  * names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, any
  * extension, any case) and segments ending in `.` or ` `.
+ *
+ * Accepted input in any Unicode normalization form comes out NFC (segments
+ * only — the `/` separators are ASCII). NFC is the canonical form because it
+ * is what NFC-habitual platforms (Windows, Linux input paths, the web) keep
+ * by default, and what the server enforces (`isNFCPath`).
  */
 export function normalizeVaultPath(input: string): VaultPath {
   if (typeof input !== 'string') {
@@ -79,7 +88,7 @@ export function normalizeVaultPath(input: string): VaultPath {
         `Vault path segment is a Windows-reserved device name or ends with a dot/space: ${JSON.stringify(segment)}`,
       );
     }
-    segments.push(segment);
+    segments.push(segment.normalize('NFC'));
   }
   return segments.length === 0 ? '/' : `/${segments.join('/')}`;
 }
@@ -188,4 +197,42 @@ function isWindowsUnsafeSegment(segment: string): boolean {
  */
 export function isWindowsUnsafePath(path: string): boolean {
   return path.split('/').some((segment) => isWindowsUnsafeSegment(segment));
+}
+
+// --- Canonical-form and fold keys (protocol path safety, §14) -----------------
+
+/**
+ * Whether every segment of `path` is already in NFC canonical form — the
+ * server's admission rule for NEW paths. Clients normalize at their scan
+ * seam (`scanVault`) so they never emit non-NFC paths; the check is the
+ * defense that keeps a non-conforming client from forking canonically-equal
+ * names (`Café.md` NFC vs `Cafe\u0301.md` NFD) into two vault files.
+ *
+ * NFC alone does NOT make two names unique on disk the way a fold does —
+ * it is the composition canonical form; pair it with `foldKeyForPath` for
+ * collision checks.
+ */
+export function isNFCPath(path: string): boolean {
+  return path.normalize('NFC') === path;
+}
+
+/**
+ * The fold key two paths share when they cannot safely coexist in one vault:
+ * NFC canonical form, case-folded. Two live entries MUST NEVER share a key —
+ * on case-insensitive filesystems (Windows, macOS) only one of the pair is
+ * visible at a time, and on every platform canonically-equal-but-byte-
+ * distinct names (NFC vs NFD) are the same name to a human. The server
+ * rejects the second commit that would share a key (`PATH_COLLIDES`), and
+ * clients pre-suppress such pushes (never pushed, surfaced as diagnostics —
+ * same UX contract as the case-collision guard, which this widens from
+ * case-only to case + canonical form).
+ *
+ * The fold is deliberately pragmatic — `String.prototype.toLowerCase()`
+ * (locale-independent Unicode default case mapping), exactly what the
+ * pre-existing client guard used. Full UAX#21 case folding (ß→ss, final
+ * sigma) would need a pinned table; default lowercasing covers the entire
+ * realistic collision space for vault filenames.
+ */
+export function foldKeyForPath(path: string): string {
+  return path.normalize('NFC').toLowerCase();
 }

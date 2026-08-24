@@ -30,7 +30,7 @@
 import { compareClocks, nextClock } from './clock.js';
 import { conflictCopyPath } from './conflictnames.js';
 import type { LocalIndex, LocalIndexEntry } from './localindex.js';
-import { parentPath } from './paths.js';
+import { foldKeyForPath, parentPath } from './paths.js';
 import type { ManifestEntry } from './protocol.js';
 import type { DeletedCandidate, LocalChanges, RenameCandidate, ScanCandidate } from './scan.js';
 import type { LogicalClock } from './types.js';
@@ -438,7 +438,7 @@ export function computeSyncPlan(input: SyncPlanInput): SyncPlan {
   }
 
   return {
-    pushes: pushes.sort((a, b) => compareStrings(opPath(a), opPath(b))),
+    pushes: hoistFoldPairedDeletes(pushes.sort((a, b) => compareStrings(opPath(a), opPath(b)))),
     pulls: pulls.sort(comparePullOps),
     conflicts: conflicts.sort((a, b) => compareStrings(a.path, b.path)),
     folderPushes: [...localChanges.emptyFolders].sort(compareStrings),
@@ -667,6 +667,37 @@ function opPath(op: PushOp | PullOp): string {
  * files, so relative order does not matter; only the case-colliding pair is
  * reordered, every other pair keeps the exact-path sort.
  */
+/**
+ * §14 companion ordering: when one plan contains BOTH a delete of path D and
+ * a content push to a path that FOLD-collides with D (the case/canonical
+ * rename fallback — `Cafe.md` → `café.md`, `Note.md` → `NOTE.md`), the
+ * delete must reach the server FIRST: the admission gate refuses a new live
+ * path whose fold key is occupied, and only D's tombstone frees the key.
+ * Plan candidates sort adds before deletes lexicographically, so without
+ * this hoist the fold-rename would take a two-cycle detour (collision drop,
+ * then a retry) — or worse if the cycles were manual. One delete per path
+ * per plan (the scan buckets by path), so a single hoist per pair suffices;
+ * ordering among unrelated pushes is preserved (splice is stable).
+ */
+function hoistFoldPairedDeletes(pushes: PushOp[]): PushOp[] {
+  const result = [...pushes];
+  for (let i = 0; i < result.length; i++) {
+    const push = result[i]!;
+    if (push.kind === 'delete') continue;
+    const key = foldKeyForPath(opPath(push));
+    const deleteIdx = result.findIndex(
+      (candidate, idx) =>
+        idx > i && candidate.kind === 'delete' && foldKeyForPath(opPath(candidate)) === key,
+    );
+    if (deleteIdx > i) {
+      const [deletion] = result.splice(deleteIdx, 1);
+      result.splice(i, 0, deletion!);
+      i++; // the pushed op now sits one later; continue after it
+    }
+  }
+  return result;
+}
+
 function comparePullOps(a: PullOp, b: PullOp): number {
   const byExact = compareStrings(opPath(a), opPath(b));
   if (byExact === 0) return 0;

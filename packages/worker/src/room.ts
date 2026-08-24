@@ -29,6 +29,7 @@ import {
   INLINE_CONTENT_MAX_BYTES,
   normalizeVaultPath,
   parseMessage,
+  pathSafetyViolation,
   planSnapshotRestore,
   ProtocolVersion,
   sha256Hex,
@@ -524,12 +525,27 @@ export class VaultRoom extends DurableObject<Env> {
       return;
     }
 
+    // 1b. Path safety (§14): never admit a NEW live path under an occupied
+    //     fold key (case + canonical form). Its own error code — PATH_COLLIDES
+    //     deliberately does NOT trip the protocol-error counter: a client
+    //     retrying a legitimately-conflicting name is not a protocol
+    //     violator, and disconnecting it would wedge honest retries.
+    const arbitrationState = this.loadArbitrationState();
+    const pathViolation = pathSafetyViolation(arbitrationState.files, {
+      path: message.path,
+      ...(message.fromPath !== undefined ? { fromPath: message.fromPath } : {}),
+    });
+    if (pathViolation !== null) {
+      this.failWs(ws, pathViolation.code, pathViolation.message);
+      return;
+    }
+
     // 2. Validate the content claim (mirrors InMemorySyncServer exactly).
     const inlineBytes = await this.verifyCommitContent(ws, message);
     if (inlineBytes === null) return; // error already sent
 
     // 3. Arbitrate with the shared core brain.
-    const state = this.loadArbitrationState();
+    const state = arbitrationState;
     const devices = new Map<string, string>(
       this.sql('SELECT id, name FROM devices').toArray().map((r) => [r.id as string, r.name as string]),
     );
@@ -1828,7 +1844,7 @@ export class VaultRoom extends DurableObject<Env> {
 
   private failWs(
     ws: WebSocket,
-    code: 'UNAUTHORIZED' | 'REVOKED' | 'NOT_FOUND' | 'PROTOCOL',
+    code: 'UNAUTHORIZED' | 'REVOKED' | 'NOT_FOUND' | 'PROTOCOL' | 'PATH_COLLIDES',
     message: string,
   ): void {
     this.safeSend(ws, { type: 'error', code, message });

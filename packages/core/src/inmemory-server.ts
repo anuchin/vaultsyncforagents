@@ -10,10 +10,11 @@
  * disagrees with a simulation, the bug is in the glue, not the arbitration.
  */
 
-import type { DeviceType, VaultSettings } from './types.js';
+import type { DeviceType, VaultSettings, Version } from './types.js';
 import {
   arbitrateCommit,
   emptyArbitrationState,
+  pathSafetyViolation,
   type ArbitrationState,
 } from './server/arbitrate.js';
 import {
@@ -32,6 +33,7 @@ import {
   type ClientMessage,
   type CommitMessage,
   type ManifestEntry,
+  type ServerErrorCode,
   type ServerMessage,
   type SnapshotCreateMessage,
   type SnapshotRestoreMessage,
@@ -157,6 +159,39 @@ export class InMemorySyncServer {
    * table. After this, `helloAck.oldestRetainedSeq` rises and clients with an
    * older cursor must fall back to a full manifest.
    */
+  /**
+   * Test-only: seed a live file head + its blob DIRECTLY, bypassing protocol
+   * admission (path safety §14). Manufactures the state of a LEGACY vault —
+   * one whose colliding or non-canonical paths predate the gate, which the
+   * gate deliberately keeps syncable (edits to existing heads flow). No
+   * change event is recorded: seeds surface through full manifests (fresh
+   * connects), mirroring a vault that existed before this server watched.
+   */
+  async seedLegacyFileForTests(
+    path: string,
+    content: Uint8Array,
+    options?: { deviceId?: string },
+  ): Promise<void> {
+    const deviceId = options?.deviceId ?? 'dev-legacy';
+    const hash = await sha256Hex(content);
+    this.blobs.set(hash, content);
+    const id = `v${this.state.versions.size + 1}`;
+    const counter = ++this.seq; // above any future commit's parent counter
+    const version: Version = {
+      id,
+      path,
+      hash,
+      size: content.byteLength,
+      deviceId,
+      clock: { counter, deviceId },
+      parentVersion: null,
+      ts: this.now(),
+      kind: 'edit',
+    };
+    this.state.versions.set(id, version);
+    this.state.files.set(path, { currentVersion: id, head: version, deleted: false });
+  }
+
   pruneEventsForTests(beforeSeq: number): void {
     while (this.log.length > 0 && this.log[0]!.seq < beforeSeq) this.log.shift();
   }
@@ -321,6 +356,17 @@ export class InMemorySyncServer {
     if (device) device.lastSeen = this.now();
     const content = await this.verifyCommitContent(server, message);
     if (content === null) return; // error already sent
+
+    // Path safety (§14): NFC canonical form always; no NEW live path under an
+    // occupied fold key. Same gate the DO room runs, byte for byte.
+    const violation = pathSafetyViolation(this.state.files, {
+      path: message.path,
+      ...(message.fromPath !== undefined ? { fromPath: message.fromPath } : {}),
+    });
+    if (violation !== null) {
+      this.fail(server, violation.code, violation.message);
+      return;
+    }
 
     const verdict = arbitrateCommit(
       this.state,
@@ -507,7 +553,7 @@ export class InMemorySyncServer {
     }
   }
 
-  private fail(server: MemoryTransport, code: 'UNAUTHORIZED' | 'REVOKED' | 'NOT_FOUND' | 'PROTOCOL', message: string): void {
+  private fail(server: MemoryTransport, code: ServerErrorCode, message: string): void {
     this.reply(server, { type: 'error', code, message });
     if (code === 'UNAUTHORIZED' || code === 'REVOKED') server.close({ code: 1008, reason: code });
   }

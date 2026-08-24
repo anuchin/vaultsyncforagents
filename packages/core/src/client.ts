@@ -808,11 +808,13 @@ export class SyncClient {
    * logged once per record until a human renames it. Deduped; replaced at
    * the start of every cycle.
    */
-  private recordSkippedPath(path: string): void {
+  private recordSkippedPath(path: string, reason?: string): void {
     if (this.skippedPaths.includes(path)) return;
     this.skippedPaths.push(path);
     this.log.warn(
-      'skipping a Windows-unsafe path (reserved device name or trailing dot/space); rename it to sync',
+      reason !== undefined
+        ? `skipping path: ${reason}`
+        : 'skipping a Windows-unsafe path (reserved device name or trailing dot/space); rename it to sync',
       path,
     );
   }
@@ -1313,7 +1315,20 @@ export class SyncClient {
       (m) => m.type === 'commitAck' || m.type === 'conflict' || m.type === 'error',
       () => transport.send(message),
     );
-    if (reply.type === 'error') throw this.toError(reply);
+    if (reply.type === 'error') {
+      if (reply.code === 'PATH_COLLIDES') {
+        // §14: the server refused to admit a fold-colliding NEW path. Never
+        // wedge the cycle on it — drop the commit into the skipped-path
+        // diagnostics (retried each cycle like a Windows-unsafe path, until
+        // a human renames) and settle the pipeline slot.
+        this.recordSkippedPath(
+          commit.path,
+          'the server refused it: the name collides with another synced entry under the case/canonical fold; rename one of them',
+        );
+        return;
+      }
+      throw this.toError(reply);
+    }
     if (reply.type === 'commitAck') {
       validateCommitAckMessage(reply);
     } else {
