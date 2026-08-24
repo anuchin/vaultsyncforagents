@@ -1,8 +1,18 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022"],
-    "types": ["@cloudflare/vitest-pool-workers"]
+    "lib": [
+      "ES2022"
+    ],
+    "types": [
+      "@cloudflare/vitest-pool-workers"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@vsa/core": [
+        "../core/src/index.ts"
+      ]
+    }
   },
   "include": [
     "src",

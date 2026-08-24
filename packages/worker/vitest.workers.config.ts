@@ -28,7 +28,9 @@ export default defineWorkersConfig({
     alias: [
       {
         find: /^@vsa\/core$/,
-        replacement: fileURLToPath(new URL('../core/src/index.ts', import.meta.url)),
+        // `.href`: the DOM/workerd `URL` type union does not satisfy
+        // fileURLToPath's parameter typing in this package's tsconfig mix.
+        replacement: fileURLToPath(new URL('../core/src/index.ts', import.meta.url).href),
       },
     ],
   },

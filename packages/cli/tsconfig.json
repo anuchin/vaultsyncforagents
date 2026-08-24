@@ -1,7 +1,28 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@vsa/core": [
+        "../core/src/index.ts"
+      ],
+      "@vsa/daemon": [
+        "../daemon/src/index.ts"
+      ],
+      "@vsa/node-runtime": [
+        "../node-runtime/src/index.ts"
+      ]
+    }
   },
-  "include": ["src", "test", "vitest.config.ts", "bin"]
+  "include": [
+    "src",
+    "test",
+    "vitest.config.ts",
+    "bin"
+  ]
 }
