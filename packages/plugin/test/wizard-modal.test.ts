@@ -5,10 +5,10 @@
  * Back button, and the multi-account first pass rendering a picker.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { App, PluginManifest } from 'obsidian';
 import { VaultSyncPlugin } from '../src/plugin.js';
-import { SetupWizardModal } from '../src/wizard-modal.js';
+import { SetupWizardModal, createTokenPageUrl } from '../src/wizard-modal.js';
 import { Notice, resetObsidianMock, Setting, type SettingRecord } from './helpers/obsidian-mock.js';
 import { makeFakeApp, FakeVault } from './helpers/fake-vault.js';
 import { offlineWsFactory } from './helpers/network-fakes.js';
@@ -70,6 +70,32 @@ describe('SetupWizardModal', () => {
     await findButton('Deploy your worker').click();
     expect(Notice.messages.some((m) => m.message.includes('vault a name'))).toBe(true);
     modal.close();
+  });
+
+  it('"Create token" opens Cloudflare with the exact permissions preselected', async () => {
+    const open = vi.fn();
+    vi.stubGlobal('window', { open });
+    try {
+      const modal = openModal();
+      await findButton('Create token').click();
+      expect(open).toHaveBeenCalledTimes(1);
+      const url = open.mock.calls[0]?.[0] as string;
+      expect(url).toContain('https://dash.cloudflare.com/profile/api-tokens?');
+      // The documented template-URL mechanism: encoded permission groups +
+      // account/zone scoping + a prefilled name.
+      const query = new URL(url).searchParams;
+      expect(JSON.parse(query.get('permissionGroupKeys') ?? '[]')).toEqual([
+        { key: 'workers_scripts', type: 'edit' },
+        { key: 'workers_r2', type: 'edit' },
+        { key: 'account_settings', type: 'read' },
+      ]);
+      expect(query.get('accountId')).toBe('*');
+      expect(query.get('zoneId')).toBe('all');
+      expect(createTokenPageUrl()).toBe(url);
+      modal.close();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('happy path: deploys, then "Use this worker" persists the URL and applies', async () => {

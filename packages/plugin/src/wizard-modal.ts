@@ -22,8 +22,31 @@ import {
 import type { CloudflareAccountInfo } from './cloudflare-deploy.js';
 import type { VaultSyncPlugin } from './plugin.js';
 
-/** Where "Create an API token" sends the user. */
-export const CF_TOKENS_URL = 'https://dash.cloudflare.com/profile/api-tokens';
+/**
+ * The "Create token" target: Cloudflare's token-creation page with this
+ * deploy's exact permissions PRESELECTED via `permissionGroupKeys` (the
+ * documented template-URL mechanism — developers.cloudflare.com/fundamentals/
+ * api/how-to/account-owned-token-template/). Equivalent to the "Edit
+ * Cloudflare Workers" template: Workers Scripts edit (upload the script +
+ * DO migration), R2 storage edit (create the bucket), Account Settings read
+ * (account lookup). Degrades gracefully: if Cloudflare ever drops the
+ * preselection, the user still lands on the right page and the field's
+ * description spells out the manual template.
+ */
+export function createTokenPageUrl(): string {
+  const permissionGroupKeys = JSON.stringify([
+    { key: 'workers_scripts', type: 'edit' },
+    { key: 'workers_r2', type: 'edit' },
+    { key: 'account_settings', type: 'read' },
+  ]);
+  const params = new URLSearchParams({
+    permissionGroupKeys,
+    accountId: '*',
+    zoneId: 'all',
+    name: 'VaultSync worker deploy',
+  });
+  return `https://dash.cloudflare.com/profile/api-tokens?${params.toString()}`;
+}
 
 type WizardState = 'form' | 'deploying' | 'done' | 'error';
 
@@ -79,7 +102,7 @@ export class SetupWizardModal extends Modal {
     new Setting(this.contentEl as never)
       .setName('Cloudflare API token')
       .setDesc(
-        `A token with the "Edit Cloudflare Workers" template's permissions (Workers Scripts + R2 Storage + Account Settings). Create one at ${CF_TOKENS_URL} → Create Token. Used for this deploy only, never stored.`,
+        `A token with the "Edit Cloudflare Workers" template's permissions (Workers Scripts + R2 Storage + Account Settings). "Create token" opens Cloudflare's page with these preselected — just Continue to create. Used for this deploy only, never stored.`,
       )
       .addText((text) => {
         text.setPlaceholder('paste your token').onChange((value) => {
@@ -91,7 +114,7 @@ export class SetupWizardModal extends Modal {
       })
       .addButton((button) =>
         button.setButtonText('Create token').onClick(() => {
-          if (typeof window !== 'undefined') window.open(CF_TOKENS_URL, '_blank');
+          if (typeof window !== 'undefined') window.open(createTokenPageUrl(), '_blank');
         }),
       );
 
