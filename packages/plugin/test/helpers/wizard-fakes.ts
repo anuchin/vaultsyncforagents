@@ -20,12 +20,24 @@ export const BUNDLE_URL = RELEASE_BUNDLE_URL;
 
 const INDEX = strToU8('<!doctype html><title>dashboard</title>');
 
+/**
+ * The fake bundle, built ONCE and shared by every route and digest
+ * assertion. fflate's zip entries carry a current-time mtime, so two
+ * `zipSync` calls a second apart hash differently — building per-call made
+ * the "served bytes" and the "pinned sha" disagree whenever the two calls
+ * straddled a second boundary (flaky on CI).
+ */
+let cachedZip: Uint8Array | null = null;
+
 export function bundleZip(): Uint8Array {
-  return zipSync({
-    'worker.js': strToU8('export { VaultRoom };\n'),
-    'dashboard/': new Uint8Array(0),
-    'dashboard/index.html': INDEX,
-  });
+  if (cachedZip === null) {
+    cachedZip = zipSync({
+      'worker.js': strToU8('export { VaultRoom };\n'),
+      'dashboard/': new Uint8Array(0),
+      'dashboard/index.html': INDEX,
+    });
+  }
+  return cachedZip;
 }
 
 export function bundleSha(): string {
