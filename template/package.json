@@ -1,0 +1,17 @@
+{
+  "name": "vaultsyncforagents-template",
+  "private": true,
+  "type": "module",
+  "description": "Deploy-button template: provisions a VaultSync for Agents worker (Worker + Durable Object + R2 + weekly GC) from a pinned release bundle. Deployed by Cloudflare Workers Builds via `npm run deploy`.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "deploy": "node scripts/prepare-deploy.mjs && wrangler deploy --config wrangler.resolved.jsonc"
+  },
+  "devDependencies": {
+    "fflate": "^0.8.3",
+    "wrangler": "^4"
+  }
+}

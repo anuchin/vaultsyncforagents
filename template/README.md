@@ -7,36 +7,54 @@ has the full picture.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/anuchin/vaultsyncforagents-template)
 
+> **Note on the repo location:** the deploy button needs a real, public repo,
+> so this template currently lives under the maintainer's personal account
+> (`anuchin`) rather than a project org. Moving it to a real org later is a
+> one-line change: replace `github.com/anuchin/` with the org URL in this
+> README, in `scripts/prepare-deploy.mjs` (the bundle-download URL), and in
+> the plugin's `DEPLOY_URL` constant — then update the deploy button URL.
+
 ## Deploy to Cloudflare (one click)
 
 1. Click the button above.
-2. Authorize GitHub (this repo is cloned into your account) and Cloudflare
-   (the deploy button configures the `CLOUDFLARE_API_TOKEN` and
-   `CLOUDFLARE_ACCOUNT_ID` secrets for you).
-3. Wait for the **Deploy vault worker** workflow to finish (a minute or two) —
-   the workflow summary shows your worker's URL.
+2. Connect your GitHub account and Cloudflare. Cloudflare clones this repo
+   into your account (you pick the name — it also names your worker) and
+   asks for the one resource the worker needs: an R2 bucket (create one,
+   the default name is fine).
+3. **Deploy** — Cloudflare's Workers Builds runs this repo's `npm run
+   deploy`, which fetches the pinned release bundle (digest-verified),
+   extracts it, resolves the worker/bucket names, creates the bucket if
+   needed, and deploys. A minute later your worker's URL is live.
 
-Prefer a terminal? Skip to [`vsa setup`](#cli-alternative-vsa-setup) below.
+Leave "Protect with Cloudflare Access" **off** — the Obsidian plugin, CLI,
+and daemon authenticate with their own device tokens and cannot pass
+through Cloudflare Access.
+
+Prefer no GitHub at all? The Obsidian plugin's **Set up a new worker…**
+wizard deploys the same bundle from inside Obsidian (API token in, claim
+URL out), or use [`vsa setup`](#cli-alternative-vsa-setup) in a terminal.
 
 ### What gets provisioned
 
 | Resource | Name (default) | For |
 |---|---|---|
-| Worker | this repo's name (override with the `WORKER_NAME` repo variable) | sync server + dashboard |
+| Worker | your repo's name (the deploy form lets you change it) | sync server + dashboard |
 | Durable Object (`VaultRoom`, SQLite) | created with the worker | single-writer sync authority (ARCHITECTURE.md §6) |
-| R2 bucket | `vaultsync-<worker name>` (override with `R2_BUCKET_NAME`) | content-addressed blobs, every version kept |
+| R2 bucket | the bucket you pick in the deploy form (default `vaultsync-<worker name>`) | content-addressed blobs, every version kept |
 | Cron trigger | Mondays 03:00 UTC | weekly orphan-blob garbage collection |
 
-All four are declared in [`wrangler.jsonc`](./wrangler.jsonc); the workflow
-resolves its `__WORKER_NAME__` / `__R2_BUCKET__` placeholders, creates the
-bucket if missing, and deploys. Nothing else lands in your account.
+All four are declared in [`wrangler.jsonc`](./wrangler.jsonc); the deploy
+command resolves the `__WORKER_NAME__` / `__R2_BUCKET__` placeholders,
+creates the bucket if missing, and deploys. Nothing else lands in your
+account — no repo secrets, no API tokens stored anywhere.
 
 ### The release bundle (artifact convention)
 
 The worker code is **not** in this repo. This template tracks a released
 version of [VaultSyncforAgents](https://github.com/anuchin/vaultsyncforagents)
-(pinned in [`VERSION`](./VERSION)) and downloads that release's
-`worker-bundle.zip` during CI:
+(pinned in [`VERSION`](./VERSION)). The deploy command downloads that
+release's `worker-bundle.zip`, verifies it against its `.sha256` sidecar,
+and extracts it:
 
 ```
 worker-bundle.zip
@@ -45,21 +63,6 @@ worker-bundle.zip
 ```
 
 Every monorepo release tag `vX.Y.Z` ships that zip as a release asset.
-
-## API token permissions
-
-If you set the secrets yourself instead of letting the deploy button do it,
-create the token at **Cloudflare dashboard → My Profile → API Tokens →
-Create Token → Custom**, scoped to your account, with:
-
-- [ ] Account → **Workers Scripts** → **Edit** (deploy the worker, run its DO migration)
-- [ ] Account → **Workers R2 Storage** → **Edit** (create the bucket)
-- [ ] Account → **Account Settings** → **Read** (account lookup during deploy)
-
-(That set is exactly what Cloudflare's built-in **"Edit Cloudflare Workers"**
-token template grants — using the template is fine.) Store it as the repo
-secret `CLOUDFLARE_API_TOKEN`, and put your account id in
-`CLOUDFLARE_ACCOUNT_ID` (dashboard → Workers & Pages → right sidebar).
 
 ## After the deploy: claim + pair
 
@@ -75,26 +78,19 @@ secret `CLOUDFLARE_API_TOKEN`, and put your account id in
 
 ## Updating to a new release
 
-- Edit [`VERSION`](./VERSION) to the release tag you want (or dispatch the
-  workflow with a `release` input for a one-off test) and push to `main` —
-  the workflow re-downloads the bundle and redeploys. Config and data
-  (DO storage + R2 blobs) are untouched.
-- To roll your own build instead, replace the download step with a checkout
-  of the monorepo and `wrangler deploy` from `packages/worker` — the
-  bindings in this template match that config.
+Edit [`VERSION`](./VERSION) to the release tag you want and push to `main` —
+Workers Builds reruns the deploy command against the new bundle. Config and
+data (DO storage + R2 blobs) are untouched.
 
 ## CLI alternative: `vsa setup`
 
-Prefer a terminal? With Node.js 22+ installed you need nothing else — no clone,
-no wrangler:
+If you have Node 20+ and prefer the terminal, the [`vsa` CLI](https://github.com/anuchin/vaultsyncforagents/tree/main/packages/cli)
+does the same flow interactively (it can also reuse an existing
+`wrangler login`):
 
 ```
 npx vaultsyncforagents setup
 ```
-
-(or `npm i -g vaultsyncforagents` for repeated use; the [`vsa` CLI]
-(https://github.com/anuchin/vaultsyncforagents/tree/main/packages/cli)
-is the same tool.)
 
 It asks for the vault name, derives `vaultsync-<slug>-<suffix>` worker +
 bucket names, authenticates (browser login or a pasted API token), downloads
@@ -106,6 +102,6 @@ URL — then hands off to `vsa link`.
 ```
 wrangler.jsonc                    # bindings; __WORKER_NAME__/__R2_BUCKET__ placeholders
 VERSION                           # pinned VaultSyncforAgents release tag
-scripts/resolve-config.mjs        # placeholder → wrangler.resolved.jsonc (+ name sanitizing)
-.github/workflows/deploy.yml      # download bundle → ensure bucket → deploy
+package.json                      # the `deploy` command Workers Builds runs
+scripts/prepare-deploy.mjs        # fetch+verify+extract bundle → resolve names → ensure bucket
 ```
