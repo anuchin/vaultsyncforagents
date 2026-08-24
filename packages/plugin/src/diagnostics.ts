@@ -276,6 +276,11 @@ export function buildSupportBundle(input: DiagnosticsInput, now: number): string
       lines.push(`- Case-colliding paths (invisible twin on this filesystem): ${collisions.length}`);
       for (const path of collisions) lines.push(`  - ${path}`);
     }
+    const symlinks = status.symlinks ?? [];
+    if (symlinks.length > 0) {
+      lines.push(`- Symlinks (never synced; contents hidden from sync): ${symlinks.length}`);
+      for (const path of symlinks) lines.push(`  - ${path}`);
+    }
     if (status.progress !== undefined) {
       lines.push(`- Progress: ${status.progress.phase} ${status.progress.done}/${status.progress.total}`);
     }

@@ -141,7 +141,8 @@ export class NodeStorageAdapter implements StorageAdapter {
    * recursively. `visit` receives the relative segments (raw names), the
    * kind, and file stats (only for `kind === 'file'`). A missing vault root
    * yields no visits — an empty vault, not an error. Entries that vanish
-   * mid-walk are skipped.
+   * mid-walk are skipped. SYMLINKS are never followed (a link may escape
+   * the vault or loop) and are collected into `links` instead of visited.
    */
   private async walk(
     relativeSegments: readonly string[],
@@ -150,6 +151,7 @@ export class NodeStorageAdapter implements StorageAdapter {
       kind: 'dir' | 'file',
       stats: { size: number; mtimeMs: number },
     ) => Promise<void>,
+    links?: string[],
   ): Promise<void> {
     const hostDir =
       relativeSegments.length === 0 ? this.root : join(this.root, ...relativeSegments);
@@ -162,15 +164,31 @@ export class NodeStorageAdapter implements StorageAdapter {
     for (const entry of entries) {
       const childSegments = [...relativeSegments, entry.name];
       const childPath = join(hostDir, entry.name);
+      if (entry.isSymbolicLink()) {
+        // Never followed: a link may point outside the vault (host content
+        // must not leak into sync) or into a loop. Collected so scans can
+        // protect occluded index entries and surface the link — see
+        // `StorageAdapter.listSymlinks`.
+        links?.push(`/${childSegments.join('/')}`);
+        continue;
+      }
       if (entry.isDirectory()) {
         await visit(childSegments, 'dir', { size: 0, mtimeMs: 0 });
-        await this.walk(childSegments, visit);
+        await this.walk(childSegments, visit, links);
       } else {
         const stats = await stat(childPath).catch(() => null);
         if (stats === null) continue; // vanished mid-walk
         await visit(childSegments, 'file', { size: stats.size, mtimeMs: stats.mtimeMs });
       }
     }
+  }
+
+  /** Every symlink inside the vault, sorted (`StorageAdapter.listSymlinks`). */
+  async listSymlinks(): Promise<readonly string[]> {
+    const links: string[] = [];
+    // The kind-specific visits are irrelevant here; the walk itself collects.
+    await this.walk([], async () => {}, links);
+    return links.sort();
   }
 }
 

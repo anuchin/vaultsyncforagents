@@ -11,8 +11,19 @@
  * Obsidian's own file watching observes them like any external edit and open
  * editors refresh (FR-3). Writes are atomic-ish: content lands in a temp file
  * under `/.vaultsyncforagents/tmp/` (core ignores that whole subtree) and is
- * renamed onto the target; if renaming is unavailable (exotic mobile
- * adapters), we fall back to a direct write.
+ * renamed onto the target. The fallback discipline is deliberately loud:
+ *
+ *   - a FAILED TEMP WRITE aborts the write outright (never a direct retry):
+ *     the same backing store that just refused the temp file would very
+ *     likely truncate the direct write too (disk full, dying mount), and a
+ *     partial file would be scanned and pushed as an "edit" — a failed
+ *     write must never become authored content. The pull simply fails and
+ *     is retried next cycle;
+ *   - a FAILED RENAME (exotic adapters with no real rename) latches
+ *     degradation: later writes go direct, the user is told via
+ *     `onDegraded`, and every direct write is verified by a post-write
+ *     size check — still not atomic against a mid-write crash, but never
+ *     silently wrong about what landed.
  */
 
 import type { DataAdapter } from 'obsidian';
@@ -41,7 +52,18 @@ export interface ObsidianStorageAdapterOptions {
    * Receives the ADAPTER path (no leading slash).
    */
   removeEmptyDir?: (adapterPath: string) => Promise<void>;
+  /**
+   * Fired ONCE per adapter lifetime when temp+rename is discovered broken:
+   * writes have degraded to non-atomic direct writes (size-verified), and the
+   * user must know that a crash mid-write can now leave a partial file that
+   * the next scan will treat as an edit. The plugin surfaces a Notice;
+   * `degradedReason` retains the cause for diagnostics.
+   */
+  onDegraded?: (cause: unknown) => void;
 }
+
+/** Why atomic writes are unavailable (null = atomic writes healthy). */
+export type WriteDegradation = { readonly cause: unknown } | null;
 
 export class ObsidianStorageAdapter implements StorageAdapter {
   private readonly adapter: DataAdapter;
@@ -52,10 +74,13 @@ export class ObsidianStorageAdapter implements StorageAdapter {
    */
   private tempRenameBroken = false;
   private tempCounter = 0;
+  private readonly onDegraded?: (cause: unknown) => void;
+  private degradedCause: unknown = null;
 
   constructor(options: ObsidianStorageAdapterOptions) {
     this.adapter = options.adapter;
     this.removeEmptyDir = options.removeEmptyDir;
+    this.onDegraded = options.onDegraded;
   }
 
   // --- path mapping ----------------------------------------------------------
@@ -82,20 +107,57 @@ export class ObsidianStorageAdapter implements StorageAdapter {
     new Uint8Array(buffer).set(data);
 
     if (this.tempRenameBroken) {
-      await this.adapter.writeBinary(target, buffer);
+      await this.writeDirectVerified(target, buffer);
       return;
     }
     const temp = await this.tempPath();
     try {
       await this.adapter.writeBinary(temp, buffer);
-      await this.adapter.rename(temp, target);
-    } catch {
-      // Clean up the orphaned temp (best effort — it lives in the ignored
-      // state dir, so even a leak is invisible to sync), then fall back to
-      // a direct, non-atomic write rather than failing the sync.
+    } catch (error) {
+      // The backing store refused even the TEMP file (disk full, dying
+      // mount, permission loss): a direct write to the target would risk a
+      // truncated file the next scan pushes as an "edit". Fail loudly —
+      // the pull aborts and retries next cycle; nothing is authored.
       await this.silentRemove(temp);
-      this.tempRenameBroken = true;
-      await this.adapter.writeBinary(target, buffer);
+      throw new Error(`atomic write failed at temp stage for ${target}`, { cause: error });
+    }
+    try {
+      await this.adapter.rename(temp, target);
+    } catch (error) {
+      // Rename is unsupported on this adapter (exotic mobile backends):
+      // degrade to direct writes — LOUDLY (once) and verified, never
+      // silently. A direct write is not crash-atomic, so report it.
+      await this.silentRemove(temp);
+      this.markDegraded(error);
+      await this.writeDirectVerified(target, buffer);
+    }
+  }
+
+  /** The recorded reason atomic writes are unavailable, or null when healthy. */
+  get degradation(): WriteDegradation {
+    return this.degradedCause === null ? null : { cause: this.degradedCause };
+  }
+
+  private markDegraded(cause: unknown): void {
+    if (this.tempRenameBroken) return;
+    this.tempRenameBroken = true;
+    this.degradedCause = cause;
+    this.onDegraded?.(cause);
+  }
+
+  /**
+   * Last-resort non-atomic write, verified after the fact. A size check
+   * cannot make it crash-atomic, but it guarantees we never BELIEVE a write
+   * that landed short: a mismatch throws (the pull fails and retries) rather
+   * than letting the index record content that is not on disk.
+   */
+  private async writeDirectVerified(target: string, buffer: ArrayBuffer): Promise<void> {
+    await this.adapter.writeBinary(target, buffer);
+    const stat = await this.statOrNull(target);
+    if (stat === null || stat.size !== buffer.byteLength) {
+      throw new Error(
+        `direct write verification failed for ${target}: expected ${buffer.byteLength} bytes, found ${stat?.size ?? 'missing'}`,
+      );
     }
   }
 

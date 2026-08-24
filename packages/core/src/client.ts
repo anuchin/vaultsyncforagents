@@ -165,6 +165,15 @@ export interface SyncClientStatus {
    */
   skippedPaths?: string[];
   /**
+   * Symbolic links found in the vault during the most recent cycle (adapters
+   * that can detect them — Node fs; the Obsidian adapter cannot). Links are
+   * never followed: content occluded by a link is not listed, not pushed,
+   * and—critically—not inferred as deleted (`LocalChanges.symlinks`).
+   * Surfaced here (and via a `warn` log line) until a human removes the
+   * link; replaced every cycle like `conflicts`. Omitted when there are none.
+   */
+  symlinks?: string[];
+  /**
    * Server release version as reported by helloAck (null before the first
    * ack — and for legacy servers ≤ 0.1, which never send the field; see
    * `checkServerCompatibility` for the shared skew policy).
@@ -237,6 +246,7 @@ export class SyncClient {
   private conflicts: ConflictOp[] = [];
   private caseCollisions: string[] = [];
   private skippedPaths: string[] = [];
+  private symlinks: string[] = [];
   private ignoreSettings: IgnoreSettings;
   private watchAdapter: WatchAdapter | null = null;
   private cancelDebounce: (() => void) | null = null;
@@ -360,6 +370,7 @@ export class SyncClient {
       conflicts: [...this.conflicts],
       ...(this.caseCollisions.length > 0 ? { caseCollisions: [...this.caseCollisions] } : {}),
       ...(this.skippedPaths.length > 0 ? { skippedPaths: [...this.skippedPaths] } : {}),
+      ...(this.symlinks.length > 0 ? { symlinks: [...this.symlinks] } : {}),
       serverVersion: this.serverVersion,
       ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
@@ -828,6 +839,15 @@ export class SyncClient {
       // through the same diagnostics channel.
       for (const path of localChanges.unsafePaths ?? []) {
         this.recordSkippedPath(path);
+      }
+      // Symlinks: never followed, never synced, and never treated as a mass
+      // deletion of what they hide — surfaced until a human removes them.
+      this.symlinks = [...(localChanges.symlinks ?? [])];
+      if (this.symlinks.length > 0) {
+        this.log.warn(
+          'symlinks are not synced and hide their contents from sync entirely; remove them to resume syncing those paths',
+          this.symlinks,
+        );
       }
 
       // Stage push contents BEFORE pulls overwrite the working tree (a

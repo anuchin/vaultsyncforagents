@@ -89,6 +89,11 @@ export class NodeWatchAdapter implements WatchAdapter {
     this.watcher = watch(this.storage.root, {
       ignoreInitial: false,
       persistent: true,
+      // Never follow links: a symlink inside the vault may point outside it
+      // (the target's churn must not trigger cycles for content the scan
+      // refuses to see) or into a loop. The link itself is surfaced by the
+      // scan's `symlinks` diagnostic instead.
+      followSymlinks: false,
       ignored: (path: string) => this.isIgnoredHostPath(path),
       awaitWriteFinish: this.awaitWriteFinish,
     });

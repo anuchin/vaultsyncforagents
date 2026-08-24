@@ -52,11 +52,18 @@
  *                  emitting a tombstone would destroy the twin on the server
  *                  and on case-sensitive peers. Surfaced as a diagnostic
  *                  only; the collision stays unresolved by design.
- *   - `unsafePaths` — files and directories whose names are Windows-unsafe
- *                  (reserved device names, trailing dot/space — `paths.ts`).
- *                  Like case collisions they are never pushed and never
- *                  treated as deletions; surfaced as a diagnostic only.
- *
+  *   - `unsafePaths` — files and directories whose names are Windows-unsafe
+  *                  (reserved device names, trailing dot/space — `paths.ts`).
+  *                  Like case collisions they are never pushed and never
+  *                  treated as deletions; surfaced as a diagnostic only.
+  *   - `symlinks` — symbolic links anywhere in the vault (adapters that can
+  *                  detect them — `StorageAdapter.listSymlinks`). Links are
+  *                  never followed (a link may escape the vault or loop), so
+  *                  nothing they occlude can appear in `listFiles`: every
+  *                  live index entry AT or BENEATH a link is protected from
+  *                  deletion inference, exactly like an ignored path, until
+  *                  a human removes the link. Surfaced as a diagnostic only.
+  *
  * ## The mtime+size pre-filter (fast mode, the default)
  *
  * Re-hashing a 50k-file vault at every app-open is a real battery cost, so
@@ -81,7 +88,7 @@ import type { FileStat, StorageAdapter } from './adapters.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
 import type { LocalIndex, LocalIndexEntry } from './localindex.js';
-import { isWindowsUnsafePath, parentPath } from './paths.js';
+import { isStrictlyBeneath, isWindowsUnsafePath, parentPath } from './paths.js';
 
 /** Injectable content hash (the default is sha256, same as blob addressing). */
 export type HashFn = (bytes: Uint8Array) => Promise<string>;
@@ -206,6 +213,15 @@ export interface LocalChanges {
    * when there are none.
    */
   unsafePaths?: string[];
+  /**
+   * Symbolic links detected anywhere in the vault (never followed — see
+   * `StorageAdapter.listSymlinks`). Live index entries AT or BENEATH a link
+   * are invisible to this scan (the link's target never enters `listFiles`)
+   * yet are NOT deletions: they are protected like ignored paths. Surfaced
+   * as a diagnostic (`SyncClientStatus.symlinks`) until a human removes the
+   * link. Omitted when there are none (or the adapter cannot detect links).
+   */
+  symlinks?: string[];
   /** Every file the scan hashed (fast mode's skipped files are absent), sorted by path. */
   hashed: HashedFile[];
 }
@@ -231,6 +247,21 @@ export async function scanVault(
   const thisDeviceId = options.thisDeviceId;
 
   const files = await storage.listFiles();
+
+  // Symlink policy (see `StorageAdapter.listSymlinks`): links are never
+  // followed, so content beneath a link simply does not appear in `files` —
+  // which the deletion pass below would otherwise misread as "the user
+  // deleted everything under the link" (the classic mount/link-drop mass
+  // delete). Entries at/beneath a link are skipped exactly like ignored
+  // paths, and the link itself is surfaced as a diagnostic.
+  const symlinkPaths = ((await storage.listSymlinks?.()) ?? []).filter(
+    (path) => !isIgnored(path, settings),
+  );
+  const beneathSymlink =
+    symlinkPaths.length === 0
+      ? () => false
+      : (path: string) =>
+          symlinkPaths.some((link) => path === link || isStrictlyBeneath(path, link));
 
   // Windows-unsafe names never enter the diff (nor the directory
   // representation walk below): they cannot be pushed, and emitting a
@@ -291,6 +322,10 @@ export async function scanVault(
       // The path became ignored (settings change) — not a deletion.
       continue;
     }
+    if (beneathSymlink(path)) {
+      // Hidden behind a symlink — its content was never listed; not a deletion.
+      continue;
+    }
     deleted.push({ path, hash: entry.hash, size: entry.size, versionId: entry.versionId });
   }
 
@@ -313,7 +348,7 @@ export async function scanVault(
     syncableDirs,
     thisDeviceId,
   );
-  const folderDeletions = detectFolderDeletions(index, settings, syncableDirs);
+  const folderDeletions = detectFolderDeletions(index, settings, syncableDirs, beneathSymlink);
 
   return {
     scannedAt: now,
@@ -327,6 +362,7 @@ export async function scanVault(
     ...(staleDirs.length > 0 ? { staleDirs } : {}),
     ...(caseCollisions.length > 0 ? { caseCollisions } : {}),
     ...(unsafePaths.length > 0 ? { unsafePaths: unsafePaths.sort(compareStrings) } : {}),
+    ...(symlinkPaths.length > 0 ? { symlinks: [...symlinkPaths].sort(compareStrings) } : {}),
     hashed: [...hashed].sort(byPath),
   };
 }
@@ -553,6 +589,7 @@ function detectFolderDeletions(
   index: LocalIndex,
   settings: IgnoreSettings,
   dirs: readonly string[],
+  beneathSymlink: (path: string) => boolean = () => false,
 ): FolderDeletionCandidate[] {
   const present = new Set(dirs);
   const folderDeletions: FolderDeletionCandidate[] = [];
@@ -561,6 +598,7 @@ function detectFolderDeletions(
     if (entry.deletedAt !== undefined) continue; // already tombstoned
     if (present.has(path)) continue; // directory still exists — no deletion
     if (isIgnored(path, settings)) continue; // settings change, not a deletion
+    if (beneathSymlink(path)) continue; // hidden behind a symlink — never listed
     folderDeletions.push({ path, versionId: entry.versionId });
   }
   return folderDeletions.sort(byPath);

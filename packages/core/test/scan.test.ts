@@ -687,3 +687,75 @@ describe('recordHashedFiles', () => {
     expect(JSON.stringify(index)).toBe(before); // input never mutated
   });
 });
+
+describe('scanVault — symlink policy', () => {
+  /** An adapter view that reports `links` from the optional symlink seam. */
+  function withSymlinks(
+    storage: InMemoryStorageAdapter,
+    links: readonly string[],
+  ): InMemoryStorageAdapter {
+    return new Proxy(storage, {
+      get(target, prop, receiver) {
+        if (prop === 'listSymlinks') return async () => links;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  }
+
+  it('surfaces detected links, sorted; ignored link paths stay hidden', async () => {
+    const storage = withSymlinks(
+      new InMemoryStorageAdapter({ '/a.md': 'a' }),
+      ['/z-link', '/media', '/.trash/ignored-link'],
+    );
+    const changes = await scanVault(storage, {}, SETTINGS, NOW);
+    expect(changes.symlinks).toEqual(['/media', '/z-link']); // .trash link filtered
+  });
+
+  it('omits the bucket entirely when the adapter cannot detect links', async () => {
+    const storage = new InMemoryStorageAdapter({ '/a.md': 'a' });
+    const changes = await scanVault(storage, {}, SETTINGS, NOW);
+    expect('symlinks' in changes).toBe(false);
+  });
+
+  it('protects live file entries beneath a symlinked dir from deletion inference', async () => {
+    // The link occludes /media from listFiles: without protection every
+    // entry beneath it would look user-deleted (the mount-drop shape).
+    const storage = withSymlinks(new InMemoryStorageAdapter({ '/keep.md': 'k' }), ['/media']);
+    const index = await indexFrom({
+      '/media/a.md': { content: 'a' },
+      '/media/deep/b.md': { content: 'b' },
+      '/keep.md': { content: 'k' },
+    });
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.deleted).toEqual([]);
+    expect(changes.symlinks).toEqual(['/media']);
+  });
+
+  it('protects a file entry AT the exact link path (link points at a file)', async () => {
+    const storage = withSymlinks(new InMemoryStorageAdapter({}), ['/report.pdf']);
+    const index = await indexFrom({ '/report.pdf': { content: 'pdf' } });
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.deleted).toEqual([]);
+    expect(changes.symlinks).toEqual(['/report.pdf']);
+  });
+
+  it('still infers deletions for entries NOT beneath a link', async () => {
+    const storage = withSymlinks(new InMemoryStorageAdapter({}), ['/media']);
+    const index = await indexFrom({
+      '/media/a.md': { content: 'a' },
+      '/gone.md': { content: 'g' },
+    });
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.deleted.map((d) => d.path)).toEqual(['/gone.md']);
+  });
+
+  it('protects folder placeholders beneath a link from folder-deletion inference', async () => {
+    const storage = withSymlinks(new InMemoryStorageAdapter({}), ['/media']);
+    const index = await indexFrom({
+      '/media': { content: '', isFolder: true },
+      '/media/a.md': { content: 'a' },
+    });
+    const changes = await scanVault(storage, index, SETTINGS, NOW);
+    expect(changes.folderDeletions).toEqual([]);
+  });
+});

@@ -66,6 +66,53 @@ describe('ObsidianStorageAdapter', () => {
     expect([...adapter.files.keys()].filter((p) => p.includes('.tmp'))).toEqual([]);
   });
 
+  it('a FAILED TEMP WRITE aborts loudly instead of direct-writing through a failing store', async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.failWrite = true; // disk full / dying mount — even the temp file cannot land
+    const onDegraded: unknown[] = [];
+    const storage = new ObsidianStorageAdapter({
+      adapter: adapter as unknown as DataAdapter,
+      onDegraded: (cause) => onDegraded.push(cause),
+    });
+
+    await expect(
+      storage.writeFile('/note.md', new TextEncoder().encode('content')),
+    ).rejects.toThrow(/temp stage/);
+    // Nothing was authored at the target, and no degradation was latched:
+    // this is a transient-looking failure, not a missing-rename capability.
+    expect(await storage.exists('/note.md')).toBe(false);
+    expect(onDegraded).toEqual([]);
+    expect(storage.degradation).toBeNull();
+  });
+
+  it('reports degradation ONCE when rename is unsupported, then keeps using verified direct writes', async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.failRename = true;
+    const causes: unknown[] = [];
+    const storage = new ObsidianStorageAdapter({
+      adapter: adapter as unknown as DataAdapter,
+      onDegraded: (cause) => causes.push(cause),
+    });
+
+    await storage.writeFile('/a.md', new TextEncoder().encode('v1'));
+    await storage.writeFile('/a.md', new TextEncoder().encode('v2'));
+
+    expect(causes).toHaveLength(1);
+    expect(storage.degradation).not.toBeNull();
+    expect(new TextDecoder().decode(await storage.readFile('/a.md'))).toBe('v2');
+  });
+
+  it('a TRUNCATED direct write is detected by the post-write size check and throws', async () => {
+    const adapter = new FakeDataAdapter();
+    adapter.failRename = true;
+    adapter.truncateWritesTo = 3; // lands short, claims success
+    const storage = makeStorage(adapter);
+
+    await expect(
+      storage.writeFile('/note.md', new TextEncoder().encode('much-longer-content')),
+    ).rejects.toThrow(/verification failed/);
+  });
+
   it('creates parent directories implicitly on write', async () => {
     const adapter = new FakeDataAdapter();
     const storage = makeStorage(adapter);

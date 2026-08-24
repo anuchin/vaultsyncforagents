@@ -71,6 +71,20 @@ export interface StorageAdapter {
   removeDir?(path: string): Promise<void>;
   /** Whether a file or directory exists at `path`. */
   exists(path: string): Promise<boolean>;
+  /**
+   * Recursive listing of every SYMLINK entry inside the vault (vault paths,
+   * sorted). OPTIONAL: adapters whose platform cannot detect links (the
+   * Obsidian `DataAdapter`) omit it, and core treats "cannot detect" as
+   * "none detected".
+   *
+   * Contract: symlinks are NEVER followed, listed, read, or synced — a link
+   * pointing outside the vault (or into a loop) must not leak host content
+   * into sync or recurse forever. Everything the link occludes (the link
+   * path itself plus every path beneath a link directory) is invisible to
+   * scans and protected from deletion inference, exactly like ignored paths:
+   * the user is told about the link instead (`LocalChanges.symlinks`).
+   */
+  listSymlinks?(): Promise<readonly string[]>;
 }
 
 /** Platform file-watching. Implementations batch raw events; the engine debounces. */

@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NodeStorageAdapter } from '../src/storage.js';
@@ -178,5 +178,72 @@ describe('NodeStorageAdapter', () => {
     expect(text).toMatch(/^content-\d+$/);
     const litter = (await readdir(adapter.root)).filter((name) => name.includes('.tmp-'));
     expect(litter).toEqual([]);
+  });
+});
+
+/**
+ * Symlink creation needs privileges on some platforms (Windows without
+ * developer mode allows directory JUNCTIONS but not file symlinks), so each
+ * kind gets its own probe and its own skip gate.
+ */
+const linkCaps = await (async (): Promise<{ file: boolean; dir: boolean }> => {
+  const probe = await mkdtemp(join(tmpdir(), 'vsa-link-probe-'));
+  let file = false;
+  let dir = false;
+  try {
+    await writeFile(join(probe, 'target.txt'), 'x');
+    await symlink(join(probe, 'target.txt'), join(probe, 'link.txt'), 'file');
+    file = true;
+  } catch { /* privileged here */ }
+  try {
+    await mkdir(join(probe, 'target-dir'));
+    await symlink(join(probe, 'target-dir'), join(probe, 'link-dir'), 'junction');
+    dir = true;
+  } catch { /* privileged here */ }
+  return { file, dir };
+})();
+
+describe('NodeStorageAdapter — symlinks', () => {
+  it.runIf(linkCaps.file)(
+    'never follows a file symlink: excluded from listings, reported by listSymlinks',
+    async () => {
+      const root = await tempRoot();
+      const outside = await tempRoot();
+      await writeFile(join(outside, 'secret.md'), 'do not sync me');
+      await symlink(join(outside, 'secret.md'), join(root, 'link.md'), 'file');
+      await writeFile(join(root, 'real.md'), 'sync me');
+
+      const adapter = new NodeStorageAdapter({ root });
+      expect((await adapter.listFiles()).map((f) => f.path)).toEqual(['/real.md']);
+      expect(await adapter.listSymlinks()).toEqual(['/link.md']);
+    },
+  );
+
+  it.runIf(linkCaps.dir)(
+    'never recurses into a directory symlink: outside content stays invisible',
+    async () => {
+      const root = await tempRoot();
+      const outside = await tempRoot();
+      await mkdir(join(outside, 'deep'));
+      await writeFile(join(outside, 'deep', 'secret.md'), 'outside the vault');
+      await symlink(outside, join(root, 'media'), 'junction');
+      await writeFile(join(root, 'real.md'), 'inside the vault');
+
+      const adapter = new NodeStorageAdapter({ root });
+      const files = (await adapter.listFiles()).map((f) => f.path);
+      expect(files).toEqual(['/real.md']);
+      expect(await adapter.listDirs()).toEqual(['/']);
+      expect(await adapter.listSymlinks()).toEqual(['/media']);
+    },
+  );
+
+  it.runIf(linkCaps.dir)('a symlink loop cannot recurse forever', async () => {
+    const root = await tempRoot();
+    await symlink(root, join(root, 'loop'), 'junction');
+    await writeFile(join(root, 'a.md'), 'x');
+
+    const adapter = new NodeStorageAdapter({ root });
+    expect((await adapter.listFiles()).map((f) => f.path)).toEqual(['/a.md']);
+    expect(await adapter.listSymlinks()).toEqual(['/loop']);
   });
 });

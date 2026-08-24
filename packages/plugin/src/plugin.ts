@@ -257,6 +257,13 @@ export class VaultSyncPlugin extends Plugin {
         if (folder === null) return; // raced away / tree not caught up — idempotent
         await this.app.fileManager.trashFile(folder);
       },
+      onDegraded: (cause) => {
+        this.syncLog.error('atomic writes unavailable; falling back to verified direct writes', cause);
+        new Notice(
+          'VaultSync: this device cannot perform atomic file writes, so a crash mid-sync could leave a partially written note. Sync continues, but report this in a support bundle.',
+          0,
+        );
+      },
     });
   }
 

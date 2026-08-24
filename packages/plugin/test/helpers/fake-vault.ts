@@ -23,6 +23,10 @@ export class FakeDataAdapter {
   readonly folders = new Set<string>();
   /** When true, `rename` throws — exercises the atomic-write fallback. */
   failRename = false;
+  /** When true, `writeBinary` throws — exercises the fail-loud temp-stage rule. */
+  failWrite = false;
+  /** When set, `writeBinary` stores only this many leading bytes (truncated write). */
+  truncateWritesTo?: number;
   /** Recorded mkdir calls (for asserting dir creation). */
   readonly mkdirs: string[] = [];
   /**
@@ -84,7 +88,12 @@ export class FakeDataAdapter {
   }
 
   async writeBinary(path: string, data: ArrayBuffer): Promise<void> {
-    this.files.set(path, new Uint8Array(data).slice());
+    if (this.failWrite) throw new Error(`write failed: ${path}`);
+    const bytes = new Uint8Array(data).slice();
+    this.files.set(
+      path,
+      this.truncateWritesTo !== undefined ? bytes.subarray(0, this.truncateWritesTo) : bytes,
+    );
     if (this.clock !== undefined) this.mtimes.set(path, this.clock());
     ensureDirs(this.folders, path);
   }
