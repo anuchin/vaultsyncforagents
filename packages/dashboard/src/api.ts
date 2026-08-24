@@ -60,12 +60,7 @@ export const api = {
   },
 
   /** First-writer-wins claim (min 4-char passphrase, non-empty vault name). */
-  claim(payload: {
-    passphrase: string;
-    vaultName: string;
-    deviceName?: string;
-    deviceType?: string;
-  }): Promise<ClaimResult> {
+  claim(payload: { passphrase: string; vaultName: string }): Promise<ClaimResult> {
     return post<ClaimResult>('/claim', payload);
   },
 

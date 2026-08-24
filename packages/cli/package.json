@@ -1,6 +1,6 @@
 {
   "name": "vaultsyncforagents",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "VaultSync for Agents CLI (`vsa`): `setup` deploys your own Cloudflare sync worker, then link, sync, and manage vaults from any machine.",
   "license": "MIT",
   "type": "module",

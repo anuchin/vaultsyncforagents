@@ -47,17 +47,32 @@ export interface Claimed {
   passphrase: string;
 }
 
-/** Claim the (isolated, fresh) worker and get the claiming device's token. */
+/**
+ * Claim WITHOUT pairing any device — for tests that assert exact table
+ * state (event kinds/counts, pairing rows). Most tests want `claim()`.
+ */
+export async function claimOnly(passphrase = 'correct-horse-battery', vaultName = 'personal'): Promise<void> {
+  const res = await post('/claim', { passphrase, vaultName });
+  if (res.status !== 200) throw new Error(`claim failed: ${res.status} ${await res.text()}`);
+}
+
+/**
+ * Claim the (isolated, fresh) worker and get the first device's token.
+ * Claiming registers NO device (the claim page mints a pairing code
+ * instead), so this convenience mints + redeems that code — exactly the
+ * production flow the dashboard drives.
+ */
 export async function claim(options: { passphrase?: string; vaultName?: string; deviceName?: string } = {}): Promise<Claimed> {
   const passphrase = options.passphrase ?? 'correct-horse-battery';
   const vaultName = options.vaultName ?? 'personal';
-  const res = await post('/claim', {
-    passphrase,
-    vaultName,
-    ...(options.deviceName !== undefined ? { deviceName: options.deviceName } : {}),
-  });
+  const deviceName = options.deviceName ?? 'Claim helper device';
+  const res = await post('/claim', { passphrase, vaultName });
   if (res.status !== 200) throw new Error(`claim failed: ${res.status} ${await res.text()}`);
-  const body = (await res.json()) as { token: string; deviceId: string };
+  const cookie = await adminLogin(passphrase);
+  const code = await mintPairingCode(cookie, deviceName);
+  const paired = await post('/pair', { code, deviceName, deviceType: 'desktop' });
+  if (paired.status !== 200) throw new Error(`first pair failed: ${paired.status} ${await paired.text()}`);
+  const body = (await paired.json()) as { token: string; deviceId: string };
   return { ...body, vaultName, passphrase };
 }
 

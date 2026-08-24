@@ -12,6 +12,7 @@ import {
   post,
   request,
   resetAll,
+  roomSql,
 } from './helpers.js';
 import { SERVER_VERSION } from '../src/version.js';
 
@@ -48,10 +49,13 @@ describe('unclaimed worker', () => {
 });
 
 describe('claim', () => {
-  it('claims, registers the claiming device, and flips health', async () => {
+  it('claims WITHOUT registering a device; health flips', async () => {
     const before = await (await get('/health')).json();
     expect(before).toEqual(unclaimedHealth);
 
+    // deviceName/deviceType in the claim body are ignored (accepted for
+    // backward compatibility with older dashboards) — a device exists only
+    // once a pairing code is redeemed.
     const res = await post('/claim', {
       passphrase: 'hunter22',
       vaultName: 'personal',
@@ -59,14 +63,30 @@ describe('claim', () => {
       deviceType: 'desktop',
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; vaultName: string; deviceId: string; token: string };
-    expect(body.ok).toBe(true);
-    expect(body.vaultName).toBe('personal');
-    expect(body.deviceId).toMatch(/^dev-[0-9a-f]{12}$/);
-    expect(body.token).toMatch(/^[A-Za-z0-9_-]{40,}$/); // 256-bit base64url
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({ ok: true, vaultName: 'personal' });
+    expect(body).not.toHaveProperty('token');
+    expect(body).not.toHaveProperty('deviceId');
+
+    const devices = await roomSql('SELECT id FROM devices');
+    expect(devices).toHaveLength(0);
 
     const after = await (await get('/health')).json();
     expect(after).toEqual({ ...unclaimedHealth, claimed: true });
+  });
+
+  it('the first device arrives via the first pairing code, named from the code', async () => {
+    await post('/claim', { passphrase: 'hunter22', vaultName: 'personal' });
+    const cookie = await adminLogin('hunter22');
+    const code = await mintPairingCode(cookie, 'Laptop', 'desktop');
+    // The CLIENT proposes a different name — the operator's code-stored name
+    // wins (this is the regression test for the phantom-duplicate-device
+    // bug: claim used to eagerly register one device, and the redeem used to
+    // ignore the code's name, netting two devices where one was intended).
+    const paired = await post('/pair', { code, deviceName: 'Impostor', deviceType: 'desktop' });
+    expect(paired.status).toBe(200);
+    const rows = await roomSql<{ name: string; type: string }>('SELECT name, type FROM devices');
+    expect(rows).toEqual([{ name: 'Laptop', type: 'desktop' }]);
   });
 
   it('rejects a second claim with 409 (already claimed)', async () => {

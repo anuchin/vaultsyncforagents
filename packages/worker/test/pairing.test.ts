@@ -28,14 +28,15 @@ describe('pairing', () => {
     const code = await mintPairingCode(cookie, 'Pixel', 'mobile');
     expect(code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
 
-    // Only the SHA-256 of the normalized code is stored.
-    const pairs = await roomSql<{ code_hash: string; device_name: string; used: number }>(
-      'SELECT code_hash, device_name, used FROM pairs',
+    // Only the SHA-256 of the normalized code is stored (claim()'s own
+    // redeemed row may also be present — assert the minted one specifically).
+    const rows = await roomSql<{ code_hash: string; device_name: string; used: number }>(
+      "SELECT code_hash, device_name, used FROM pairs WHERE device_name = 'Pixel'",
     );
-    expect(pairs).toHaveLength(1);
-    expect(pairs[0]!.device_name).toBe('Pixel');
-    expect(pairs[0]!.code_hash).not.toContain(code);
-    expect(pairs[0]!.code_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.device_name).toBe('Pixel');
+    expect(rows[0]!.code_hash).not.toContain(code);
+    expect(rows[0]!.code_hash).toMatch(/^[0-9a-f]{64}$/);
 
     const { token, deviceId } = await pair(code, 'Pixel', 'mobile');
     expect(deviceId).toMatch(/^dev-[0-9a-f]{12}$/);

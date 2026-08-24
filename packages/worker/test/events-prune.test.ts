@@ -8,7 +8,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src/index.js';
-import { adminLogin, claim, get, mintPairingCode, pair, resetAll, roomSql } from './helpers.js';
+import { adminLogin, claim, claimOnly, get, mintPairingCode, pair, resetAll, roomSql } from './helpers.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const VERSION_ROW =
@@ -53,7 +53,7 @@ beforeEach(async () => {
 
 describe('events pruning', () => {
   it('opportunistically prunes rows older than 30 days on the next event write', async () => {
-    await claim({ passphrase: 'pppppppp', vaultName: 'v' }); // writes the 'claimed' event
+    await claimOnly('pppppppp', 'v'); // writes the 'claimed' event only
     const nowMs = Date.now();
     await seedEvents(nowMs - 31 * DAY_MS, 3); // ancient
     await seedEvents(nowMs - 60_000, 2); // recent
@@ -104,7 +104,7 @@ describe('events pruning', () => {
   });
 
   it('the weekly GC cron prunes old events too (no event write needed)', async () => {
-    await claim({ passphrase: 'pppppppp', vaultName: 'v' });
+    await claimOnly('pppppppp', 'v');
     const nowMs = Date.now();
     await seedEvents(nowMs - 40 * DAY_MS, 3);
     await seedEvents(nowMs - 60_000, 2);

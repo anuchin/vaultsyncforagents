@@ -1,6 +1,6 @@
 {
   "name": "@vsa/plugin",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "VaultSync for Agents Obsidian plugin (desktop + mobile): pairing UI, live sync, status indicator, obsidian:// deep links",
   "license": "MIT",

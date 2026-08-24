@@ -70,7 +70,9 @@ require them. What `link` does, so you can diagnose it:
 - Refuses if `/srv/vault` already holds another device's
   `.vaultsyncforagents/` state (one sync client per machine per vault).
   Override with `--force` only if the operator confirms the old device is gone.
-- Exchanges the code for a long-lived device token. Machine registry:
+- Exchanges the code for a long-lived device token. The device takes the
+  name entered when the code was minted on the dashboard (mint it as
+  `agent-vps`); `--name` applies only to unnamed codes. Machine registry:
   `~/.config/vaultsyncforagents/config.json`; token: `secrets.json` next to it
   (mode 0600). A `.vaultsyncforagents/` state dir is created inside the vault.
 - Runs an initial sync immediately: existing local files are pushed, remote

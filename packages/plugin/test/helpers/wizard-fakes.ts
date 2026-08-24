@@ -83,7 +83,7 @@ export function happyRoutes(): Record<string, () => unknown> {
     [`GET cf:/accounts/${WIZARD_ACCOUNT}/workers/subdomain`]: () => ok({ subdomain: 'alice' }),
     [`GET ` + 'gh:/' + RELEASE_BUNDLE_URL.replace('https://github.com/', '')]: () =>
       new Response(zip as unknown as BodyInit, { status: 200 }),
-    'GET worker:/health': () => Response.json({ ok: true, claimed: false, serverVersion: '0.1.5' }),
+    'GET worker:/health': () => Response.json({ ok: true, claimed: false, serverVersion: '0.1.6' }),
   };
 }
 

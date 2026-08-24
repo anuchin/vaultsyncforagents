@@ -82,7 +82,7 @@ export function claimView(ctx: ViewContext): ViewHandle {
       submit.disabled = true;
       submit.textContent = 'Claiming…';
       try {
-        await api.claim({ passphrase: pass, vaultName: name, deviceName: firstDevice, deviceType: firstType });
+        await api.claim({ passphrase: pass, vaultName: name });
         ctx.dispatch({ type: 'network-ok' });
         await finishClaim(pass, firstDevice, firstType);
       } catch (error) {

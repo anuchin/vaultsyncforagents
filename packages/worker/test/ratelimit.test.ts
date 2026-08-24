@@ -75,7 +75,9 @@ describe('rate limiting on POST /pair', () => {
 
     // Expired: the 10th failure is an expired code, and it closes the door.
     const expired = await mintPairingCode(cookie, 'Late', 'desktop');
-    await roomSql(`UPDATE pairs SET expires_at = 1 WHERE code_hash = (SELECT code_hash FROM pairs LIMIT 1)`);
+    // (claim()'s own redeemed code row is also in the table — target the
+    // minted one by name, not by "first row".)
+    await roomSql("UPDATE pairs SET expires_at = 1 WHERE device_name = 'Late'");
     await wrongPairAttempts(9);
     expect((await post('/pair', { code: expired, deviceName: 'Late' }, IP)).status).toBe(401);
     expect((await post('/pair', { code: 'ZZZZ-ZZZZ', deviceName: 'X' }, IP)).status).toBe(429);

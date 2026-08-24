@@ -18,16 +18,16 @@
  * template/VERSION for the deploy-button track). Bumped by the release
  * build pass together with `PINNED_BUNDLE_SHA256`.
  */
-export const PINNED_RELEASE = 'v0.1.5';
+export const PINNED_RELEASE = 'v0.1.6';
 
 /**
  * SHA-256 (hex) of the pinned release's `worker-bundle.zip`, baked in by the
  * release build pass (deterministic: local and CI builds hash identically —
- * verified for v0.1.3–v0.1.5). When empty, the download path falls back
+ * verified for v0.1.3–v0.1.6). When empty, the download path falls back
  * to the release's `.sha256` sidecar (uploaded by release.yml) and finally
  * warns when neither is available (older releases).
  */
-export const PINNED_BUNDLE_SHA256 = 'a346766111e6ad7b156c6efc5fa2543c83df4da85667e59d0934b5b847beb506';
+export const PINNED_BUNDLE_SHA256 = '0e806beb690ddbebb10c071b7172a56d81061cbcf4a9080ea7df885a492aa368';
 
 /**
  * GitHub release artifact convention: the tag ships `worker-bundle.zip`

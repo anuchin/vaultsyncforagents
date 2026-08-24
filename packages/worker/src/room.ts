@@ -897,7 +897,7 @@ export class VaultRoom extends DurableObject<Env> {
   /** First-writer-wins claim (FR-22). Runs inside `runExclusive` (race guard). */
   private async httpClaim(request: Request): Promise<Response> {
     const body = (await request.json().catch(() => null)) as
-      | { passphrase?: unknown; vaultName?: unknown; deviceName?: unknown; deviceType?: unknown }
+      | { passphrase?: unknown; vaultName?: unknown }
       | null;
     if (
       body === null ||
@@ -921,22 +921,13 @@ export class VaultRoom extends DurableObject<Env> {
     await this.setMeta('vault_name', body.vaultName.trim());
     await this.setMeta('settings_obsidian_sync', '0');
     await this.setMeta('claimed_at', String(now));
-
-    // The claiming device is paired immediately (§3: "claiming also mints the
-    // first device pairing") so the plugin/CLI can sync right after claiming.
-    const deviceName =
-      typeof body.deviceName === 'string' && body.deviceName.trim().length > 0
-        ? body.deviceName.trim()
-        : 'admin-device';
-    if (!isValidDeviceName(deviceName)) {
-      return json(400, {
-        error: `deviceName must be 1-${DEVICE_NAME_MAX_CHARS} characters, without control characters`,
-      });
-    }
-    const deviceType = isDeviceType(body.deviceType) ? body.deviceType : 'desktop';
-    const { token, deviceId } = await this.registerDevice(deviceName, deviceType, now);
-    this.appendEvent(now, deviceId, 'claimed', body.vaultName.trim(), null);
-    return json(200, { ok: true, vaultName: body.vaultName.trim(), deviceId, token });
+    // Claiming registers NO device: the claim page immediately mints the
+    // first PAIRING CODE (seeded with the name/type its form collected) and
+    // the device comes to exist only when a client redeems that code. An
+    // eagerly-registered "first device" would orphan a row — the browser
+    // cannot use a device token — and produce a phantom offline device.
+    this.appendEvent(now, null, 'claimed', body.vaultName.trim(), null);
+    return json(200, { ok: true, vaultName: body.vaultName.trim() });
   }
 
   private async httpAdminLogin(request: Request): Promise<Response> {
@@ -1138,15 +1129,24 @@ export class VaultRoom extends DurableObject<Env> {
       this.noteAuthFailure(ip, now);
       return json(401, { error: 'pairing code is invalid, expired, or already used' });
     }
-    // Burn the code (one-time) and mint the device.
+    // Burn the code (one-time) and mint the device. The dashboard seeded the
+    // code with the operator-entered name/type ("Pair new device" / the claim
+    // form's "First device to pair") — that intent WINS over the client's
+    // own name, which is only a fallback for codes minted without one. This
+    // is what makes the dashboard forms' "shown in the device list" promise
+    // true, and keeps one code → one correctly-named device.
     this.sql('UPDATE pairs SET used = 1 WHERE code_hash = ?', codeHash);
-    const deviceType = isDeviceType(body.deviceType)
-      ? body.deviceType
-      : isDeviceType(pair.device_type)
-        ? pair.device_type
+    const codeName =
+      typeof pair.device_name === 'string' && pair.device_name.trim() !== ''
+        ? pair.device_name.trim()
+        : deviceName;
+    const deviceType = isDeviceType(pair.device_type)
+      ? pair.device_type
+      : isDeviceType(body.deviceType)
+        ? body.deviceType
         : 'desktop';
-    const { token, deviceId } = await this.registerDevice(deviceName, deviceType, now);
-    this.appendEvent(now, deviceId, 'device_paired', deviceName, null);
+    const { token, deviceId } = await this.registerDevice(codeName, deviceType, now);
+    this.appendEvent(now, deviceId, 'device_paired', codeName, null);
     this.authFailures.delete(ip);
     return json(200, { ok: true, token, deviceId });
   }

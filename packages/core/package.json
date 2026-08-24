@@ -1,6 +1,6 @@
 {
   "name": "@vsa/core",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "VaultSync for Agents shared sync engine foundation (platform-portable: Web APIs only)",
   "license": "MIT",

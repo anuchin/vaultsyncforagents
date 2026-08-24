@@ -138,9 +138,11 @@ describe('GET /api/status', () => {
     expect(status.lastEdit).toBeNull();
     expect(status.attachments).toEqual({ count: 0, bytes: 0 });
     expect(status.storageBytes).toBe(0);
-    expect(status.recentEvents.map((e) => e.kind)).toEqual(['claimed']);
+    // Claim + the first pairing (claim() mints and redeems the first code —
+    // a claimed worker always has exactly this much history).
+    expect(status.recentEvents.map((e) => e.kind)).toEqual(['device_paired', 'claimed']);
     expect(status.devices).toHaveLength(1);
-    // The claiming device has not said hello on the WS yet -> offline.
+    // The first device has not said hello on the WS yet -> offline.
     expect(status.devices[0]!.online).toBe(false);
   });
 });

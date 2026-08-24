@@ -71,8 +71,6 @@ export interface HistoryDoc {
 export interface ClaimResult {
   ok: boolean;
   vaultName: string;
-  deviceId: string;
-  token: string;
 }
 
 /** `POST /admin/pair` */

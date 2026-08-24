@@ -161,7 +161,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   private renderPairingDeviceName(): void {
     new Setting(this.containerEl)
       .setName('Device name')
-      .setDesc(`Shown in the worker dashboard's device list. Applies when (re)pairing.`)
+      .setDesc(
+        `Shown in the worker dashboard's device list. Applies when (re)pairing — a pairing code minted with a name on the dashboard (Devices → Pair new device) keeps that name instead.`,
+      )
       .addText((text) =>
         text
           .setPlaceholder(defaultDeviceName())
