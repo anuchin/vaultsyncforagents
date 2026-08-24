@@ -199,6 +199,12 @@ export default {
     if (request.method === 'POST' && path === '/admin/revoke') {
       return roomPost(env, '/admin/revoke', await readJsonBody(request), cookieHeader(request));
     }
+    if (request.method === 'POST' && path === '/admin/retention') {
+      return roomPost(env, '/admin/retention', await readJsonBody(request), cookieHeader(request));
+    }
+    if (request.method === 'POST' && path === '/admin/quota') {
+      return roomPost(env, '/admin/quota', await readJsonBody(request), cookieHeader(request));
+    }
     if (request.method === 'GET' && path === '/api/status') {
       // Plugin-CORS route: the About section fetches this cross-origin with
       // the device token (see `isPluginCorsPath`). Auth is unchanged — the
@@ -210,6 +216,12 @@ export default {
       // device token cross-origin (the plugin's snapshot UI); token-authenticated,
       // no cookies involved, so a wildcard ACAO adds no exposure.
       return withPluginCors(await roomFetch(env, '/api/snapshots', { headers: authForwardHeaders(request) }));
+    }
+    if (request.method === 'GET' && path === '/backup') {
+      // The trust escape hatch (§ free-tier longevity): the whole vault as a
+      // streamed NDJSON archive. Token-authenticated inside the room; no CORS
+      // widening — `vsa backup` is the consumer.
+      return roomFetch(env, '/backup', { headers: authForwardHeaders(request) });
     }
     if (request.method === 'GET' && path === '/api/history') {
       // Read-only version-chain lookup for `vsa history` / `vsa restore`
@@ -237,7 +249,11 @@ export default {
 
   // --- weekly GC cron (§7) -----------------------------------------------------------------
   //
-  // Two jobs ride the same weekly trigger:
+  // Three jobs ride the same weekly trigger:
+  //  - retention (if configured): bound version history — drop non-head
+  //    versions older than N days and/or beyond the newest N per path
+  //    (snapshot-referenced versions always pinned), dropping their blob
+  //    refcounts so the GC below collects the freed space the same night;
   //  - orphan-blob GC: ask the DO for unreferenced hashes (refcount 0, older
   //    than the grace window), then have the DO purge the bookkeeping rows
   //    and CONFIRM which hashes are still orphans (re-checked inside its
@@ -249,6 +265,9 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       (async () => {
+        const retention = await roomPost(env, '/internal/retention', {});
+        const { removed } = (await retention.json()) as { removed: number };
+        if (removed > 0) console.log(`retention removed ${removed} versions`);
         await roomPost(env, '/internal/events-prune', {});
         const list = await roomFetch(env, '/internal/gc');
         const { orphans } = (await list.json()) as { orphans: string[] };

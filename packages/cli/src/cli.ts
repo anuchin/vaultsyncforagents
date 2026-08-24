@@ -25,6 +25,8 @@ import {
 import { runDoctor, renderDoctor } from './commands/doctor.js';
 import { renderDaemonResult, runDaemonCommand, type DaemonAction } from './commands/daemon.js';
 import { runSetup } from './commands/setup.js';
+import { runBackupSave, runBackupRestore } from './commands/backup.js';
+import { formatBytes } from './format.js';
 import {
   ClackPromptUi,
   CommandError,
@@ -286,6 +288,48 @@ export function buildProgram(runtime: VsRuntime): Command {
           `${result.restored} file(s) reverted, ${result.tombstoned} tombstoned`,
       );
       runtime.output.log('Every revert landed as a new version — history was kept. Other devices converge on their next sync.');
+    });
+
+  // --- backup (the trust escape hatch) ---------------------------------------------------
+
+  const backup = program
+    .command('backup')
+    .description('full off-site archive: heads + history + blobs as NDJSON, restorable offline');
+  backup
+    .command('save')
+    .description('download the entire vault (all versions, all blobs) as one NDJSON file')
+    .option('--out <file>', 'output path (default: vaultsync-backup-<vault>-<stamp>.ndjson)')
+    .action(async (options: { out?: string }) => {
+      const merged: Record<string, unknown> = { ...globals() };
+      const result = await runBackupSave(runtime, options.out, merged['vault'] as string | undefined);
+      if (merged['json'] === true) {
+        runtime.output.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      runtime.output.log(`Backup saved: ${result.file} (${formatBytes(result.bytes)})`);
+      if (result.meta !== null) {
+        runtime.output.log(
+          `  vault: ${result.meta.vaultName ?? '?'} — ` +
+            `${result.meta.fileCount ?? '?'} files, ${result.meta.versionCount ?? '?'} versions, ` +
+            `${result.meta.blobCount ?? '?'} blobs`,
+        );
+      }
+      if (result.missingBlobs > 0) {
+        runtime.output.log(
+          `  ⚠ ${result.missingBlobs} blob(s) were missing server-side (GC raced the export); re-run to capture them`,
+        );
+      }
+    });
+  backup
+    .command('restore <file>')
+    .description('materialize a backup archive into a directory — no worker needed')
+    .requiredOption('--into <dir>', 'target directory (created if missing)')
+    .action(async (file: string, options: { into: string }) => {
+      const merged: Record<string, unknown> = { ...globals() };
+      const result = await runBackupRestore(runtime, file, options.into);
+      if (merged['json'] === true) {
+        runtime.output.log(JSON.stringify(result, null, 2));
+      }
     });
 
   // --- setup (FR-50) ------------------------------------------------------------------------

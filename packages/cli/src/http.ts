@@ -62,6 +62,10 @@ export interface StatusDoc {
   lastEdit: { ts: number; deviceId: string; path: string } | null;
   attachments: { count: number; bytes: number };
   storageBytes: number;
+  /** Advisory storage quota (servers ≥ 0.2; absent on older). */
+  quota?: { warnBytes: number; hardBytes: number; state: 'ok' | 'warn' | 'over' | 'off' };
+  /** Retention configuration (servers ≥ 0.2; absent on older). */
+  retention?: { days: number; versions: number };
   recentEvents: StatusEvent[];
 }
 
@@ -179,6 +183,15 @@ export class WorkerApi {
   async snapshots(token: string): Promise<SnapshotSummary[]> {
     const body = await this.getJson<{ snapshots: SnapshotSummary[] }>('/api/snapshots', token);
     return body.snapshots;
+  }
+
+  /**
+   * GET /backup — the streamed NDJSON archive (the trust escape hatch).
+   * Returns the raw Response: the caller streams it to disk; the body may
+   * be arbitrarily large, so no json() round-trip is possible.
+   */
+  async backup(token: string): Promise<Response> {
+    return this.request('/backup', 'GET', token);
   }
 
   /** POST /pair — redeem a pairing code for a device token. */

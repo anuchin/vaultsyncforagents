@@ -12,7 +12,7 @@
  * All timers are owned here and torn down in `stopSync()`/`onunload`.
  */
 
-import { Notice, Plugin } from 'obsidian';
+import { Notice, Platform, Plugin } from 'obsidian';
 import type { App, PluginManifest } from 'obsidian';
 import {
   checkServerCompatibility,
@@ -25,6 +25,7 @@ import {
 import { ObsidianStorageAdapter } from './adapters/obsidian-storage.js';
 import { ObsidianWatchAdapter, RescanScheduler } from './adapters/obsidian-watch.js';
 import { OpenNoteGuard, type WorkspaceLike } from './open-note-guard.js';
+import { installSuspendFlush } from './suspend-flush.js';
 import { HttpBlobStore } from './blobstore.js';
 import {
   buildDiagnosticsBundle,
@@ -99,6 +100,8 @@ export class VaultSyncPlugin extends Plugin {
   private massDeleteNoticeAt: number | null = null;
   /** The editor-race guard (open dirty notes) — lives from onload to onunload. */
   private openNoteGuard: OpenNoteGuard | null = null;
+  /** Mobile suspend-flush uninstaller (set while a sync session is live). */
+  private uninstallSuspendFlush: (() => void) | null = null;
   /**
    * Latest server-version verdict (core compat.ts), re-assessed by the
    * supervision tick after every helloAck; null before the first ack of a
@@ -414,6 +417,16 @@ export class VaultSyncPlugin extends Plugin {
     // Live watching: vault events (debounced in core) + rescan hooks.
     this.watcher = new ObsidianWatchAdapter({ vault: this.app.vault });
     client.startWatching(this.watcher);
+    // Mobile suspend flush: backgrounding the app runs one immediate cycle
+    // instead of waiting for the next open (shrinks the conflict window).
+    if (Platform.isMobileApp) {
+      this.uninstallSuspendFlush = installSuspendFlush({
+        flush: () => {
+          if (this.paused) return;
+          void client.triggerSync().catch(() => {}); // best-effort by design
+        },
+      });
+    }
     this.rescan = new RescanScheduler({
       intervalMs: this.data.settings.rescanIntervalSec * 1000,
     });
@@ -459,6 +472,8 @@ export class VaultSyncPlugin extends Plugin {
     this.client?.close(); // also stops the watcher
     this.client = null;
     this.watcher = null;
+    this.uninstallSuspendFlush?.();
+    this.uninstallSuspendFlush = null;
     this.statusBarItem?.remove();
     this.statusBarItem = null;
     this.statusBar = null;

@@ -28,6 +28,9 @@ export interface VaultStatusReport {
   lastEdit?: { ts: number; deviceName: string; path: string } | null;
   attachments?: { count: number; bytes: number };
   storageBytes?: number;
+  /** Advisory quota state from the server (absent on older workers). */
+  quota?: { warnBytes: number; hardBytes: number; state: 'ok' | 'warn' | 'over' | 'off' };
+  retention?: { days: number; versions: number };
   sync?: {
     state: string;
     pending: number;
@@ -150,6 +153,8 @@ async function report(
         : { ts: status.lastEdit.ts, deviceName: deviceName(status.lastEdit.deviceId), path: status.lastEdit.path },
     attachments: status.attachments,
     storageBytes: status.storageBytes,
+    ...(status.quota !== undefined ? { quota: status.quota } : {}),
+    ...(status.retention !== undefined ? { retention: status.retention } : {}),
     sync,
   };
 }
@@ -180,6 +185,14 @@ export function renderStatus(report: StatusReport, runtime: VsRuntime): void {
     if (vault.attachments !== undefined) {
       out.log(`  attachments: ${vault.attachments.count} (${formatBytes(vault.attachments.bytes)})`);
       out.log(`  storage:     ${formatBytes(vault.storageBytes ?? 0)}`);
+    }
+    if (vault.quota !== undefined && vault.quota.state !== 'off' && vault.quota.state !== 'ok') {
+      out.log(
+        `  ⚠ storage ${vault.quota.state === 'over' ? 'OVER' : 'near'} the ${formatBytes(vault.quota.hardBytes)} threshold` +
+          (vault.retention !== undefined && vault.retention.days === 0 && vault.retention.versions === 0
+            ? ' — no retention is configured; consider `retention` in the dashboard admin'
+            : ''),
+      );
     }
     if (vault.sync !== undefined) {
       out.log(

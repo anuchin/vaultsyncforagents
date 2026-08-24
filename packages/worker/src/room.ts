@@ -119,6 +119,21 @@ const VAULT_NAME_MAX_CHARS = 60;
 /** Snapshot label cap (snapshotCreate). */
 const SNAPSHOT_NAME_MAX_CHARS = 100;
 
+// --- free-tier longevity (retention + quota) ---------------------------------------
+
+/**
+ * Quota defaults, tuned for the R2 free tier the self-hosting story rides on:
+ * WARN at 8 GiB (80% of 10 GiB) so there is time to act, HARD at 10 GiB.
+ * Advisory in v1 — surfaced on `/api/status` (dashboard, `vsa doctor`) but
+ * never enforced by refusing commits (a vault that cannot sync is worse
+ * than a vault over quota). Admin-tunable via `POST /admin/quota` (0 = off).
+ */
+export const QUOTA_WARN_DEFAULT_BYTES = 8 * 1024 ** 3;
+export const QUOTA_HARD_DEFAULT_BYTES = 10 * 1024 ** 3;
+/** Retention knob bounds (`POST /admin/retention`): 0 disables each. */
+export const RETENTION_MAX_DAYS = 3650;
+export const RETENTION_MAX_VERSIONS = 1000;
+
 export const ADMIN_COOKIE_NAME = 'vsa_admin';
 const CLIENT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'hello',
@@ -897,11 +912,15 @@ export class VaultRoom extends DurableObject<Env> {
     }
     if (request.method === 'POST' && path === '/admin/pair') return this.httpAdminPair(request);
     if (request.method === 'POST' && path === '/admin/revoke') return this.httpAdminRevoke(request);
+    if (request.method === 'POST' && path === '/admin/retention') return this.httpAdminRetention(request);
+    if (request.method === 'POST' && path === '/admin/quota') return this.httpAdminQuota(request);
     if (request.method === 'POST' && path === '/pair') return this.httpPair(request);
     if (request.method === 'PATCH' && path === '/device') return this.httpDeviceRename(request);
     if (request.method === 'GET' && path === '/api/status') return this.httpStatus(request);
     if (request.method === 'GET' && path === '/api/history') return this.httpHistory(request, url);
     if (request.method === 'GET' && path === '/api/snapshots') return this.httpSnapshots(request);
+    if (request.method === 'GET' && path === '/backup') return this.httpBackup(request);
+    if (request.method === 'POST' && path === '/internal/retention') return this.httpRetentionRun();
     if (request.method === 'POST' && path === '/internal/auth') return this.httpInternalAuth(request);
     if (request.method === 'POST' && path === '/internal/blob-uploaded') return this.httpBlobUploaded(request);
     if (request.method === 'GET' && path === '/internal/gc') return this.httpGcList();
@@ -1261,7 +1280,291 @@ export class VaultRoom extends DurableObject<Env> {
       lastEdit,
       attachments: { count: attachmentRow?.count ?? 0, bytes: attachmentRow?.bytes ?? 0 },
       storageBytes: storageRow?.bytes ?? 0,
+      quota: await this.quotaState(Number(storageRow?.bytes ?? 0)),
+      retention: {
+        days: await this.intMeta('settings_retention_days', 0),
+        versions: await this.intMeta('settings_retention_versions', 0),
+      },
       recentEvents,
+    });
+  }
+
+  /**
+   * The advisory quota state for a storage byte total (see the constants'
+   * doc): `off` when both knobs are 0, `warn` at/over warnBytes, `over` at/
+   * over hardBytes, else `ok`. Pure metadata — surfaced, never enforced.
+   */
+  private async quotaState(storageBytes: number): Promise<{
+    warnBytes: number;
+    hardBytes: number;
+    state: 'ok' | 'warn' | 'over' | 'off';
+  }> {
+    const warnBytes = await this.intMeta('settings_quota_warn_bytes', QUOTA_WARN_DEFAULT_BYTES);
+    const hardBytes = await this.intMeta('settings_quota_hard_bytes', QUOTA_HARD_DEFAULT_BYTES);
+    const state =
+      warnBytes === 0 && hardBytes === 0
+        ? 'off'
+        : hardBytes !== 0 && storageBytes >= hardBytes
+          ? 'over'
+          : warnBytes !== 0 && storageBytes >= warnBytes
+            ? 'warn'
+            : 'ok';
+    return { warnBytes, hardBytes, state };
+  }
+
+  /** `meta` integer read with a default (unset/invalid → `fallback`). */
+  private async intMeta(key: string, fallback: number): Promise<number> {
+    const raw = await this.getMeta(key);
+    if (raw === null) return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  }
+
+  /**
+   * `POST /admin/quota` — advisory storage thresholds (bytes; 0 disables).
+   * Values are clamped to [0, 1 TiB]; a hard threshold below the warn
+   * threshold is accepted as-is (the stricter one simply fires first).
+   */
+  private async httpAdminQuota(request: Request): Promise<Response> {
+    if (!(await this.requireAdmin(request))) return json(401, { error: 'admin session required' });
+    const body = (await request.json().catch(() => null)) as
+      | { warnBytes?: unknown; hardBytes?: unknown }
+      | null;
+    const clamp = (value: unknown): number | null => {
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) return null;
+      return Math.min(value, 1024 ** 4);
+    };
+    if (
+      body === null ||
+      (body.warnBytes === undefined && body.hardBytes === undefined) ||
+      (body.warnBytes !== undefined && clamp(body.warnBytes) === null) ||
+      (body.hardBytes !== undefined && clamp(body.hardBytes) === null)
+    ) {
+      return json(400, { error: 'warnBytes/hardBytes must be integer bytes (0 to disable)' });
+    }
+    if (body.warnBytes !== undefined) {
+      await this.setMeta('settings_quota_warn_bytes', String(clamp(body.warnBytes)));
+    }
+    if (body.hardBytes !== undefined) {
+      await this.setMeta('settings_quota_hard_bytes', String(clamp(body.hardBytes)));
+    }
+    return json(200, { ok: true, quota: await this.quotaState(await this.storageBytes()) });
+  }
+
+  /** Total bytes across all tracked blobs (quota input). */
+  private async storageBytes(): Promise<number> {
+    const row = this.sql('SELECT COALESCE(SUM(size), 0) AS bytes FROM blobs').toArray()[0];
+    return (row?.bytes as number) ?? 0;
+  }
+
+  /**
+   * `POST /admin/retention` — history bounding (the free-tier growth lever).
+   * `days`: drop non-head versions older than N days. `versions`: keep at
+   * most N non-head versions per path (newest win). Both default 0 = keep
+   * forever (today's FR-7 behavior); each applies independently, and
+   * snapshot-referenced versions are ALWAYS pinned (a snapshot that cannot
+   * be restored would be a silent lie).
+   */
+  private async httpAdminRetention(request: Request): Promise<Response> {
+    if (!(await this.requireAdmin(request))) return json(401, { error: 'admin session required' });
+    const body = (await request.json().catch(() => null)) as
+      | { days?: unknown; versions?: unknown }
+      | null;
+    const validDays =
+      body?.days === undefined ? undefined : typeof body.days === 'number' && Number.isInteger(body.days) && body.days >= 0 && body.days <= RETENTION_MAX_DAYS;
+    const validVersions =
+      body?.versions === undefined
+        ? undefined
+        : typeof body.versions === 'number' &&
+          Number.isInteger(body.versions) &&
+          body.versions >= 0 &&
+          body.versions <= RETENTION_MAX_VERSIONS;
+    if (body === null || (validDays === false && validVersions === undefined) || (validVersions === false && validDays === undefined) || (validDays === false && validVersions === false)) {
+      return json(400, {
+        error: `days (0..${RETENTION_MAX_DAYS}) and versions (0..${RETENTION_MAX_VERSIONS}) must be integers; 0 disables`,
+      });
+    }
+    if (validDays === true) await this.setMeta('settings_retention_days', String(body?.days));
+    if (validVersions === true) await this.setMeta('settings_retention_versions', String(body?.versions));
+    return json(200, {
+      ok: true,
+      retention: {
+        days: await this.intMeta('settings_retention_days', 0),
+        versions: await this.intMeta('settings_retention_versions', 0),
+      },
+    });
+  }
+
+  /**
+   * `POST /internal/retention` — the weekly cron's history-compaction pass
+   * (runs before GC so freed blobs are collected the same night). Inside
+   * `runExclusive` (the DO's serialized queue): commits cannot interleave.
+   *
+   * Never deleted: every path's HEAD version, and every version id any
+   * snapshot references (restorability is absolute). Each deletion drops
+   * its blob refcount by one; the GC's confirm-then-purge pass is what
+   * actually removes R2 objects, so a version re-referenced between here
+   * and GC still wins.
+   */
+  private async httpRetentionRun(): Promise<Response> {
+    const retentionDays = await this.intMeta('settings_retention_days', 0);
+    const retentionVersions = await this.intMeta('settings_retention_versions', 0);
+    if (retentionDays === 0 && retentionVersions === 0) {
+      return json(200, { removed: 0, skipped: 'retention disabled' });
+    }
+    const cutoff = this.now() - retentionDays * 24 * 60 * 60 * 1000;
+
+    // Protected ids: every head, plus everything snapshots point at.
+    const protectedIds = new Set<string>();
+    for (const row of this.sql('SELECT current_version FROM files').toArray()) {
+      protectedIds.add(row.current_version as string);
+    }
+    for (const row of this.sql('SELECT heads FROM snapshots').toArray()) {
+      // `heads` is a path → SnapshotHeadRecord map (snapshots.ts), not an array.
+      const heads = JSON.parse(row.heads as string) as Record<string, { version?: string }>;
+      for (const head of Object.values(heads)) {
+        if (head.version !== undefined) protectedIds.add(head.version);
+      }
+    }
+
+    // Per path (versions newest-first): age-doomed candidates drop by `days`;
+    // of the REMAINING non-head versions, only the newest `versions` survive.
+    const doomed: Array<{ id: string; hash: string }> = [];
+    const paths = new Map<string, Array<{ id: string; hash: string; ts: number }>>();
+    for (const row of this.sql(
+      'SELECT path, id, hash, ts FROM versions ORDER BY path ASC, ts DESC, id DESC',
+    ).toArray()) {
+      const path = row.path as string;
+      const list = paths.get(path) ?? [];
+      list.push({ id: row.id as string, hash: row.hash as string, ts: row.ts as number });
+      paths.set(path, list);
+    }
+    for (const versions of paths.values()) {
+      let survivors = 0;
+      for (const version of versions) {
+        if (protectedIds.has(version.id)) continue; // heads + snapshot pins
+        const expired = retentionDays !== 0 && version.ts < cutoff;
+        if (expired || (retentionVersions !== 0 && survivors >= retentionVersions)) {
+          doomed.push(version);
+          continue;
+        }
+        survivors += 1;
+      }
+    }
+
+    let refcountDrops = 0;
+    for (const version of doomed) {
+      this.sql('DELETE FROM versions WHERE id = ?', version.id);
+      if (version.hash !== '') {
+        this.sql('UPDATE blobs SET refcount = MAX(refcount - 1, 0) WHERE hash = ?', version.hash);
+        refcountDrops += 1;
+      }
+    }
+    return json(200, { removed: doomed.length, refcountDrops, retentionDays, retentionVersions });
+  }
+
+  /**
+   * `GET /backup` — the trust escape hatch: the ENTIRE vault (heads, full
+   * version history, every distinct blob) as one streamed NDJSON archive:
+   *
+   *   {"type":"meta",…}               vault name, generated-at, counts
+   *   {"type":"file",…}               one per live/tombstoned head
+   *   {"type":"version",…}            one per version row (the history)
+   *   {"type":"blob","hash":…}        one per distinct content hash
+   *   {"type":"blob-missing","hash":…} GC raced a blob away (rare; noted)
+   *
+   * All SQL is drained BEFORE the response returns (the DO's serialized
+   * queue is held only for the fast metadata phase); the R2 stream then
+   * reads outside the lock. Device token or admin session — it is the
+   * owner's data by construction.
+   */
+  private async httpBackup(request: Request): Promise<Response> {
+    const auth = await this.authenticateHttpRequest(request);
+    if (!auth.ok) return json(401, { error: 'device token or admin session required' });
+
+    const files = this.sql('SELECT * FROM files ORDER BY path ASC').toArray();
+    const versions = this.sql(
+      'SELECT id, path, hash, size, device_id, clock_counter, clock_device, ts, kind FROM versions ORDER BY path ASC, ts ASC, id ASC',
+    ).toArray();
+    const blobs = this.sql('SELECT hash, size FROM blobs ORDER BY hash ASC').toArray();
+    const vaultName = (await this.getMeta('vault_name')) ?? '';
+    const generated = this.now();
+
+    const encoder = new TextEncoder();
+    const line = (value: unknown): Uint8Array => encoder.encode(`${JSON.stringify(value)}\n`);
+    const headerRows = [
+      line({
+        type: 'meta',
+        format: 1,
+        vaultName,
+        generated,
+        fileCount: files.length,
+        versionCount: versions.length,
+        blobCount: blobs.length,
+      }),
+      ...files.map((row) =>
+        line({
+          type: 'file',
+          path: row.path,
+          version: row.current_version,
+          hash: row.head_hash,
+          size: row.head_size,
+          deleted: (row.deleted as number) === 1,
+          isFolder: (row.is_folder as number) === 1,
+        }),
+      ),
+      ...versions.map((row) =>
+        line({
+          type: 'version',
+          path: row.path,
+          id: row.id,
+          hash: row.hash,
+          size: row.size,
+          deviceId: row.device_id,
+          clock: { counter: row.clock_counter, deviceId: row.clock_device },
+          ts: row.ts,
+          kind: row.kind,
+        }),
+      ),
+    ];
+
+    const blobRows = blobs as Array<{ hash: string; size: number }>;
+    const bucket = this.env.BUCKET;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        // Header + version rows first (already in memory)…
+        if (headerRows.length > 0) {
+          controller.enqueue(headerRows.shift());
+          return; // one chunk per pull keeps memory flat
+        }
+        const blob = blobRows.shift();
+        if (blob === undefined) {
+          controller.close();
+          return;
+        }
+        const object = await bucket.get(blobKey(blob.hash)).catch(() => null);
+        if (object === null) {
+          controller.enqueue(line({ type: 'blob-missing', hash: blob.hash }));
+          return;
+        }
+        const bytes = new Uint8Array(await object.arrayBuffer());
+        controller.enqueue(
+          line({
+            type: 'blob',
+            hash: blob.hash,
+            size: bytes.byteLength,
+            content: bytesToBase64(bytes),
+          }),
+        );
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'content-disposition': `attachment; filename="vaultsync-backup.ndjson"`,
+        'cache-control': 'no-store',
+      },
     });
   }
 

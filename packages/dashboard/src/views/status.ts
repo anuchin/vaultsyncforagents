@@ -225,7 +225,17 @@ export function statusView(ctx: ViewContext): ViewHandle {
     statAttachments.textContent = String(current.attachments.count);
     statAttachmentsSub.textContent = formatBytes(current.attachments.bytes);
     statStorage.textContent = formatBytes(current.storageBytes);
-    statStorageSub.textContent = 'all stored versions, deduplicated';
+    const quota = current.quota;
+    statStorageSub.textContent =
+      quota !== undefined && quota.state === 'over'
+        ? `OVER the ${formatBytes(quota.hardBytes)} threshold`
+        : quota !== undefined && quota.state === 'warn'
+          ? `approaching ${formatBytes(quota.hardBytes)}`
+          : 'all stored versions, deduplicated';
+    statStorage.parentElement?.classList.toggle(
+      'stat-warn',
+      quota?.state === 'warn' || quota?.state === 'over',
+    );
 
     // Devices table.
     deviceError.textContent = '';

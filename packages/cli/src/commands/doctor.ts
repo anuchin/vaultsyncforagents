@@ -151,10 +151,21 @@ async function examine(runtime: VsRuntime, vault: VaultEntry): Promise<DoctorRep
         if (versionCheck.status !== 'fail') versionCheck.status = 'warn';
         versionCheck.detail += ` (but /api/status reports ${status.serverVersion})`;
       }
+      const quota = status.quota;
+      const quotaDetail =
+        quota === undefined
+          ? ''
+          : quota.state === 'off'
+            ? ' (quota alerts off)'
+            : quota.state === 'over'
+              ? ` — OVER the ${formatBytes(quota.hardBytes)} hard threshold: trim history (retention) or raise the quota in the dashboard`
+              : quota.state === 'warn'
+                ? ` — approaching the ${formatBytes(quota.hardBytes)} threshold (${formatBytes(quota.warnBytes)} warn mark)`
+                : '';
       checks.push({
         name: 'storage',
-        status: 'ok',
-        detail: `${formatBytes(status.storageBytes)} of blobs (${status.attachments.count} attachments, ${formatBytes(status.attachments.bytes)})`,
+        status: quota?.state === 'over' ? 'fail' : quota?.state === 'warn' ? 'warn' : 'ok',
+        detail: `${formatBytes(status.storageBytes)} of blobs (${status.attachments.count} attachments, ${formatBytes(status.attachments.bytes)})${quotaDetail}`,
       });
     } catch {
       checks.push({ name: 'storage', status: 'skip', detail: 'status unavailable' });

@@ -45,6 +45,10 @@ export interface StatusDoc {
   lastEdit: LastEdit | null;
   attachments: { count: number; bytes: number };
   storageBytes: number;
+  /** Advisory storage quota (servers ≥ 0.2; absent on older). */
+  quota?: { warnBytes: number; hardBytes: number; state: 'ok' | 'warn' | 'over' | 'off' };
+  /** Retention configuration (servers ≥ 0.2; absent on older). */
+  retention?: { days: number; versions: number };
   recentEvents: EventInfo[];
 }
 
