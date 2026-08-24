@@ -14,6 +14,12 @@ export default defineConfig({
         find: /^obsidian$/,
         replacement: fileURLToPath(new URL('./test/helpers/obsidian-mock.ts', import.meta.url)),
       },
+      // Source aliases for workspace deps — junctions do not resolve on
+      // network-mapped/OneDrive drives (see node-runtime's config).
+      {
+        find: /^@vsa\/core$/,
+        replacement: fileURLToPath(new URL('../core/src/index.ts', import.meta.url)),
+      },
     ],
   },
   test: {

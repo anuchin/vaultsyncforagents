@@ -17,9 +17,21 @@
  * R2 bucket in `beforeEach` (`helpers.resetAll`), preserving fresh-worker
  * semantics without file juggling.
  */
+import { fileURLToPath } from 'node:url';
 import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
 
 export default defineWorkersConfig({
+  resolve: {
+    // Source aliases for workspace deps: node_modules junctions do not
+    // resolve on some drives (network-mapped/OneDrive volumes), and tests
+    // must run regardless of how the checkout's links were created.
+    alias: [
+      {
+        find: /^@vsa\/core$/,
+        replacement: fileURLToPath(new URL('../core/src/index.ts', import.meta.url)),
+      },
+    ],
+  },
   test: {
     include: ['test/**/*.test.ts'],
     // Generous per-test budget: the auth tests run real argon2 derivations
