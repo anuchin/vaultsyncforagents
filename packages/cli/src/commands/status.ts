@@ -28,7 +28,14 @@ export interface VaultStatusReport {
   lastEdit?: { ts: number; deviceName: string; path: string } | null;
   attachments?: { count: number; bytes: number };
   storageBytes?: number;
-  sync?: { state: string; pending: number; conflicts: number; trackedFiles: number };
+  sync?: {
+    state: string;
+    pending: number;
+    conflicts: number;
+    trackedFiles: number;
+    /** Present while the mass-delete quarantine holds (see core's guard). */
+    massDeleteGuard?: { deletions: number; liveEntries: number };
+  };
   error?: string;
 }
 
@@ -40,9 +47,10 @@ export interface StatusReport {
 export async function runStatus(
   runtime: VsRuntime,
   vaults: readonly VaultEntry[],
+  options?: { allowMassDelete?: boolean },
 ): Promise<StatusReport> {
   const reports = await Promise.all(
-    vaults.map(async (vault): Promise<VaultStatusReport> => report(runtime, vault)),
+    vaults.map(async (vault): Promise<VaultStatusReport> => report(runtime, vault, options)),
   );
   return {
     vaults: reports,
@@ -53,7 +61,11 @@ export async function runStatus(
   };
 }
 
-async function report(runtime: VsRuntime, vault: VaultEntry): Promise<VaultStatusReport> {
+async function report(
+  runtime: VsRuntime,
+  vault: VaultEntry,
+  options?: { allowMassDelete?: boolean },
+): Promise<VaultStatusReport> {
   const base: VaultStatusReport = {
     id: vault.id,
     name: vault.name,
@@ -97,12 +109,20 @@ async function report(runtime: VsRuntime, vault: VaultEntry): Promise<VaultStatu
   let sync: VaultStatusReport['sync'];
   let syncError: string | undefined;
   try {
-    const result = await oneShotSync(vault, token, runtime, `cli:${vault.name}`);
+    const result = await oneShotSync(vault, token, runtime, `cli:${vault.name}`, options);
     sync = {
       state: result.status.state,
       pending: result.status.pending,
       conflicts: result.status.conflicts.length,
       trackedFiles: result.trackedFiles,
+      ...(result.status.massDeleteGuard !== undefined
+        ? {
+            massDeleteGuard: {
+              deletions: result.status.massDeleteGuard.deletions,
+              liveEntries: result.status.massDeleteGuard.liveEntries,
+            },
+          }
+        : {}),
     };
   } catch (error) {
     syncError = error instanceof Error ? error.message : String(error);
@@ -165,6 +185,12 @@ export function renderStatus(report: StatusReport, runtime: VsRuntime): void {
       out.log(
         `  pending: ${vault.sync.pending}, conflicts: ${vault.sync.conflicts}, files tracked: ${vault.sync.trackedFiles}`,
       );
+      if (vault.sync.massDeleteGuard !== undefined) {
+        out.log(
+          `  ⚠ mass-delete quarantine: ${vault.sync.massDeleteGuard.deletions} deletions blocked ` +
+            `(of ${vault.sync.massDeleteGuard.liveEntries} tracked) — if intentional, re-run with --allow-mass-delete`,
+        );
+      }
     }
     out.log('');
   }

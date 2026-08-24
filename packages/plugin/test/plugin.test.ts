@@ -562,7 +562,7 @@ describe('VaultSyncPlugin — commands + support bundle export', () => {
     vi.useRealTimers();
   });
 
-  it('onload registers the two palette commands', async () => {
+  it('onload registers the three palette commands', async () => {
     const { plugin } = makePlugin({});
     await plugin.onload();
 
@@ -570,6 +570,7 @@ describe('VaultSyncPlugin — commands + support bundle export', () => {
     expect(commands.map((c) => `${c.id}:${c.name}`)).toEqual([
       'copy-diagnostics:Copy diagnostics',
       'save-support-bundle:Save support bundle',
+      'allow-mass-deletion:Allow blocked mass deletion (one sync cycle)',
     ]);
     // Both callbacks are wired to the plugin's actions.
     expect(commands[0]!.callback).toBeInstanceOf(Function);

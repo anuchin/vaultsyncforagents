@@ -17,7 +17,11 @@
  *   watcher:  `WatchAdapter` batches are debounced (~300 ms, injectable
  *             scheduler — no ambient timers in tests) into scan→plan→execute;
  *   reconnect: `onClose` flips to `'disconnected'`; `reconnect()` re-runs the
- *             whole startup reconciliation (backoff is the caller's job).
+ *             whole startup reconciliation (backoff is the caller's job);
+ *   safety:   a cycle whose scan wants to delete more than the quarantine
+ *             thresholds (`SyncClientOptions.massDeleteGuard`) has its
+ *             deletions REFUSED — the mount-drop wipe stops here, from the
+ *             very first cycle (v1's startup barrier folded into the guard).
  *
  * Bulk phases report X/Y on `status().progress` (throttled via the injected
  * clock); the push phase keeps up to `pushConcurrency` commits in flight.
@@ -73,7 +77,7 @@ import {
   type RemoteFile,
   type SyncPlan,
 } from './resolve.js';
-import { recordHashedFiles, scanVault, type HashedFile } from './scan.js';
+import { recordHashedFiles, scanVault, type HashedFile, type LocalChanges } from './scan.js';
 import type { Transport } from './transport.js';
 import type { LogicalClock } from './types.js';
 
@@ -119,7 +123,25 @@ export interface SyncClientOptions {
    * always emit). Tests pass 0 to observe every file.
    */
   progressThrottleMs?: number;
+  /**
+   * Mass-delete quarantine tuning (see `SyncClientStatus.massDeleteGuard`).
+   * Defaults: a cycle's deletions are refused when they exceed BOTH 25 paths
+   * and 50% of the index's live entries. Set `disabled: true` to opt out
+   * (not recommended — this is the last line of defense against a dropped
+   * mount wiping the remote vault).
+   */
+  massDeleteGuard?: {
+    /** Absolute floor: this many deletions never trigger the guard (default 25). */
+    maxDeletions?: number;
+    /** Fraction of live index entries (default 0.5). */
+    maxDeleteFraction?: number;
+    /** Opt the guard out entirely (default false). */
+    disabled?: boolean;
+  };
 }
+
+/** Defaults for `SyncClientOptions.massDeleteGuard`. */
+export const MASS_DELETE_DEFAULTS = { maxDeletions: 25, maxDeleteFraction: 0.5 } as const;
 
 export type SyncClientState = 'idle' | 'connecting' | 'syncing' | 'live' | 'disconnected';
 
@@ -173,6 +195,29 @@ export interface SyncClientStatus {
    * link; replaced every cycle like `conflicts`. Omitted when there are none.
    */
   symlinks?: string[];
+  /**
+   * Present while the mass-delete quarantine holds: the most recent cycle's
+   * scan wanted to push THIS many deletions (files + folder tombstones),
+   * more than the configured floor AND fraction of the index's live
+   * entries, so the client refused to plan them. This is the guard against
+   * the classic disaster — a dropped mount making an empty vault look like
+   * "the user deleted everything" — and it also plays v1's startup-barrier
+   * role: because it evaluates from the very first cycle, a client that
+   * starts against an unreadable vault can never open with a wipe.
+   *
+   * Everything else in the cycle still syncs; only the deletion pushes are
+   * withheld. If the deletions are REAL (the user cleaned house on
+   * purpose), arm one cycle with `confirmMassDeletion()`; if the scan
+   * heals (mount returns), the next cycle clears this field automatically.
+   */
+  massDeleteGuard?: {
+    /** Deletions the last cycle refused to push. */
+    deletions: number;
+    /** Live entries the index held when the guard tripped. */
+    liveEntries: number;
+    /** Epoch ms of the trip. */
+    at: number;
+  };
   /**
    * Server release version as reported by helloAck (null before the first
    * ack — and for legacy servers ≤ 0.1, which never send the field; see
@@ -247,6 +292,9 @@ export class SyncClient {
   private caseCollisions: string[] = [];
   private skippedPaths: string[] = [];
   private symlinks: string[] = [];
+  private massDelete: { deletions: number; liveEntries: number; at: number } | null = null;
+  /** Set by `confirmMassDeletion`; consumed (one cycle) by the guard. */
+  private massDeleteArmed = false;
   private ignoreSettings: IgnoreSettings;
   private watchAdapter: WatchAdapter | null = null;
   private cancelDebounce: (() => void) | null = null;
@@ -356,6 +404,19 @@ export class SyncClient {
     await this.enqueue(() => this.runCycle());
   }
 
+  /**
+   * "Yes, these deletions are intentional" — arms the guard for exactly one
+   * cycle (the next `triggerSync`/reconcile) and schedules that cycle.
+   * Returns false when no quarantine is active (nothing to confirm), so
+   * UIs can keep the button disabled otherwise.
+   */
+  confirmMassDeletion(): boolean {
+    if (this.massDelete === null) return false;
+    this.massDeleteArmed = true;
+    this.scheduleReconcile();
+    return true;
+  }
+
   /** Resolves when every queued operation has settled. */
   async waitIdle(): Promise<void> {
     while (this.queuedOps > 0) await this.tail;
@@ -371,6 +432,7 @@ export class SyncClient {
       ...(this.caseCollisions.length > 0 ? { caseCollisions: [...this.caseCollisions] } : {}),
       ...(this.skippedPaths.length > 0 ? { skippedPaths: [...this.skippedPaths] } : {}),
       ...(this.symlinks.length > 0 ? { symlinks: [...this.symlinks] } : {}),
+      ...(this.massDelete !== null ? { massDeleteGuard: { ...this.massDelete } } : {}),
       serverVersion: this.serverVersion,
       ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
@@ -756,6 +818,43 @@ export class SyncClient {
   }
 
   /**
+   * Mass-delete quarantine (v1's assessMassDelete and StartupBarrier in one):
+   * when a scan would push more deletions (file tombstones + folder
+   * tombstones) than BOTH the floor and the fraction of the index's live
+   * entries, refuse to plan them — surfaces via `status().massDeleteGuard`
+   * and an error log; everything else in the cycle still syncs. Because it
+   * evaluates from the very first cycle, a client starting against an
+   * unreadable/empty mount can never open with a wipe. An armed
+   * confirmation (`confirmMassDeletion`) bypasses exactly one cycle.
+   */
+  private guardMassDelete(localChanges: LocalChanges): LocalChanges {
+    const deletions = localChanges.deleted.length + localChanges.folderDeletions.length;
+    const options = this.options.massDeleteGuard;
+    const armed = this.massDeleteArmed;
+    this.massDeleteArmed = false; // one cycle only
+    if (options?.disabled === true || armed || deletions === 0) {
+      this.massDelete = null;
+      return localChanges;
+    }
+    let liveEntries = 0;
+    for (const entry of Object.values(this.index)) {
+      if (entry.deletedAt === undefined) liveEntries += 1;
+    }
+    const floor = options?.maxDeletions ?? MASS_DELETE_DEFAULTS.maxDeletions;
+    const fraction = options?.maxDeleteFraction ?? MASS_DELETE_DEFAULTS.maxDeleteFraction;
+    if (deletions <= floor || deletions <= liveEntries * fraction) {
+      this.massDelete = null;
+      return localChanges;
+    }
+    this.massDelete = { deletions, liveEntries, at: this.now() };
+    this.log.error(
+      `mass-delete quarantine: this scan wants to push ${deletions} deletions (over ${floor} and over ${Math.round(fraction * 100)}% of ${liveEntries} tracked entries) — refusing to push them. ` +
+        'If the deletions are intentional, confirm once (the "allow mass deletion" command / --allow-mass-delete); otherwise check the vault mount and ignore rules first.',
+    );
+    return { ...localChanges, deleted: [], folderDeletions: [] };
+  }
+
+  /**
    * Record one bulk-phase step on `status().progress`. Coalesced to at most
    * one update per `progressThrottleMs` (renderer churn), EXCEPT phase
    * changes and completions, which always emit so a phase is never missed
@@ -812,8 +911,9 @@ export class SyncClient {
           thisDeviceId: this.options.deviceId,
         },
       );
+      const guardedChanges = this.guardMassDelete(localChanges);
       const plan = computeSyncPlan({
-        localChanges,
+        localChanges: guardedChanges,
         index: this.index,
         manifest,
         thisDeviceId: this.options.deviceId,

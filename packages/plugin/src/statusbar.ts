@@ -75,6 +75,9 @@ export function statusLineFor(
     case 'disconnected':
       return compact ? 'vsa ✗' : 'vsa ✗ offline';
     case 'live':
+      if (status.massDeleteGuard !== undefined) {
+        return compact ? 'vsa ⛔' : `vsa ⛔ ${status.massDeleteGuard.deletions} deletions blocked`;
+      }
       if (status.conflicts.length > 0) {
         return compact ? 'vsa ⚠' : `vsa ⚠ conflicts: ${status.conflicts.length}`;
       }
@@ -106,6 +109,12 @@ export function statusTooltipFor(status: SyncClientStatus, context: StatusContex
   if (status.progress !== undefined) {
     lines.push(`Syncing: ${status.progress.done}/${status.progress.total} (${status.progress.phase})`);
   }
+  if (status.massDeleteGuard !== undefined) {
+    lines.push(
+      `⛔ Mass-delete quarantine: ${status.massDeleteGuard.deletions} deletions blocked ` +
+        `(of ${status.massDeleteGuard.liveEntries} tracked) — run "Allow blocked mass deletion" if intentional`,
+    );
+  }
   lines.push(`Pending changes: ${status.pending}`);
   lines.push(`Conflicts: ${status.conflicts.length}`);
   if (status.conflicts.length > 0) {
@@ -118,6 +127,7 @@ export function statusTooltipFor(status: SyncClientStatus, context: StatusContex
 /** CSS modifier for the indicator (tinted warning/error states). */
 export function statusClassFor(status: SyncClientStatus): string {
   if (status.state === 'disconnected') return 'vsa-error';
+  if (status.massDeleteGuard !== undefined) return 'vsa-warn';
   if (status.conflicts.length > 0) return 'vsa-warn';
   return '';
 }

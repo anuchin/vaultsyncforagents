@@ -132,9 +132,15 @@ export function buildProgram(runtime: VsRuntime): Command {
   program
     .command('status')
     .description('per-vault sync status across all linked vaults')
-    .action(async () => {
+    .option(
+      '--allow-mass-delete',
+      'if the mass-delete quarantine has blocked deletions you intended, let THIS cycle push them',
+    )
+    .action(async (cmdOptions: { allowMassDelete?: boolean }) => {
       const options = globals();
-      const report = await runStatus(runtime, selectVaults(runtime, options.vault));
+      const report = await runStatus(runtime, selectVaults(runtime, options.vault), {
+        allowMassDelete: cmdOptions.allowMassDelete === true,
+      });
       if (options.json === true) {
         runtime.output.log(JSON.stringify(report, null, 2));
         return;

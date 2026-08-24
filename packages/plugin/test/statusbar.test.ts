@@ -54,6 +54,19 @@ describe('statusLineFor', () => {
     ).toBe('vsa ⚠ conflicts: 2');
   });
 
+  it('a mass-delete quarantine takes over the line (and outranks conflicts)', () => {
+    const guard = { massDeleteGuard: { deletions: 4000, liveEntries: 5000, at: now } };
+    expect(statusLineFor(status(guard), now)).toBe('vsa ⛔ 4000 deletions blocked');
+    expect(statusLineFor(status(guard), now, 'compact')).toBe('vsa ⛔');
+    expect(statusLineFor(status({ ...guard, conflicts: [conflict('/a.md')] }), now)).toBe(
+      'vsa ⛔ 4000 deletions blocked',
+    );
+    expect(statusClassFor(status(guard))).toBe('vsa-warn');
+    expect(statusTooltipFor(status(guard), { url: '', deviceName: '' }, now)).toContain(
+      '4000 deletions blocked',
+    );
+  });
+
   it('offline when disconnected; plain marker when idle', () => {
     expect(statusLineFor(status({ state: 'disconnected' }), now)).toBe('vsa ✗ offline');
     expect(statusLineFor(status({ state: 'idle' }), now)).toBe('vsa');

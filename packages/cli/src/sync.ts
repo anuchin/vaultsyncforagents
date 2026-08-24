@@ -25,6 +25,7 @@ export function createVaultClient(
   token: string,
   runtime: VsRuntime,
   deviceName: string,
+  options?: { allowMassDelete?: boolean },
 ): VaultClient {
   const storage = new NodeStorageAdapter({ root: vault.id });
   const blobStore = new HttpBlobStore({
@@ -44,6 +45,9 @@ export function createVaultClient(
     blobStore,
     storage,
     now: runtime.now,
+    // An armed one-shot is the CLI's confirmation gesture: THIS invocation's
+    // cycle proceeds (the daemon's own guard still re-engages on its cycles).
+    ...(options?.allowMassDelete === true ? { massDeleteGuard: { disabled: true } } : {}),
   });
   return { client, storage };
 }
@@ -57,14 +61,17 @@ export interface OneShotResult {
 /**
  * Connect (startup reconciliation IS the cycle), snapshot, disconnect.
  * Never leaves a socket open — CLI invocations are one-shot by contract.
+ * `allowMassDelete` arms the deletion quarantine for THIS cycle (the user
+ * typed the flag; the daemon's own cycles stay guarded).
  */
 export async function oneShotSync(
   vault: VaultEntry,
   token: string,
   runtime: VsRuntime,
   deviceName: string,
+  options?: { allowMassDelete?: boolean },
 ): Promise<OneShotResult> {
-  const { client } = createVaultClient(vault, token, runtime, deviceName);
+  const { client } = createVaultClient(vault, token, runtime, deviceName, options);
   try {
     await client.connect();
     const status = client.status();

@@ -94,6 +94,8 @@ export class VaultSyncPlugin extends Plugin {
   /** Set when the worker rejected the token — reconnecting cannot help. */
   private authFailed = false;
   private statusNote = '';
+  /** Trip timestamp of the last mass-delete quarantine we noticed about (edge-trigger dedup). */
+  private massDeleteNoticeAt: number | null = null;
   /**
    * Latest server-version verdict (core compat.ts), re-assessed by the
    * supervision tick after every helloAck; null before the first ack of a
@@ -149,6 +151,18 @@ export class VaultSyncPlugin extends Plugin {
       id: 'save-support-bundle',
       name: 'Save support bundle',
       callback: () => this.saveSupportBundle(),
+    });
+    this.addCommand({
+      id: 'allow-mass-deletion',
+      name: 'Allow blocked mass deletion (one sync cycle)',
+      callback: () => {
+        const armed = this.client?.confirmMassDeletion() ?? false;
+        new Notice(
+          armed
+            ? 'VaultSync: deletions approved — the next cycle will push them. The guard re-engages right after.'
+            : 'VaultSync: no blocked mass deletion right now.',
+        );
+      },
     });
     // "Sync on startup" OFF = manual-only mode: load idle; the first "Sync
     // now" starts the machinery (watcher included).
@@ -353,6 +367,7 @@ export class VaultSyncPlugin extends Plugin {
     this.client = client;
     this.authFailed = false;
     this.statusNote = '';
+    this.massDeleteNoticeAt = null;
     this.serverCompat = null; // re-assessed from the fresh helloAck
     this.supervisor = new ReconnectSupervisor(this.overrides.reconnect ?? {});
 
@@ -630,6 +645,16 @@ export class VaultSyncPlugin extends Plugin {
     if (client === null) return;
     const status = client.status();
     this.assessServerVersion(status);
+    // Edge-triggered notice for the mass-delete quarantine: once per trip
+    // (keyed on the trip timestamp), persistent, pointing at the command.
+    const blocked = status.massDeleteGuard;
+    if (blocked !== undefined && this.massDeleteNoticeAt !== blocked.at) {
+      this.massDeleteNoticeAt = blocked.at;
+      new Notice(
+        `VaultSync BLOCKED ${blocked.deletions} deletions (a large share of the vault). If you deleted these on purpose, run the command "Allow blocked mass deletion". If not — check the vault's storage first.`,
+        0,
+      );
+    }
     this.statusBar?.update(
       status,
       {
