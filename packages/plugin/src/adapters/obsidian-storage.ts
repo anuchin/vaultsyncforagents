@@ -60,6 +60,16 @@ export interface ObsidianStorageAdapterOptions {
    * `degradedReason` retains the cause for diagnostics.
    */
   onDegraded?: (cause: unknown) => void;
+  /**
+   * The editor-race seam (`open-note-guard.ts`): consulted for every write
+   * with the NORMALIZED vault path (leading slash); when it returns a path,
+   * the write lands THERE instead — the pull of an open, dirty note becomes
+   * a conflict copy rather than a clobber the stale buffer then overwrites.
+   * Sync-internal paths (state file, temp) never reach it (the guard filters),
+   * but the redirect only applies to the final target anyway: temp writes are
+   * anonymous by construction.
+   */
+  openNoteRedirect?: (vaultPath: string) => Promise<string | null>;
 }
 
 /** Why atomic writes are unavailable (null = atomic writes healthy). */
@@ -75,12 +85,14 @@ export class ObsidianStorageAdapter implements StorageAdapter {
   private tempRenameBroken = false;
   private tempCounter = 0;
   private readonly onDegraded?: (cause: unknown) => void;
+  private readonly openNoteRedirect?: (vaultPath: string) => Promise<string | null>;
   private degradedCause: unknown = null;
 
   constructor(options: ObsidianStorageAdapterOptions) {
     this.adapter = options.adapter;
     this.removeEmptyDir = options.removeEmptyDir;
     this.onDegraded = options.onDegraded;
+    this.openNoteRedirect = options.openNoteRedirect;
   }
 
   // --- path mapping ----------------------------------------------------------
@@ -99,7 +111,10 @@ export class ObsidianStorageAdapter implements StorageAdapter {
   }
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
-    const target = this.toAdapterPath(path);
+    // The editor race: a pull overwriting an OPEN, dirty note is redirected
+    // to a conflict copy — see `openNoteRedirect` on the options.
+    const redirected = await this.openNoteRedirect?.(normalizeVaultPath(path));
+    const target = this.toAdapterPath(redirected ?? path);
     await this.ensureParentDirs(target);
     // Copy into a standalone ArrayBuffer: `bytes.buffer` may be a pooled
     // buffer larger than the view (core slices and reuses buffers).

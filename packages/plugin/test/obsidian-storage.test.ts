@@ -113,6 +113,28 @@ describe('ObsidianStorageAdapter', () => {
     ).rejects.toThrow(/verification failed/);
   });
 
+  it('the open-note guard redirects a pull write to the conflict path it names', async () => {
+    const adapter = new FakeDataAdapter({ 'note.md': 'user buffer on disk' });
+    const seen: string[] = [];
+    const storage = new ObsidianStorageAdapter({
+      adapter: adapter as unknown as DataAdapter,
+      openNoteRedirect: async (vaultPath) => {
+        seen.push(vaultPath);
+        return vaultPath === '/note.md' ? '/note (conflict x - from Phone).md' : null;
+      },
+    });
+
+    await storage.writeFile('/note.md', new TextEncoder().encode('remote content'));
+    expect(new TextDecoder().decode(await storage.readFile('/note (conflict x - from Phone).md'))).toBe(
+      'remote content',
+    );
+    // The user's note is untouched, and the guard saw the normalized vault path.
+    expect(new TextDecoder().decode(await storage.readFile('/note.md'))).toBe(
+      'user buffer on disk',
+    );
+    expect(seen).toEqual(['/note.md']);
+  });
+
   it('creates parent directories implicitly on write', async () => {
     const adapter = new FakeDataAdapter();
     const storage = makeStorage(adapter);

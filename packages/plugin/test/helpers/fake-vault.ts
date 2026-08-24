@@ -223,9 +223,11 @@ export class FakeVault {
   }
 }
 
-/** The workspace surface the plugin touches (active-leaf-change). */
+/** The workspace surface the plugin touches (active-leaf-change, editor-change, leaves). */
 export class FakeWorkspace {
   private readonly listeners: FakeEventRef[] = [];
+  /** Open leaves (the open-note guard scans these for editor state). */
+  readonly leaves: Array<{ view: { file?: { path: string } | null; editor?: { getValue(): string } } }> = [];
 
   on(name: string, fn: (...args: unknown[]) => unknown): FakeEventRef {
     const ref = { name, fn };
@@ -238,9 +240,20 @@ export class FakeWorkspace {
     if (index !== -1) this.listeners.splice(index, 1);
   }
 
+  iterateAllLeaves(cb: (leaf: (typeof this.leaves)[number]) => void): void {
+    for (const leaf of this.leaves) cb(leaf);
+  }
+
   emitActiveLeafChange(): void {
     for (const listener of [...this.listeners]) {
       if (listener.name === 'active-leaf-change') listener.fn(null);
+    }
+  }
+
+  /** Simulate Obsidian's editor-change for the note at `path`. */
+  emitEditorChange(path: string): void {
+    for (const listener of [...this.listeners]) {
+      if (listener.name === 'editor-change') listener.fn(null, { file: { path } });
     }
   }
 }

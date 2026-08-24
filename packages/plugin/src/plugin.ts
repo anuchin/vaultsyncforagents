@@ -24,6 +24,7 @@ import {
 } from '@vsa/core';
 import { ObsidianStorageAdapter } from './adapters/obsidian-storage.js';
 import { ObsidianWatchAdapter, RescanScheduler } from './adapters/obsidian-watch.js';
+import { OpenNoteGuard, type WorkspaceLike } from './open-note-guard.js';
 import { HttpBlobStore } from './blobstore.js';
 import {
   buildDiagnosticsBundle,
@@ -96,6 +97,8 @@ export class VaultSyncPlugin extends Plugin {
   private statusNote = '';
   /** Trip timestamp of the last mass-delete quarantine we noticed about (edge-trigger dedup). */
   private massDeleteNoticeAt: number | null = null;
+  /** The editor-race guard (open dirty notes) — lives from onload to onunload. */
+  private openNoteGuard: OpenNoteGuard | null = null;
   /**
    * Latest server-version verdict (core compat.ts), re-assessed by the
    * supervision tick after every helloAck; null before the first ack of a
@@ -135,6 +138,30 @@ export class VaultSyncPlugin extends Plugin {
     this.data = normalizePluginData(await this.loadData());
     this.syncLog.setLevel(this.data.settings.logLevel);
     this.addSettingTab(new VaultSyncSettingTab(this.app, this));
+    // The editor-race guard is session-independent: editor-change events are
+    // tracked from load so the dirty window survives sync restarts.
+    this.openNoteGuard = new OpenNoteGuard({
+      workspace: this.app.workspace as unknown as WorkspaceLike,
+      deviceName: () => this.resolveDeviceName(),
+      readText: async (adapterPath) => {
+        try {
+          const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(adapterPath));
+          return new TextDecoder().decode(bytes);
+        } catch {
+          return null;
+        }
+      },
+      existsNow: (adapterPath) => this.app.vault.getAbstractFileByPath(adapterPath) !== null,
+      now: this.now,
+      onRedirect: ({ fromPath, toPath }) => {
+        this.syncLog.warn('pull redirected over an open, dirty note', { fromPath, toPath });
+        new Notice(
+          `VaultSync kept your unsaved edits in “${fromPath}”; the remote version arrived as “${toPath}”. Merge them when ready.`,
+          12000,
+        );
+      },
+    });
+    this.openNoteGuard.start();
     registerPairProtocolHandler(
       (action, handler) => this.registerObsidianProtocolHandler(action, handler),
       (link) => this.handlePairDeepLink(link.url, link.code),
@@ -171,6 +198,8 @@ export class VaultSyncPlugin extends Plugin {
 
   override onunload(): void {
     this.stopSync();
+    this.openNoteGuard?.stop();
+    this.openNoteGuard = null;
   }
 
   // --- persistence -----------------------------------------------------------------
@@ -278,6 +307,11 @@ export class VaultSyncPlugin extends Plugin {
           0,
         );
       },
+      // The editor race: a pull overwriting an open, dirty note becomes a
+      // conflict copy instead (open-note-guard.ts). Lives on the adapter so
+      // EVERY core write path (pulls, conflict replies) is covered.
+      openNoteRedirect: async (vaultPath) =>
+        (await this.openNoteGuard?.conflictRedirectFor(vaultPath)) ?? null,
     });
   }
 
