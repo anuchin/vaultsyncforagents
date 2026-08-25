@@ -95,7 +95,7 @@ import type { FileStat, StorageAdapter } from './adapters.js';
 import { sha256Hex } from './hashing.js';
 import { isIgnored, type IgnoreSettings } from './ignore.js';
 import type { LocalIndex, LocalIndexEntry } from './localindex.js';
-import { foldKeyForPath, isStrictlyBeneath, isWindowsUnsafePath, parentPath } from './paths.js';
+import { basename, foldKeyForPath, isStrictlyBeneath, isWindowsUnsafePath, parentPath } from './paths.js';
 
 /** Injectable content hash (the default is sha256, same as blob addressing). */
 export type HashFn = (bytes: Uint8Array) => Promise<string>;
@@ -522,12 +522,20 @@ export function recordHashedFiles(
 }
 
 /**
- * Correlate delete + add pairs by content hash (ARCHITECTURE §4).
+ * Correlate delete + add pairs into renames (ARCHITECTURE §4), preserving
+ * file identity — and therefore history — across moves.
  *
- * One-to-one matching, most deterministic wins: when several unmatched adds
- * share the deleted side's hash, prefer an add in the same parent directory;
- * within a preference class, the lexicographically smallest `to` path wins.
- * Matched pairs leave the delete/add buckets and become `renamed`.
+ * Pass 1 — exact content hash (always safe): one-to-one matching, most
+ * deterministic wins; several unmatched adds sharing the deleted side's
+ * hash prefer an add in the same parent directory, then the smallest path.
+ *
+ * Pass 2 — bounded identity (rename WITH edits): when exactly ONE unmatched
+ * delete and exactly ONE unmatched add share the same basename, the pair is
+ * a rename whose content also changed — v1's bounded identity matching,
+ * narrowed to the unambiguous case. Ambiguity in EITHER direction (two
+ * deletes or two adds with the same basename) falls back to delete + add,
+ * the documented safe decomposition: guessing identity from a name collision
+ * could weld two different files' histories together.
  */
 function detectRenames(
   deleted: readonly DeletedCandidate[],
@@ -546,7 +554,7 @@ function detectRenames(
 
   const usedAdds = new Set<string>();
   const renamed: RenameCandidate[] = [];
-  const unmatchedDeleted: DeletedCandidate[] = [];
+  let unmatchedDeleted: DeletedCandidate[] = [];
 
   for (const deletion of [...deleted].sort(byPath)) {
     const candidates = addsByHash.get(deletion.hash) ?? [];
@@ -569,10 +577,39 @@ function detectRenames(
     }
   }
 
+  let unmatchedAdded = added.filter((candidate) => !usedAdds.has(candidate.path));
+
+  // Pass 2 — unique-basename identity: a lone delete and a lone add sharing
+  // a basename is a rename that carried edits.
+  const deletesByBase = new Map<string, DeletedCandidate[]>();
+  for (const deletion of unmatchedDeleted) {
+    const base = basename(deletion.path);
+    deletesByBase.set(base, [...(deletesByBase.get(base) ?? []), deletion]);
+  }
+  const addsByBase = new Map<string, ScanCandidate[]>();
+  for (const candidate of unmatchedAdded) {
+    const base = basename(candidate.path);
+    addsByBase.set(base, [...(addsByBase.get(base) ?? []), candidate]);
+  }
+  const pairedAdds = new Set<string>();
+  const pairedDeletes = new Set<string>();
+  for (const [base, deletionBucket] of deletesByBase) {
+    if (deletionBucket.length !== 1) continue; // ambiguous — do not guess
+    const addBucket = addsByBase.get(base);
+    if (addBucket === undefined || addBucket.length !== 1) continue;
+    const deletion = deletionBucket[0]!;
+    const candidate = addBucket[0]!;
+    pairedDeletes.add(deletion.path);
+    pairedAdds.add(candidate.path);
+    renamed.push({ from: deletion.path, to: candidate.path, hash: candidate.hash, size: candidate.size });
+  }
+  unmatchedDeleted = unmatchedDeleted.filter((d) => !pairedDeletes.has(d.path));
+  unmatchedAdded = unmatchedAdded.filter((a) => !pairedAdds.has(a.path));
+
   return {
     renamed,
     deleted: unmatchedDeleted,
-    added: added.filter((candidate) => !usedAdds.has(candidate.path)),
+    added: unmatchedAdded,
   };
 }
 

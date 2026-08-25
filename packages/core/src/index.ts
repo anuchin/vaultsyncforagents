@@ -18,6 +18,7 @@ export * from './hashing.js';
 export * from './ignore.js';
 export * from './inmemory-server.js';
 export * from './localindex.js';
+export * from './merge/threeway.js';
 export * from './paths.js';
 export * from './protocol.js';
 export * from './resolve.js';

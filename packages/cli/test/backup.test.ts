@@ -11,8 +11,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sha256Hex } from '@vsa/core';
 import { runBackupRestore } from '../src/commands/backup.js';
-import { OutputCapture, type VsRuntime } from './helpers.js';
-import { CommandError } from '../src/runtime.js';
+import { OutputCapture } from './helpers.js';
+import { CommandError, type VsRuntime } from '../src/runtime.js';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 const b64 = (bytes: Uint8Array): string => Buffer.from(bytes).toString('base64');

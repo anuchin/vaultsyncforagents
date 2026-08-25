@@ -68,15 +68,8 @@ import {
   type SnapshotCreateAckMessage,
   type SnapshotRestoreAckMessage,
 } from './protocol.js';
-import {
-  computeSyncPlan,
-  type ConflictOp,
-  type PullFileOp,
-  type PullOp,
-  type PushOp,
-  type RemoteFile,
-  type SyncPlan,
-} from './resolve.js';
+import { computeSyncPlan, type ConflictOp, type PullFileOp, type PullOp, type PushOp, type RemoteFile, type SyncPlan } from './resolve.js';
+import { mergeText3 } from './merge/threeway.js';
 import { recordHashedFiles, scanVault, type HashedFile, type LocalChanges } from './scan.js';
 import type { Transport } from './transport.js';
 import type { LogicalClock } from './types.js';
@@ -196,6 +189,16 @@ export interface SyncClientStatus {
    */
   symlinks?: string[];
   /**
+   * Paths the loop detector has QUARANTINED: the client observed the same
+   * path's content flip between two hashes repeatedly (the ping-pong shape
+   * — usually two writers fighting over generated content), so pushes for
+   * the path are withheld until the quarantine lapses. Surfaced while
+   * active; the scan keeps reporting local content, it is simply not
+   * pushed. Cleared by time (default 15 min) — a genuine user edit after
+   * that wins normally.
+   */
+  loopSuspected?: string[];
+  /**
    * Present while the mass-delete quarantine holds: the most recent cycle's
    * scan wanted to push THIS many deletions (files + folder tombstones),
    * more than the configured floor AND fraction of the index's live
@@ -235,6 +238,8 @@ export interface SyncClientStatus {
 export const DEFAULT_PUSH_CONCURRENCY = 8;
 /** Default progress coalescing window (see `SyncClientOptions.progressThrottleMs`). */
 export const DEFAULT_PROGRESS_THROTTLE_MS = 50;
+/** How long a ping-ponging path's pushes stay quarantined (`loopSuspected`). */
+export const LOOP_QUARANTINE_MS = 15 * 60 * 1000;
 
 const defaultLog: LogAdapter = {
   debug: () => {},
@@ -292,6 +297,13 @@ export class SyncClient {
   private caseCollisions: string[] = [];
   private skippedPaths: string[] = [];
   private symlinks: string[] = [];
+  /**
+   * Loop detector (v1's TransitionLedger, minimal): per path, the recent
+   * head-hash sequence. An `…A,B,A` tail quarantines the path's pushes.
+   */
+  private readonly loopLedger = new Map<string, string[]>();
+  /** Path → epoch ms until which pushes are quarantined. */
+  private readonly loopQuarantine = new Map<string, number>();
   private massDelete: { deletions: number; liveEntries: number; at: number } | null = null;
   /** Set by `confirmMassDeletion`; consumed (one cycle) by the guard. */
   private massDeleteArmed = false;
@@ -433,6 +445,7 @@ export class SyncClient {
       ...(this.skippedPaths.length > 0 ? { skippedPaths: [...this.skippedPaths] } : {}),
       ...(this.symlinks.length > 0 ? { symlinks: [...this.symlinks] } : {}),
       ...(this.massDelete !== null ? { massDeleteGuard: { ...this.massDelete } } : {}),
+      ...(this.activeLoopQuarantine().length > 0 ? { loopSuspected: this.activeLoopQuarantine() } : {}),
       serverVersion: this.serverVersion,
       ...(this.progress !== null ? { progress: { ...this.progress } } : {}),
     };
@@ -679,6 +692,7 @@ export class SyncClient {
     }
 
     this.index = await this.applyPulls([this.pullOpFromChange(change)]);
+    this.noteHeadChange(change.path, change.hash);
     // This path's head is now materialized locally, so the completion
     // watermark advances with the (strictly ordered) feed. A change that
     // took the defer branch above never reaches this line, and its
@@ -857,6 +871,163 @@ export class SyncClient {
   }
 
   /**
+   * Concurrent-edit auto-merge pass over a plan's conflicts (see the call
+   * site). For each conflict it can resolve: fetches base/ours/theirs,
+   * runs `mergeText3`, and on a clean merge REWRITES the plan — the remote
+   * head becomes an explicit pull (local-wins plans would not otherwise
+   * apply it), the local-edit and conflict-copy pushes for the path are
+   * suppressed, and the merge result is returned for post-pull
+   * materialization. Anything unmergeable keeps its conflict untouched.
+   */
+  private async attemptAutoMerges(
+    plan: SyncPlan,
+  ): Promise<{
+    plan: SyncPlan;
+    autoMerged: Map<string, { bytes: Uint8Array; hash: string; size: number; parentVersion: string }>;
+  }> {
+    const autoMerged = new Map<string, { bytes: Uint8Array; hash: string; size: number; parentVersion: string }>();
+    const suppressPaths = new Set<string>();
+    const suppressCopies = new Set<string>();
+    const keptConflicts: ConflictOp[] = [];
+    const extraPulls: PullOp[] = [];
+
+    for (const conflict of plan.conflicts) {
+      const mergeable =
+        conflict.reason === 'concurrent-edit' &&
+        !conflict.remote.deleted &&
+        conflict.path.endsWith('.md');
+      const entry = this.index[conflict.path];
+      if (!mergeable || entry === undefined || entry.deletedAt !== undefined || entry.hash === '') {
+        keptConflicts.push(conflict);
+        continue;
+      }
+      let merged: string | null = null;
+      try {
+        const [baseBytes, oursBytes, theirsBytes] = await Promise.all([
+          this.fetchBlob(entry.hash),
+          this.readLocal(conflict.path).then((bytes) => {
+            if (bytes === undefined) throw new Error('local content vanished');
+            return bytes;
+          }),
+          this.fetchBlob(conflict.remote.hash),
+        ]);
+        const decodeStrict = (bytes: Uint8Array): string | null => {
+          try {
+            // Typed narrowly: core's lib mix lacks the standard
+            // TextDecoderOptions shape for this constructor.
+            const FatalDecoder = TextDecoder as unknown as new (
+              label: string,
+              options: { fatal: boolean },
+            ) => { decode(input: Uint8Array): string };
+            return new FatalDecoder('utf-8', { fatal: true }).decode(bytes);
+          } catch {
+            return null; // binary or invalid UTF-8 — not mergeable text
+          }
+        };
+        const base = decodeStrict(baseBytes);
+        const ours = decodeStrict(oursBytes);
+        const theirs = decodeStrict(theirsBytes);
+        if (base === null || ours === null || theirs === null) {
+          keptConflicts.push(conflict);
+          continue;
+        }
+        merged = mergeText3(base, ours, theirs);
+      } catch {
+        merged = null; // any fetch/decode hiccup — plain conflict path
+      }
+      if (merged === null) {
+        keptConflicts.push(conflict);
+        continue;
+      }
+      const bytes = new TextEncoder().encode(merged);
+      autoMerged.set(conflict.path, {
+        bytes,
+        hash: await sha256Hex(bytes),
+        size: bytes.byteLength,
+        parentVersion: conflict.remote.version,
+      });
+      suppressPaths.add(conflict.path);
+      if (conflict.conflictCopyPath !== undefined) suppressCopies.add(conflict.conflictCopyPath);
+      // Local-wins plans push ours as the head and never pull the remote —
+      // the merge needs the remote head materialized first, explicitly.
+      if (!plan.pulls.some((pull) => (pull.kind === 'rename' ? pull.toPath : pull.path) === conflict.path)) {
+        extraPulls.push({
+          kind: 'edit',
+          path: conflict.path,
+          hash: conflict.remote.hash,
+          size: conflict.remote.size,
+          version: conflict.remote.version,
+          clock: conflict.remote.clock,
+          deleted: false,
+        });
+      }
+    }
+
+    if (autoMerged.size === 0) return { plan, autoMerged };
+    this.log.info(
+      'auto-merged concurrent edits (non-overlapping regions) instead of forking conflict copies',
+      [...autoMerged.keys()],
+    );
+    return {
+      plan: {
+        pushes: plan.pushes.filter((push) => {
+          if (push.kind === 'rename') return !suppressPaths.has(push.toPath);
+          return !suppressPaths.has(push.path) && !suppressCopies.has(push.path);
+        }),
+        pulls: [...plan.pulls, ...extraPulls],
+        conflicts: keptConflicts,
+        folderPushes: plan.folderPushes,
+      },
+      autoMerged,
+    };
+  }
+
+  /**
+   * Record one head-hash change for `path` and quarantine on ping-pong: the
+   * same two hashes alternating (`…A,B,A`) is the two-writers-fighting shape
+   * (typically generated content) — pushing again would just continue the
+   * loop, so the path's pushes pause for the quarantine window.
+   */
+  private noteHeadChange(path: string, hash: string): void {
+    if (hash === '') return; // folder metadata — nothing to loop
+    const hashes = this.loopLedger.get(path) ?? [];
+    if (hashes[hashes.length - 1] === hash) return;
+    hashes.push(hash);
+    if (hashes.length > 6) hashes.shift();
+    this.loopLedger.set(path, hashes);
+    const n = hashes.length;
+    if (n >= 3 && hashes[n - 1] === hashes[n - 3] && hashes[n - 1] !== hashes[n - 2]) {
+      this.loopQuarantine.set(path, this.now() + LOOP_QUARANTINE_MS);
+      this.log.warn(
+        'sync loop suspected: the same two versions keep alternating on this path; its pushes are paused (15 min) — fix the two writers or let them settle',
+        path,
+      );
+    }
+  }
+
+  /** Paths whose push quarantine has not lapsed (also prunes expired entries). */
+  private activeLoopQuarantine(): string[] {
+    const now = this.now();
+    const active: string[] = [];
+    for (const [path, until] of this.loopQuarantine) {
+      if (until > now) active.push(path);
+      else this.loopQuarantine.delete(path);
+    }
+    return active.sort();
+  }
+
+  /** Whether `path`'s pushes are currently quarantined by the loop detector. */
+  private loopQuarantined(path: string): boolean {
+    const until = this.loopQuarantine.get(path);
+    if (until === undefined) return false;
+    if (until <= this.now()) {
+      this.loopQuarantine.delete(path);
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Record one bulk-phase step on `status().progress`. Coalesced to at most
    * one update per `progressThrottleMs` (renderer churn), EXCEPT phase
    * changes and completions, which always emit so a phase is never missed
@@ -914,7 +1085,7 @@ export class SyncClient {
         },
       );
       const guardedChanges = this.guardMassDelete(localChanges);
-      const plan = computeSyncPlan({
+      const plan0 = computeSyncPlan({
         localChanges: guardedChanges,
         index: this.index,
         manifest,
@@ -922,6 +1093,13 @@ export class SyncClient {
         thisDeviceName: this.options.deviceName,
         now: this.now(),
       });
+      // Concurrent-edit auto-merge (§4 upgrade): when both sides edited the
+      // same Markdown note but in DIFFERENT regions, a clean diff3 merge
+      // replaces the fork — the remote head applies, the merged text lands
+      // on top of it as this device's next edit, no conflict copy. Any
+      // overlapping edit, binary-ish content, or oversized file falls back
+      // to the conflict-copy flow unchanged.
+      const { plan, autoMerged } = await this.attemptAutoMerges(plan0);
       // Conflicts reflect the latest plan: entries for paths no longer
       // contested are dropped (a cycle that plans clean clears the list), so
       // a synced-quiet client reports 0 while still-contested paths stay
@@ -960,18 +1138,36 @@ export class SyncClient {
         onProgress: (done, total) => this.emitProgress('pulling', done, total),
       });
 
+      // Auto-merge materialization: the remote head just landed at each
+      // merged path; write the MERGED text over it and queue the merge as
+      // this device's next edit (parent = the remote head's version).
+      for (const [path, merge] of autoMerged) {
+        await this.options.storage.writeFile(path, merge.bytes);
+      }
+
       // Push pipeline: up to `pushConcurrency` commits in flight; acks fold
       // into the index as they arrive (serialized through `ackChain`).
       // Blob uploads for >256KB files start inside their slot and overlap
       // with the OTHER slots' in-flight commits instead of serializing.
-      const pushTotal = staged.length + plan.folderPushes.length;
+      // Auto-merged paths join the queue: their write already landed (above),
+      // the commit builds on the just-pulled remote head.
+      const autoMergeCommits: StagedCommit[] = [...autoMerged].map(([path, merge]) => ({
+        kind: 'edit' as const,
+        path,
+        parentVersion: merge.parentVersion,
+        hash: merge.hash,
+        size: merge.size,
+        bytes: merge.bytes,
+      }));
+      const allStaged = [...staged, ...autoMergeCommits];
+      const pushTotal = allStaged.length + plan.folderPushes.length;
       let pushDone = 0;
       const settlePush = (): void => {
         pushDone += 1;
         this.emitProgress('pushing', pushDone, pushTotal);
       };
       this.emitProgress('pushing', 0, pushTotal);
-      await this.runPushPipeline(staged, settlePush);
+      await this.runPushPipeline(allStaged, settlePush);
 
       // Prune-on-delete (C), local side: every deletion that actually
       // committed this cycle (the index now tombstones it / migrated it away)
@@ -1167,6 +1363,12 @@ export class SyncClient {
 
     const staged: StagedCommit[] = [];
     for (const push of plan.pushes) {
+      // Loop quarantine: a ping-ponging path's pushes are withheld (the
+      // content keeps syncing DOWN; the fight stops when we stop firing).
+      if (this.loopQuarantined(push.kind === 'rename' ? push.toPath : push.path)) {
+        this.log.warn('withholding push for a loop-suspected path', push.kind === 'rename' ? push.toPath : push.path);
+        continue;
+      }
       if (push.kind === 'delete' || push.kind === 'rename') {
         staged.push(this.toStaged(push));
         continue;
@@ -1359,6 +1561,7 @@ export class SyncClient {
 
   private applyAckToIndex(commit: StagedCommit, versionId: string, clock: LogicalClock): void {
     const deleted = commit.kind === 'delete';
+    this.noteHeadChange(commit.path, commit.hash);
     if (commit.kind === 'rename' && commit.fromPath !== undefined) {
       this.index = applyCommit(removeEntry(this.index, commit.fromPath), {
         path: commit.path,

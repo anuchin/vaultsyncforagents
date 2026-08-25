@@ -272,7 +272,7 @@ Every user self-hosts in their own account, so load is inherently distributed.
 |---|---|---|---|
 | 1 | Worker topology | One worker + R2 per vault | Per-user multi-vault worker — more internal scoping, weaker isolation |
 | 2 | Authority | Durable Object (SQLite) single-writer | D1 + polling — no push, harder consistency |
-| 3 | Conflict model | Whole-file LWW + conflict copies | CRDT/Yjs — YAOS's memory ceiling; agent bulk-writes are the failure shape |
+| 3 | Conflict model | Whole-file LWW + conflict copies, with line-level 3-way auto-merge for non-overlapping Markdown edits (`merge/threeway.ts` — a clean diff3 replaces the fork; any overlap still forks) | CRDT/Yjs — YAOS's memory ceiling; agent bulk-writes are the failure shape |
 | 4 | Encryption | TLS-only v1, E2E-ready | E2E in v1 — key ceremony not worth it; dashboard is metadata-only anyway |
 | 5 | Stack | TS monorepo, shared `core` | Rust daemon — engine implemented twice, drift bugs |
 | 6 | YAOS interop | Clean break, own protocol | Speaking YAOS protocol — chained to their ceiling and schema |
