@@ -1,0 +1,47 @@
+# Scheduled live-cloud smoke (free-tier longevity pack): the wizard deploys
+# through raw Cloudflare REST and the worker runs on real Workers runtime —
+# both drift silently when Cloudflare changes something. This job provisions
+# a DISPOSABLE worker (random name, deleted at the end), claims it, pairs a
+# device, syncs a note over the real WebSocket protocol, and asserts the
+# round-trip — the same path a fresh user's first hour takes.
+#
+# Runs weekly (Mon 04:11 UTC, offset from the GC cron) and on demand. The
+# repo-level secrets gate it: without them it skips as a success with a loud
+# notice, so forks and PRs never touch anyone's Cloudflare account.
+name: Disposable cloud smoke
+
+on:
+  schedule:
+    - cron: '11 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: disposable-cloud-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Skip cleanly when the smoke account is not configured
+        if: ${{ secrets.CLOUDFLARE_ACCOUNT_ID == '' || secrets.CLOUDFLARE_API_TOKEN == '' }}
+        run: |
+          echo "::notice::CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID are not set — the live smoke skipped (nothing was deployed)."
+          exit 0
+
+      - name: Provision → claim → pair → sync → assert → tear down
+        if: ${{ secrets.CLOUDFLARE_ACCOUNT_ID != '' && secrets.CLOUDFLARE_API_TOKEN != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/cloud-smoke.mjs

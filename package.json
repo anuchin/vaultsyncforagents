@@ -14,6 +14,7 @@
   "scripts": {
     "test": "npm run test:core && npm run test:node-runtime && npm run test:cli && npm run test:worker && npm run test:daemon && npm run test:dashboard && npm run test:plugin",
     "test:core": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "test:node-runtime": "npm run test --workspace @vsa/node-runtime",
     "test:cli": "npm run test --workspace vaultsyncforagents",
     "test:worker": "npm run test --workspace @vsa/worker",
@@ -25,6 +26,7 @@
     "vsa": "node packages/cli/bin/vsa.js"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^3.2.4",
     "fflate": "^0.8.3",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"

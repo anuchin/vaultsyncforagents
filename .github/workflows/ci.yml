@@ -36,3 +36,24 @@ jobs:
 
       - name: Run the test suites
         run: npm test
+
+  # Coverage floor for @vsa/core (v1 parity: CI-enforced minimums). Runs the
+  # core suite with v8 coverage and fails below the thresholds configured in
+  # the root vitest.config.ts. Linux-only: coverage numbers are stable there,
+  # and it keeps the matrix cheap.
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (npm ci)
+        run: npm ci
+
+      - name: Coverage gate (core)
+        run: npm run test:coverage
