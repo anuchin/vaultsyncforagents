@@ -6,7 +6,10 @@
  *   server version  /health-reported version vs the shared compat policy
  *   token valid     a real WS hello roundtrip (SyncClient connect + disconnect)
  *   clock skew      local clock vs the worker's Date response header (warn >60s)
- *   storage         R2 bytes in use (via /api/status)
+ *   storage         R2 bytes in use (via /api/status), warn/fail vs the quota
+ *   disk space      free space on the vault's filesystem (warn <1 GiB, fail <100 MiB)
+ *   watcher capacity  inotify watch budget vs the vault's file count (Linux)
+ *   local state     the persisted index parses (the client's crash-recovery input)
  *   hints           one-client rule (foreign state dir), claim, re-pair
  *
  * Exit code is non-zero iff any check FAILS (unreachable / unclaimed / server
@@ -15,6 +18,8 @@
  */
 
 import type { VaultEntry } from '@vsa/node-runtime';
+import { readFile } from 'node:fs/promises';
+import { statfs } from 'node:fs/promises';
 import {
   NodeStorageAdapter,
   readDeviceMarker,
@@ -197,6 +202,66 @@ async function examine(runtime: VsRuntime, vault: VaultEntry): Promise<DoctorRep
             ? 'state dir present without a device marker (older client?)'
             : 'no state dir yet (first sync will create it)',
     });
+  }
+
+  // 8. Local disk space (v1 lesson: a full disk turns every atomic write
+  //    into a failed sync — better to name it before it bites).
+  try {
+    const stats = await statfs(vault.id);
+    const free = Number(stats.bavail) * Number(stats.bsize);
+    checks.push({
+      name: 'disk space',
+      status: free < 100 * 1024 * 1024 ? 'fail' : free < 1024 ** 3 ? 'warn' : 'ok',
+      detail: `${formatBytes(free)} free on the vault's filesystem`,
+    });
+    if (free < 1024 ** 3) hints.push('free space is low — a full disk makes every sync write fail');
+  } catch {
+    checks.push({ name: 'disk space', status: 'skip', detail: 'statfs unavailable' });
+  }
+
+  // 9. Watcher capacity (Linux/inotify): the daemon's chokidar needs one
+  //    watch per directory; a vault beyond ~70% of the budget starts
+  //    silently missing events. Non-Linux platforms have no such limit.
+  try {
+    const maxWatches = Number((await readFile('/proc/sys/fs/inotify/max_user_watches', 'utf8')).trim());
+    if (Number.isFinite(maxWatches) && maxWatches > 0) {
+      const dirs = (await storage.listDirs()).length;
+      const used = dirs / maxWatches;
+      checks.push({
+        name: 'watcher capacity',
+        status: used > 0.9 ? 'fail' : used > 0.7 ? 'warn' : 'ok',
+        detail: `${dirs} directories watched of ${maxWatches} inotify watches (${Math.round(used * 100)}%)`,
+      });
+      if (used > 0.7) hints.push('raise fs.inotify.max_user_watches (sysctl) or prune the vault');
+    } else {
+      checks.push({ name: 'watcher capacity', status: 'skip', detail: 'no inotify limit exposed' });
+    }
+  } catch {
+    checks.push({ name: 'watcher capacity', status: 'skip', detail: 'not applicable off Linux' });
+  }
+
+  // 10. Local state integrity: the persisted index must parse — it is the
+  //     crash-recovery input; the client quarantines a corrupt file and
+  //     resyncs from a full manifest, so name it before that happens.
+  try {
+    if (await storage.exists(LOCAL_INDEX_STATE_PATH).catch(() => false)) {
+      const { loadLocalIndex } = await import('@vsa/core');
+      await loadLocalIndex(storage);
+      checks.push({ name: 'local state', status: 'ok', detail: 'persisted index parses' });
+    } else {
+      checks.push({
+        name: 'local state',
+        status: 'ok',
+        detail: 'no persisted index yet (first sync will create it)',
+      });
+    }
+  } catch (error) {
+    checks.push({
+      name: 'local state',
+      status: 'fail',
+      detail: `persisted index is corrupt: ${error instanceof Error ? error.message : String(error)}`,
+    });
+    hints.push('the client will quarantine the corrupt state file on next start and resync from a full manifest');
   }
 
   return {

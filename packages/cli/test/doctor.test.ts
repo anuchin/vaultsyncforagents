@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { writeDeviceMarker } from '@vsa/node-runtime';
+import { LOCAL_INDEX_STATE_PATH } from '@vsa/core';
 import { runDoctor, renderDoctor } from '../src/commands/doctor.js';
 import { makeRig, seedVault } from './helpers.js';
 
@@ -16,12 +17,37 @@ describe('runDoctor', () => {
     expect(reports).toHaveLength(1);
     const report = reports[0]!;
     expect(report.healthy).toBe(true);
+    // The full ordered list (local checks trail the remote ones):
+    // disk space, watcher capacity, and local state are appended after the
+    // one-client rule per the header comment's numbering.
+    expect(report.checks.map((check) => check.name)).toEqual([
+      'reachable',
+      'claimed',
+      'server version',
+      'clock skew',
+      'token',
+      'storage',
+      'state dir owner',
+      'disk space',
+      'watcher capacity',
+      'local state',
+    ]);
     const byName = Object.fromEntries(report.checks.map((check) => [check.name, check.status]));
     expect(byName['reachable']).toBe('ok');
     expect(byName['claimed']).toBe('ok');
     expect(byName['token']).toBe('ok');
     expect(byName['clock skew']).toBe('ok');
     expect(byName['server version']).toBe('ok');
+    // The hello roundtrip (check 5) persists the index, so by the time the
+    // local-state check runs it exists and parses.
+    const localState = report.checks.find((check) => check.name === 'local state')!;
+    expect(localState.status).toBe('ok');
+    expect(localState.detail).toContain('persisted index parses');
+    // The temp vault lives on a filesystem with plenty of free space.
+    expect(report.checks.find((check) => check.name === 'disk space')?.status).toBe('ok');
+    // inotify has no equivalent off Linux: 'skip' on Windows/macOS, 'ok' on
+    // Linux (a one-directory temp vault is nowhere near the watch budget).
+    expect(['ok', 'skip']).toContain(byName['watcher capacity']);
     expect(report.hints).toEqual([]);
   });
 
@@ -31,6 +57,26 @@ describe('runDoctor', () => {
     const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
     expect(report.healthy).toBe(false);
     expect(report.checks.find((check) => check.name === 'reachable')?.status).toBe('fail');
+    // No hello roundtrip ran, so the fresh temp vault has no persisted index
+    // yet — that is 'ok', not a failure (first sync creates it).
+    const localState = report.checks.find((check) => check.name === 'local state')!;
+    expect(localState.status).toBe('ok');
+    expect(localState.detail).toContain('no persisted index yet');
+  });
+
+  it('a corrupt persisted index fails local state and hints the quarantine resync', async () => {
+    // The sync probe (a connect) would quarantine and rewrite a corrupt file,
+    // so this rig keeps the worker unreachable — the local-state check then
+    // parses the corrupt bytes itself, which is the crash it exists to name.
+    const rig = await makeRig({ fake: { unreachable: true } });
+    seedVault(rig);
+    await rig.storage.writeFile(LOCAL_INDEX_STATE_PATH, new TextEncoder().encode('@@@ not json @@@'));
+    const report = (await runDoctor(rig.runtime, rig.configStore.load().vaults))[0]!;
+    const localState = report.checks.find((check) => check.name === 'local state')!;
+    expect(localState.status).toBe('fail');
+    expect(localState.detail).toMatch(/corrupt/);
+    expect(report.healthy).toBe(false);
+    expect(report.hints.join(' ')).toMatch(/quarantine the corrupt state file/i);
   });
 
   it('unclaimed worker fails and hints the claim flow', async () => {
