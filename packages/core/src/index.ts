@@ -26,4 +26,5 @@ export * from './scan.js';
 export * from './server/arbitrate.js';
 export * from './server/snapshots.js';
 export * from './transport.js';
+export * from './transport/unreliable.js';
 export * from './types.js';
