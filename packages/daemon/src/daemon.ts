@@ -107,6 +107,8 @@ export type ClientFactory = (
   token: string,
   log: LogAdapter,
   deviceName?: string,
+  overrides?: NodeClientBundleOverrides,
+  onTokenRotated?: (token: string) => void,
 ) => ClientBundle;
 
 /**
@@ -131,6 +133,7 @@ export function createNodeClientBundle(
   log: LogAdapter,
   deviceName = defaultDaemonDeviceName(),
   overrides: NodeClientBundleOverrides = {},
+  onTokenRotated?: (token: string) => void,
 ): ClientBundle {
   const nodeStorage = new NodeStorageAdapter({ root: vault.id });
   const storage = new TrashGuardStorage({ storage: nodeStorage, log });
@@ -158,6 +161,7 @@ export function createNodeClientBundle(
     blobStore,
     storage,
     log,
+    ...(onTokenRotated !== undefined ? { onTokenRotated } : {}),
   });
 
   const watcher = new NodeWatchAdapter({
@@ -467,7 +471,16 @@ export class DaemonManager {
         continue;
       }
       const token = this.configStore.getToken(vault.id) as string;
-      const bundle = this.createClient(vault, token, this.log, this.deviceName);
+      const bundle = this.createClient(
+        vault,
+        token,
+        this.log,
+        this.deviceName,
+        undefined,
+        // Token rotation: persist the re-issued token so the daemon's next
+        // dial (restart, reconnect) uses it.
+        (next: string) => this.configStore.setToken(vault.id, next),
+      );
       const session = this.createSession({
         vault,
         token,

@@ -427,15 +427,16 @@ describe('MIGRATION_2 (snapshots table)', () => {
         (instance as unknown as { applyMigrations(): Promise<void> }).applyMigrations();
       });
     await applyMigrations();
-    expect(await version()).toBe('2');
+    expect(await version()).toBe('3');
 
     const snapReply = wsDesktop.next((m) => m.type === 'snapshotCreateAck');
     wsDesktop.send({ type: 'snapshotCreate', name: 'keeper' });
     await snapReply;
 
-    // Restart-safe: applying pending migrations again must not disturb data.
+    // Restart-safe: applying pending migrations again must not disturb data
+    // (the ALTER-based migration 0003 skips cleanly over existing columns).
     await applyMigrations();
-    expect(await version()).toBe('2');
+    expect(await version()).toBe('3');
     const rows = await roomSql<{ id: string; name: string }>('SELECT id, name FROM snapshots');
     expect(rows).toEqual([{ id: 's1', name: 'keeper' }]);
   });

@@ -117,6 +117,14 @@ export interface SyncClientOptions {
    */
   progressThrottleMs?: number;
   /**
+   * Token rotation hand-off: called with the replacement token whenever a
+   * helloAck carries `nextToken`. The caller MUST persist it durably —
+   * after the server's grace window the old token is dead. The client
+   * itself keeps running on the live connection; the callback feeds the
+   * NEXT dial (and any token-bearing HTTP surfaces the caller rebuilds).
+   */
+  onTokenRotated?: (token: string) => Promise<void> | void;
+  /**
    * Mass-delete quarantine tuning (see `SyncClientStatus.massDeleteGuard`).
    * Defaults: a cycle's deletions are refused when they exceed BOTH 25 paths
    * and 50% of the index's live entries. Set `disabled: true` to opt out
@@ -541,6 +549,16 @@ export class SyncClient {
     // event after its cursor was retained (delta-manifest eligibility).
     this.serverOldestRetainedSeq = helloAck.oldestRetainedSeq ?? null;
     this.serverVersion = helloAck.serverVersion ?? null;
+    // Token rotation hand-off: persist the replacement before anything else
+    // rides on it — the cycle continues on the live connection either way.
+    if (helloAck.nextToken !== undefined) {
+      this.log.info('server re-issued this device’s token; handing the replacement to the host for persistence');
+      try {
+        await this.options.onTokenRotated?.(helloAck.nextToken);
+      } catch (error) {
+        this.log.error('failed to persist the rotated token — the next dial may need re-pairing', error);
+      }
+    }
 
     this.state = 'syncing';
     if (this.shouldRequestDeltaManifest()) {

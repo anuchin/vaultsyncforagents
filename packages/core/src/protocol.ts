@@ -148,6 +148,13 @@ export interface HelloAckMessage {
    * protocol failure.
    */
   serverVersion?: string;
+  /**
+   * Token rotation (servers ≥ 0.2): when present, this device's token has
+   * been RE-ISSUED — the client must persist this replacement (it becomes
+   * the only dial credential after the server's grace window) via
+   * `SyncClientOptions.onTokenRotated`. Absent = token unchanged.
+   */
+  nextToken?: string;
 }
 
 /** Reply to `getManifest`: the (possibly delta) file index. */

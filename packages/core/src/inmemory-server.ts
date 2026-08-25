@@ -45,6 +45,14 @@ export interface InMemorySyncServerOptions {
   now?: () => number;
   vaultName?: string;
   settings?: VaultSettings;
+  /**
+   * Token-rotation interval (ms); 0 disables (the default — most tests want
+   * stable tokens). When set, a device token older than the interval is
+   * re-issued in the helloAck (`nextToken`), the previous token surviving
+   * `tokenRotationGraceMs` (default 24 h) — mirrors the DO's rotation.
+   */
+  tokenRotationMs?: number;
+  tokenRotationGraceMs?: number;
 }
 
 interface RegisteredDevice {
@@ -52,6 +60,10 @@ interface RegisteredDevice {
   name: string;
   type: DeviceType;
   token: string;
+  /** The immediately-previous token, valid until `prevTokenExpiresAt`. */
+  prevToken: string | null;
+  prevTokenExpiresAt: number;
+  tokenIssuedAt: number;
   revoked: boolean;
   lastSeen: number;
 }
@@ -107,17 +119,30 @@ export class InMemorySyncServer {
   readonly vaultName: string;
 
   constructor(options: InMemorySyncServerOptions = {}) {
+    this.options = options;
     this.now = options.now ?? (() => Date.now());
     this.vaultName = options.vaultName ?? 'test-vault';
     this.settings = options.settings ?? { obsidianSync: false, displayName: this.vaultName };
   }
+
+  private readonly options: InMemorySyncServerOptions;
 
   // --- device registry ---------------------------------------------------------
 
   /** Register a device; returns its (deterministic) long-lived token. */
   register(deviceId: string, name: string, type: DeviceType = 'desktop'): string {
     const token = `tok-${deviceId}`;
-    const device: RegisteredDevice = { deviceId, name, type, token, revoked: false, lastSeen: 0 };
+    const device: RegisteredDevice = {
+      deviceId,
+      name,
+      type,
+      token,
+      prevToken: null,
+      prevTokenExpiresAt: 0,
+      tokenIssuedAt: 0,
+      revoked: false,
+      lastSeen: 0,
+    };
     this.devices.set(deviceId, device);
     this.tokens.set(token, deviceId);
     return token;
@@ -274,7 +299,15 @@ export class InMemorySyncServer {
     cursor: number,
   ): void {
     if (claimedToken !== token || !this.tokens.has(claimedToken)) {
-      this.fail(server, 'UNAUTHORIZED', 'unknown token');
+      // Rotation grace: a previous token maps through `prevTokens` — and the
+      // ack hands back the CURRENT token, so a client stuck on the old one
+      // still receives the replacement instead of dying with the grace.
+      const graceDevice = this.resolvePrevToken(claimedToken);
+      if (graceDevice === undefined) {
+        this.fail(server, 'UNAUTHORIZED', 'unknown token');
+        return;
+      }
+      this.finishHello(server, graceDevice, connection, protocolVersion, cursor, graceDevice.token);
       return;
     }
     const deviceId = this.tokens.get(claimedToken) as string;
@@ -291,6 +324,41 @@ export class InMemorySyncServer {
       this.fail(server, 'PROTOCOL', `protocol version ${protocolVersion} not supported`);
       return;
     }
+    // Rotation: re-issue tokens older than the configured interval and hand
+    // the replacement over in the ack (mirrors the DO's hello rotation).
+    let nextToken: string | undefined;
+    const rotationMs = this.options.tokenRotationMs ?? 0;
+    if (rotationMs > 0 && this.now() - device.tokenIssuedAt > rotationMs) {
+      nextToken = `tok-${deviceId}-r${this.rotationCounter++}`;
+      this.tokens.delete(device.token);
+      this.tokens.set(nextToken, deviceId);
+      device.prevToken = device.token;
+      device.prevTokenExpiresAt = this.now() + (this.options.tokenRotationGraceMs ?? 24 * 60 * 60 * 1000);
+      device.token = nextToken;
+      device.tokenIssuedAt = this.now();
+    }
+    this.finishHello(server, device, connection, protocolVersion, cursor, nextToken);
+  }
+
+  private rotationCounter = 0;
+
+  /** The device a PREVIOUS token still unlocks, when its grace has not lapsed. */
+  private resolvePrevToken(token: string): RegisteredDevice | undefined {
+    for (const device of this.devices.values()) {
+      if (device.prevToken === token && device.prevTokenExpiresAt > this.now()) return device;
+    }
+    return undefined;
+  }
+
+  private finishHello(
+    server: MemoryTransport,
+    device: RegisteredDevice,
+    connection: Connection,
+    _protocolVersion: number,
+    cursor: number,
+    nextToken: string | undefined,
+  ): void {
+    const deviceId = device.deviceId;
     connection.deviceId = deviceId;
     device.lastSeen = this.now();
     this.reply(server, {
@@ -298,6 +366,7 @@ export class InMemorySyncServer {
       deviceId,
       vaultName: this.vaultName,
       settings: this.settings,
+      ...(nextToken !== undefined ? { nextToken } : {}),
       // Replay-window answer (protocol v1, pre-release): the seq of the
       // oldest retained change event — the log's first entry, or "nothing
       // retained" (`seq + 1`) once pruned/empty. A client cursor C is

@@ -133,6 +133,16 @@ export const QUOTA_HARD_DEFAULT_BYTES = 10 * 1024 ** 3;
 /** Retention knob bounds (`POST /admin/retention`): 0 disables each. */
 export const RETENTION_MAX_DAYS = 3650;
 export const RETENTION_MAX_VERSIONS = 1000;
+/**
+ * Device-token rotation: a token older than this is re-issued in the
+ * helloAck (`nextToken`); the previous token stays valid for the grace
+ * window so a client that never noticed (crash mid-hand-off) still gets one
+ * more successful connect to receive it again — rotation must never wedge
+ * an honest device. Bounded credential life: a leaked token dies the next
+ * time its device syncs past the interval.
+ */
+export const TOKEN_ROTATION_INTERVAL_MS = 90 * 24 * 60 * 60 * 1000;
+export const TOKEN_ROTATION_GRACE_MS = 24 * 60 * 60 * 1000;
 
 export const ADMIN_COOKIE_NAME = 'vsa_admin';
 const CLIENT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
@@ -252,6 +262,10 @@ interface DeviceRow {
   created_at: number;
   last_seen: number;
   revoked: number;
+  /** Migration 0003: rotation bookkeeping (0 / null on legacy rows). */
+  token_issued_at: number;
+  prev_token_hash: string | null;
+  prev_token_expires_at: number;
 }
 
 interface PairRow {
@@ -342,7 +356,7 @@ export class VaultRoom extends DurableObject<Env> {
       // clients keep failing fast on bad/revoked tokens with a clean 401
       // instead of an opaque WS close.
       const device = await this.lookupDeviceByToken(token);
-      if (device === undefined || device.revoked === 1) {
+      if (device === undefined || device.row.revoked === 1) {
         return json(401, { error: device !== undefined ? 'device revoked' : 'invalid token' });
       }
     }
@@ -457,7 +471,7 @@ export class VaultRoom extends DurableObject<Env> {
       this.failWs(ws, 'UNAUTHORIZED', 'unknown token');
       return;
     }
-    if (device.revoked === 1) {
+    if (device.row.revoked === 1) {
       this.failWs(ws, 'REVOKED', 'device was revoked');
       return;
     }
@@ -466,17 +480,41 @@ export class VaultRoom extends DurableObject<Env> {
       return;
     }
     const now = this.now();
-    ws.serializeAttachment({ deviceId: device.id, protocolErrors: 0 } satisfies SocketAttachment);
-    this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', now, device.id);
+    const { row, viaGrace } = device;
+    ws.serializeAttachment({ deviceId: row.id, protocolErrors: 0 } satisfies SocketAttachment);
+    this.sql('UPDATE devices SET last_seen = ? WHERE id = ?', now, row.id);
+
+    // Token rotation: a device token older than the interval is re-issued on
+    // hello — the ack carries `nextToken`, the client persists it, and the
+    // old token survives only the grace window (see `lookupDeviceByToken`).
+    // A leaked token therefore has a bounded life once the device syncs again.
+    // A GRACE connect re-issues too: the client dialed with the previous
+    // token (it missed the earlier hand-off), and the DO stores only hashes,
+    // so a fresh mint is the only way to hand it a working credential.
+    let nextToken: string | undefined;
+    const issuedAt = row.token_issued_at > 0 ? row.token_issued_at : row.created_at;
+    if (viaGrace || now - issuedAt > TOKEN_ROTATION_INTERVAL_MS) {
+      nextToken = randomToken64url(32);
+      this.sql(
+        'UPDATE devices SET token_hash = ?, token_issued_at = ?, prev_token_hash = ?, prev_token_expires_at = ? WHERE id = ?',
+        await sha256Hex(nextToken),
+        now,
+        viaGrace ? row.token_hash : row.token_hash, // same either way: the hash being replaced
+        now + TOKEN_ROTATION_GRACE_MS,
+        row.id,
+      );
+      this.appendEvent(now, row.id, 'device', null, JSON.stringify({ rotated: row.id }));
+    }
     const vaultName = (await this.getMeta('vault_name')) ?? '';
     this.safeSend(ws, {
       type: 'helloAck',
-      deviceId: device.id,
+      deviceId: row.id,
       vaultName,
       settings: {
         obsidianSync: (await this.getMeta('settings_obsidian_sync')) === '1',
         displayName: vaultName,
       },
+      ...(nextToken !== undefined ? { nextToken } : {}),
       // Replay-window answer (§5/§6): the oldest change-event seq still
       // retained under the pruning policy (30 days / newest 10k). Clients
       // with `cursor + 1 >= oldestRetainedSeq` request a delta manifest
@@ -489,7 +527,7 @@ export class VaultRoom extends DurableObject<Env> {
       // field is optional on the wire; pre-0.1 servers simply omit it.
       serverVersion: SERVER_VERSION,
     });
-    this.broadcastOthers(ws, { type: 'deviceSeen', deviceId: device.id, ts: now });
+    this.broadcastOthers(ws, { type: 'deviceSeen', deviceId: row.id, ts: now });
     // Catch-up replay (§5): everything the client missed since its cursor.
     // A first-ever connect (cursor 0) gets the full manifest instead.
     if (message.cursor > 0) {
@@ -1811,18 +1849,29 @@ export class VaultRoom extends DurableObject<Env> {
     const header = request.headers.get('authorization');
     if (header !== null && header.startsWith('Bearer ')) {
       const device = await this.lookupDeviceByToken(header.slice('Bearer '.length));
-      if (device === undefined || device.revoked === 1) return { ok: false };
-      return { ok: true, kind: 'device', deviceId: device.id };
+      if (device === undefined || device.row.revoked === 1) return { ok: false };
+      return { ok: true, kind: 'device', deviceId: device.row.id };
     }
     if (await this.requireAdmin(request)) return { ok: true, kind: 'admin' };
     return { ok: false };
   }
 
   /** Token → device row (tokens are stored SHA-256-hashed only, §14). */
-  private async lookupDeviceByToken(token: string): Promise<DeviceRow | undefined> {
+  private async lookupDeviceByToken(token: string): Promise<{ row: DeviceRow; viaGrace: boolean } | undefined> {
     const tokenHash = await sha256Hex(token);
     const rows = this.sql('SELECT * FROM devices WHERE token_hash = ?', tokenHash).toArray();
-    return rows[0] as unknown as DeviceRow | undefined;
+    if (rows.length > 0) return { row: rows[0] as unknown as DeviceRow, viaGrace: false };
+    // Rotation grace: the PREVIOUS token stays valid for a bounded window so
+    // a process that missed the helloAck hand-off (crash mid-cycle, an
+    // unwired older client) survives to its next connect instead of wedging.
+    const previous = this.sql(
+      'SELECT * FROM devices WHERE prev_token_hash = ? AND prev_token_expires_at > ?',
+      tokenHash,
+      this.now(),
+    ).toArray();
+    return previous[0] !== undefined
+      ? { row: previous[0] as unknown as DeviceRow, viaGrace: true }
+      : undefined;
   }
 
   private async registerDevice(
@@ -1835,11 +1884,12 @@ export class VaultRoom extends DurableObject<Env> {
     // last_seen starts at 0: registration is not authenticated contact, so a
     // freshly paired device reads "offline" until its first hello/bearer use.
     this.sql(
-      'INSERT INTO devices (id, name, type, token_hash, created_at, last_seen, revoked) VALUES (?, ?, ?, ?, ?, 0, 0)',
+      'INSERT INTO devices (id, name, type, token_hash, created_at, last_seen, revoked, token_issued_at, prev_token_expires_at) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0)',
       deviceId,
       name,
       type,
       await sha256Hex(token),
+      now,
       now,
     );
     return { token, deviceId };
@@ -2226,6 +2276,20 @@ export class VaultRoom extends DurableObject<Env> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       );
     }
+    if (version < 3) {
+      // `ALTER TABLE ... ADD COLUMN` is not idempotent, and tests wipe the
+      // `meta` rows between cases (resetAll) — so the version row reads 0
+      // again while the columns already exist. Skip cleanly in that case.
+      try {
+        this.ctx.storage.sql.exec(MIGRATION_3);
+      } catch (error) {
+        if (!String(error).includes('duplicate column name')) throw error;
+      }
+      this.ctx.storage.sql.exec(
+        `INSERT INTO meta (key, value) VALUES ('schema_version', '3')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      );
+    }
   }
 }
 
@@ -2314,4 +2378,16 @@ CREATE TABLE IF NOT EXISTS snapshots (
   file_count INTEGER NOT NULL,
   heads TEXT NOT NULL
 );
+`;
+
+/**
+ * Migration 0003 — device-token rotation bookkeeping. Legacy rows default
+ * `token_issued_at = 0`, read as "issued at creation" (rotation anchors on
+ * `created_at` then); the previous-hash columns are inert until the first
+ * rotation fills them.
+ */
+const MIGRATION_3 = `
+ALTER TABLE devices ADD COLUMN token_issued_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE devices ADD COLUMN prev_token_hash TEXT;
+ALTER TABLE devices ADD COLUMN prev_token_expires_at INTEGER NOT NULL DEFAULT 0;
 `;

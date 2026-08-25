@@ -48,6 +48,15 @@ export function createVaultClient(
     // An armed one-shot is the CLI's confirmation gesture: THIS invocation's
     // cycle proceeds (the daemon's own guard still re-engages on its cycles).
     ...(options?.allowMassDelete === true ? { massDeleteGuard: { disabled: true } } : {}),
+    // Token rotation: one-shots persist the replacement the same way the
+    // daemon does, so the next `vsa` invocation dials with it.
+    onTokenRotated: (next) => {
+      try {
+        runtime.configStore.setToken(vault.id, next);
+      } catch (error) {
+        console.warn('failed to persist the rotated device token', error);
+      }
+    },
   });
   return { client, storage };
 }

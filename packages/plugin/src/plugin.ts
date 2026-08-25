@@ -400,6 +400,13 @@ export class VaultSyncPlugin extends Plugin {
       },
       log: this.syncLog,
       now: this.now,
+      // Token rotation: the worker re-issues long-lived device tokens on
+      // hello; persist the replacement so the NEXT dial uses it (the live
+      // connection keeps running on the old one until it closes).
+      onTokenRotated: async (token) => {
+        this.data.token = token;
+        await this.savePluginData();
+      },
     });
     this.client = client;
     this.authFailed = false;
