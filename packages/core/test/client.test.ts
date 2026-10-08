@@ -138,6 +138,28 @@ describe('SyncClient — startup and status', () => {
 });
 
 describe('SyncClient — the local-modification guard', () => {
+  it('preserves a local edit when checking its existence fails', async () => {
+    const { make } = rig();
+    const a = make('dev-a', 'Alpha');
+    const b = make('dev-b', 'Beta');
+    await a.storage.writeFile('/notes/x.md', enc('base'));
+    await a.client.connect();
+    await b.client.connect();
+    await settle(a, b);
+
+    await b.storage.writeFile('/notes/x.md', enc('unsynced local edit'));
+    const exists = vi.spyOn(b.storage, 'exists').mockRejectedValueOnce(
+      Object.assign(new Error('permission denied'), { code: 'EACCES' }),
+    );
+    await a.storage.writeFile('/notes/x.md', enc('remote edit'));
+    await a.client.triggerSync();
+    await settle(a, b);
+
+    expect(exists).toHaveBeenCalledWith('/notes/x.md');
+    expect(text(await b.storage.readFile('/notes/x.md'))).toBe('unsynced local edit');
+    exists.mockRestore();
+  });
+
   it('defers a remote change over locally-modified content, then reconciles via conflict logic', async () => {
     const { make } = rig();
     const a = make('dev-a', 'Alpha');

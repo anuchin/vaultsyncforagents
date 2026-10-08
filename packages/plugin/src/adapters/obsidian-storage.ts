@@ -253,23 +253,15 @@ export class ObsidianStorageAdapter implements StorageAdapter {
   async exists(path: string): Promise<boolean> {
     const normalized = normalizeVaultPath(path);
     if (normalized === '/') return true; // the vault root always exists
-    try {
-      return await this.adapter.exists(this.toAdapterPath(normalized));
-    } catch {
-      return false;
-    }
+    return this.adapter.exists(this.toAdapterPath(normalized));
   }
 
   // --- helpers ----------------------------------------------------------------
 
   private async statOrNull(adapterPath: string): Promise<AdapterStat | null> {
-    try {
-      const stat = await this.adapter.stat(adapterPath);
-      if (stat === null || stat.type !== 'file') return null;
-      return { size: stat.size, mtime: stat.mtime };
-    } catch {
-      return null;
-    }
+    const stat = await this.adapter.stat(adapterPath);
+    if (stat === null || stat.type !== 'file') return null;
+    return { size: stat.size, mtime: stat.mtime };
   }
 
   /** A unique temp path inside the (sync-ignored) client state dir. */
@@ -300,12 +292,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
     dirAdapterPath: string,
     visit: (adapterPath: string) => Promise<void>,
   ): Promise<void> {
-    let listing;
-    try {
-      listing = await this.adapter.list(dirAdapterPath);
-    } catch {
-      return; // unreadable/missing — treat as empty
-    }
+    const listing = await this.adapter.list(dirAdapterPath);
     for (const file of listing.files) await visit(file);
     for (const folder of listing.folders) await this.walkFiles(folder, visit);
   }
@@ -315,12 +302,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
     dirAdapterPath: string,
     visit: (adapterPath: string) => Promise<void>,
   ): Promise<void> {
-    let listing;
-    try {
-      listing = await this.adapter.list(dirAdapterPath);
-    } catch {
-      return;
-    }
+    const listing = await this.adapter.list(dirAdapterPath);
     for (const folder of listing.folders) {
       await visit(folder);
       await this.walkFolders(folder, visit);

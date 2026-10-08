@@ -140,18 +140,27 @@ export function createNodeClientBundle(
   const blobStore = overrides.blobStore ?? new HttpBlobStore({ baseUrl: vault.url, token });
   const dropHandlers: Array<(reason: string) => void> = [];
 
-  const dial = overrides.dial ??
-    ((): Transport => {
-      const transport = new WebSocketTransport({ url: vault.url });
-      transport.onClose((reason) => {
-        if (reason.code === 1000 && reason.reason === 'closed by caller') return; // our own close
-        const detail = reason.reason !== undefined && reason.reason !== ''
-          ? reason.reason
-          : `connection closed (code ${reason.code ?? '?'})`;
-        for (const handler of [...dropHandlers]) handler(detail);
-      });
-      return transport;
-    });
+  const createTransport = overrides.dial ?? (() => new WebSocketTransport({ url: vault.url }));
+  const dial = (): Transport => {
+    const transport = createTransport();
+    // Transport callbacks are setters. Compose the core's close notification
+    // with supervision so registering the core listener cannot replace ours.
+    return {
+      send: (message) => transport.send(message),
+      onMessage: (callback) => transport.onMessage(callback),
+      onClose(callback) {
+        transport.onClose((reason) => {
+          callback(reason);
+          if (reason.code === 1000 && reason.reason === 'closed by caller') return;
+          const detail = reason.reason !== undefined && reason.reason !== ''
+            ? reason.reason
+            : `connection closed (code ${reason.code ?? '?'})`;
+          for (const handler of [...dropHandlers]) handler(detail);
+        });
+      },
+      close: () => transport.close(),
+    };
+  };
 
   const client = new SyncClient({
     deviceId: vault.deviceId,

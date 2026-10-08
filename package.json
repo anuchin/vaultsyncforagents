@@ -25,10 +25,15 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "vsa": "node packages/cli/bin/vsa.js"
   },
+  "overrides": {
+    "obsidian": { "moment": "^2.31.0" },
+    "miniflare": { "sharp": "^0.35.5" },
+    "source-map-js": "^1.2.2"
+  },
   "devDependencies": {
-    "@vitest/coverage-v8": "^3.2.4",
+    "@vitest/coverage-v8": "^4.1.11",
     "fflate": "^0.8.3",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

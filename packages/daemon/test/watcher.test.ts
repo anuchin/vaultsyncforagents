@@ -5,7 +5,7 @@
  * temp-file suppression, and batch coalescing.
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, rmdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, onTestFinished } from 'vitest';
@@ -72,6 +72,15 @@ async function quietPeriod(ms = 350): Promise<void> {
 }
 
 describe('NodeWatchAdapter', () => {
+  it('triggers scans for creating and deleting an empty directory', async () => {
+    const harness = await makeHarness();
+    await harness.start();
+    await mkdir(join(harness.root, 'empty'));
+    await eventually(() => harness.events.some(e => e.kind === 'add' && e.path === '/empty'), 2000);
+    await rmdir(join(harness.root, 'empty'));
+    await eventually(() => harness.events.some(e => e.kind === 'delete' && e.path === '/empty'), 2000);
+    await harness.stop();
+  });
   it('maps chokidar add/change/unlink to core FileChangeEvent kinds', async () => {
     const harness = await makeHarness();
     await writeFile(join(harness.root, 'note.md'), 'v1\n', 'utf8');

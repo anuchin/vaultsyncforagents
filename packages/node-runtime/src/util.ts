@@ -28,17 +28,23 @@ import { randomBytes } from 'node:crypto';
  * Write `data` to `filePath` atomically: write a sibling temp file, fsync it,
  * rename over the destination. Creates parent directories as needed.
  */
-export async function writeFileAtomic(filePath: string, data: Uint8Array): Promise<void> {
+export async function writeFileAtomic(
+  filePath: string,
+  data: Uint8Array,
+  validatePath?: () => Promise<void>,
+): Promise<void> {
   const temp = tempPathFor(filePath);
+  await validatePath?.();
   await mkdir(dirname(filePath), { recursive: true });
   let handle: FileHandle | null = null;
   try {
-    handle = await open(temp, 'w');
+    await validatePath?.();
+    handle = await open(temp, 'wx');
     await handle.writeFile(data);
     await handle.sync();
     await handle.close();
     handle = null;
-    await renameWithRetry(temp, filePath);
+    await renameWithRetry(temp, filePath, validatePath);
   } catch (error) {
     if (handle !== null) await handle.close().catch(() => {});
     await unlink(temp).catch(() => {});
@@ -79,9 +85,10 @@ export function writeFileAtomicSync(filePath: string, text: string): void {
 const RENAME_RETRIES = 5;
 const RENAME_BACKOFF_MS = 25;
 
-export async function renameWithRetry(from: string, to: string): Promise<void> {
+export async function renameWithRetry(from: string, to: string, validatePath?: () => Promise<void>): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
+      await validatePath?.();
       await rename(from, to);
       return;
     } catch (error) {

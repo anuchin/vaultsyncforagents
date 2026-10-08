@@ -13,6 +13,8 @@ import {
 } from './helpers/obsidian-mock.js';
 import { makeFakeApp, FakeVault } from './helpers/fake-vault.js';
 import { FakeFetch, FakeSocket, jsonResult, offlineWsFactory } from './helpers/network-fakes.js';
+import { normalizePluginData } from '../src/data.js';
+import { buildDiagnosticsBundle, buildSupportBundle } from '../src/diagnostics.js';
 
 const LINKED = { url: 'https://w.example', token: 'tok-1', deviceId: 'dev-1', deviceName: 'Desk' };
 
@@ -58,6 +60,81 @@ function findModalButton(text: string): ButtonRecord {
   }
   throw new Error(`modal button not rendered: ${text}`);
 }
+
+describe('device write warning acknowledgement', () => {
+  beforeEach(() => resetObsidianMock());
+  afterEach(() => {
+    for (const plugin of created.splice(0)) plugin.onunload();
+  });
+
+  const warnings = () => Notice.messages.filter((n) => n.message.includes('checks their size afterward'));
+
+  it('remembers Got it across reloads while keeping the limitation in settings and diagnostics', async () => {
+    const vault = new FakeVault();
+    vault.adapter.failRename = true;
+    const { plugin } = makePlugin({ vault });
+    await plugin.onload();
+    await plugin.saveSupportBundle();
+    await plugin.saveSupportBundle(); // a new adapter must not make another popup
+    expect(warnings()).toHaveLength(1);
+    const notice = Notice.instances.find((_, i) => Notice.messages[i]?.message.includes('checks their size afterward'))!;
+    await findModalButton('Got it').onClick();
+    expect(notice.hidden).toBe(true);
+    expect(asMockPlugin(plugin).store).toMatchObject({
+      atomicWritesUnavailable: true,
+      atomicWriteWarningAcknowledgedFor: '',
+    });
+    plugin.onunload();
+    const { plugin: reloaded } = makePlugin({ vault, store: asMockPlugin(plugin).store });
+    await reloaded.onload();
+    await reloaded.saveSupportBundle();
+    expect(warnings()).toHaveLength(1);
+    const tab = asMockPlugin(reloaded).settingTabs[0]!;
+    tab.display();
+    expect(findModalSetting('File writes on this device').desc).toContain('crash during writing');
+    tab.hide();
+    const input = { pluginVersion: 'test', deviceId: '', deviceName: '', workerUrl: '', paired: false,
+      paused: false, clientStatus: null, recentLogLines: [], atomicWritesUnavailable: reloaded.data.atomicWritesUnavailable };
+    expect(buildDiagnosticsBundle(input)).toContain('non-atomic direct writes');
+    expect(buildSupportBundle(input, Date.now())).toContain('non-atomic direct writes');
+  });
+
+  it('does not carry an acknowledgement to a different device identity', async () => {
+    const vault = new FakeVault();
+    vault.adapter.failRename = true;
+    const { plugin } = makePlugin({ vault, store: {
+      deviceId: 'new-device', atomicWritesUnavailable: true,
+      atomicWriteWarningAcknowledgedFor: 'old-device',
+    } });
+    await plugin.onload();
+    await plugin.saveSupportBundle();
+    expect(warnings()).toHaveLength(1);
+    await findModalButton('Got it').onClick();
+    expect(asMockPlugin(plugin).store?.atomicWriteWarningAcknowledgedFor).toBe('new-device');
+  });
+
+  it('keeps the warning retryable when saving the acknowledgement fails', async () => {
+    const vault = new FakeVault();
+    vault.adapter.failRename = true;
+    const { plugin } = makePlugin({ vault });
+    await plugin.onload();
+    await plugin.saveSupportBundle();
+    const button = findModalButton('Got it');
+    vi.spyOn(plugin, 'savePluginData').mockRejectedValueOnce(new Error('disk unavailable'));
+    await button.onClick();
+    expect(plugin.data.atomicWriteWarningAcknowledgedFor).toBeNull();
+    expect(asMockPlugin(plugin).store?.atomicWriteWarningAcknowledgedFor).toBeNull();
+    expect(button.disabled).toBe(false);
+    expect(Notice.messages.some(n => n.message.includes('could not remember your choice'))).toBe(true);
+    await button.onClick();
+    expect(asMockPlugin(plugin).store?.atomicWriteWarningAcknowledgedFor).toBe('');
+  });
+
+  it('migrates old data without silently acknowledging the warning', () => {
+    expect(normalizePluginData(LINKED)).toMatchObject({ atomicWritesUnavailable: false, atomicWriteWarningAcknowledgedFor: null });
+    expect(normalizePluginData({ atomicWritesUnavailable: 'true', atomicWriteWarningAcknowledgedFor: true })).toMatchObject({ atomicWritesUnavailable: false, atomicWriteWarningAcknowledgedFor: null });
+  });
+});
 
 describe('VaultSyncPlugin lifecycle', () => {
   beforeEach(() => {

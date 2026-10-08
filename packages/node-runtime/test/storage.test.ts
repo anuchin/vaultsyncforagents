@@ -98,10 +98,10 @@ describe('NodeStorageAdapter', () => {
     expect(await adapter.listDirs()).toEqual(['/', '/a', '/a/b', '/empty']);
   });
 
-  it('listFiles/listDirs on a missing root behave as an empty vault', async () => {
+  it('listFiles/listDirs abort on a missing root to prevent deletion inference', async () => {
     const adapter = new NodeStorageAdapter({ root: join(await tempRoot(), 'never-created') });
-    expect(await adapter.listFiles()).toEqual([]);
-    expect(await adapter.listDirs()).toEqual(['/']);
+    await expect(adapter.listFiles()).rejects.toThrow();
+    await expect(adapter.listDirs()).rejects.toThrow();
   });
 
   it('ensureDir is idempotent and creates ancestors', async () => {

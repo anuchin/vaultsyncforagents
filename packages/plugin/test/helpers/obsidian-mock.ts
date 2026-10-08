@@ -201,10 +201,17 @@ export interface ButtonComponentStub {
 }
 
 export class Notice {
+  static instances: Notice[] = [];
+  readonly noticeEl = {};
+  hidden = false;
   /** All notices issued since the last mock reset (with durations). */
   static messages: Array<{ message: string; duration?: number }> = [];
   constructor(message: string | DocumentFragment, duration?: number) {
+    Notice.instances.push(this);
     Notice.messages.push({ message: String(message), duration });
+  }
+  hide(): void {
+    this.hidden = true;
   }
 }
 
@@ -377,6 +384,7 @@ export function asMockPlugin(plugin: unknown): MockPluginSurface {
 export function resetObsidianMock(): void {
   Setting.instances = [];
   Notice.messages = [];
+  Notice.instances = [];
   Modal.instances = [];
   Modal.opened = [];
   for (const action of Object.keys(protocolHandlers)) delete protocolHandlers[action];

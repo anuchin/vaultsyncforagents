@@ -5,7 +5,7 @@
       "ES2022"
     ],
     "types": [
-      "@cloudflare/vitest-pool-workers"
+      "@cloudflare/vitest-plugin/types"
     ],
     "baseUrl": ".",
     "paths": {

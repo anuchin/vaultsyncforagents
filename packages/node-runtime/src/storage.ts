@@ -15,7 +15,8 @@
 
 import type { FileStat, StorageAdapter } from '@vsa/core';
 import { normalizeVaultPath } from '@vsa/core';
-import { mkdir, readdir, readFile, rename, rm, rmdir, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, readdir, rename, rm, rmdir, stat } from 'node:fs/promises';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { writeFileAtomic } from './util.js';
 
@@ -36,7 +37,7 @@ export class NodeStorageAdapter implements StorageAdapter {
     if (!isAbsolute(root)) {
       throw new Error(`vault root must be absolute, got ${JSON.stringify(root)}`);
     }
-    this.root = root;
+    this.root = resolve(root);
   }
 
   /** Host path for a vault path (the inverse of {@link toVaultPath}). */
@@ -63,23 +64,33 @@ export class NodeStorageAdapter implements StorageAdapter {
   }
 
   async readFile(path: string): Promise<Uint8Array> {
-    // Node Buffers ARE Uint8Arrays; copying would double every read's memory.
-    return readFile(this.toHostPath(path));
+    const hostPath = await this.safeHostPath(path);
+    // O_NOFOLLOW also closes the final-component link race where supported.
+    const handle = await open(hostPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      await this.safeHostPath(path);
+      return await handle.readFile();
+    } finally {
+      await handle.close();
+    }
   }
 
   async writeFile(path: string, data: Uint8Array): Promise<void> {
-    await writeFileAtomic(this.toHostPath(path), data);
+    const hostPath = await this.safeHostPath(path);
+    await writeFileAtomic(hostPath, data, async () => { await this.safeHostPath(path); });
   }
 
   async deleteFile(path: string): Promise<void> {
     // Idempotent by contract: `force` swallows ENOENT.
-    await rm(this.toHostPath(path), { force: true });
+    await rm(await this.safeHostPath(path), { force: true });
   }
 
   async renameFile(from: string, to: string): Promise<void> {
-    const fromHost = this.toHostPath(from);
-    const toHost = this.toHostPath(to);
+    const fromHost = await this.safeHostPath(from);
+    const toHost = await this.safeHostPath(to);
     await mkdir(dirnameOf(toHost), { recursive: true });
+    await this.safeHostPath(from);
+    await this.safeHostPath(to);
     await rename(fromHost, toHost);
   }
 
@@ -107,7 +118,8 @@ export class NodeStorageAdapter implements StorageAdapter {
   }
 
   async ensureDir(path: string): Promise<void> {
-    await mkdir(this.toHostPath(path), { recursive: true });
+    await mkdir(await this.safeHostPath(path), { recursive: true });
+    await this.safeHostPath(path);
   }
 
   /**
@@ -119,8 +131,9 @@ export class NodeStorageAdapter implements StorageAdapter {
    * refuses EVERY directory with EISDIR on Windows.)
    */
   async removeDir(path: string): Promise<void> {
+    if (normalizeVaultPath(path) === '/') return;
     try {
-      await rmdir(this.toHostPath(path));
+      await rmdir(await this.safeHostPath(path));
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return;
       throw error;
@@ -129,20 +142,22 @@ export class NodeStorageAdapter implements StorageAdapter {
 
   async exists(path: string): Promise<boolean> {
     try {
-      await stat(this.toHostPath(path));
+      await stat(await this.safeHostPath(path));
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
     }
   }
 
   /**
    * Depth-first walk of the vault, visiting every child of the root
    * recursively. `visit` receives the relative segments (raw names), the
-   * kind, and file stats (only for `kind === 'file'`). A missing vault root
-   * yields no visits — an empty vault, not an error. Entries that vanish
-   * mid-walk are skipped. SYMLINKS are never followed (a link may escape
-   * the vault or loop) and are collected into `links` instead of visited.
+   * kind, and file stats (only for `kind === 'file'`). An unavailable root or
+   * unreadable subtree aborts the inventory: an incomplete scan must never
+   * infer deletions. Children that vanish mid-walk are skipped. SYMLINKS are
+   * never followed (a link may escape the vault or loop) and are collected
+   * into `links` instead of visited.
    */
   private async walk(
     relativeSegments: readonly string[],
@@ -157,9 +172,11 @@ export class NodeStorageAdapter implements StorageAdapter {
       relativeSegments.length === 0 ? this.root : join(this.root, ...relativeSegments);
     let entries;
     try {
+      await this.safeHostPath(`/${relativeSegments.join('/')}`);
       entries = await readdir(hostDir, { withFileTypes: true });
-    } catch {
-      return; // vault root does not exist yet — an empty vault
+    } catch (error) {
+      if (relativeSegments.length > 0 && isMissing(error)) return;
+      throw error;
     }
     for (const entry of entries) {
       const childSegments = [...relativeSegments, entry.name];
@@ -176,7 +193,11 @@ export class NodeStorageAdapter implements StorageAdapter {
         await visit(childSegments, 'dir', { size: 0, mtimeMs: 0 });
         await this.walk(childSegments, visit, links);
       } else {
-        const stats = await stat(childPath).catch(() => null);
+        await this.safeHostPath(`/${childSegments.join('/')}`);
+        const stats = await stat(childPath).catch((error: unknown) => {
+          if (isMissing(error)) return null;
+          throw error;
+        });
         if (stats === null) continue; // vanished mid-walk
         await visit(childSegments, 'file', { size: stats.size, mtimeMs: stats.mtimeMs });
       }
@@ -190,6 +211,37 @@ export class NodeStorageAdapter implements StorageAdapter {
     await this.walk([], async () => {}, links);
     return links.sort();
   }
+
+  /**
+   * Reject links in the root or any existing component, including the leaf.
+   * Lexical normalization alone does not stop a junction from escaping the
+   * vault. Missing components are allowed for creates; operations recheck
+   * after creating parents and immediately before replacing a file.
+   */
+  private async safeHostPath(vaultPath: string): Promise<string> {
+    const normalized = normalizeVaultPath(vaultPath);
+    const segments = normalized === '/' ? [] : normalized.slice(1).split('/');
+    let hostPath = this.root;
+    for (let index = 0; index <= segments.length; index++) {
+      if (index > 0) hostPath = join(hostPath, segments[index - 1]!);
+      let info;
+      try {
+        info = await lstat(hostPath);
+      } catch (error) {
+        if (isMissing(error)) break;
+        throw error;
+      }
+      if (info.isSymbolicLink()) throw new Error(`refusing filesystem link in vault path: ${hostPath}`);
+      if (index < segments.length && !info.isDirectory()) {
+        throw new Error(`vault path ancestor is not a directory: ${hostPath}`);
+      }
+    }
+    return this.toHostPath(normalized);
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
 }
 
 function dirnameOf(hostPath: string): string {

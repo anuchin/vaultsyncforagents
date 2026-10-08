@@ -1,6 +1,6 @@
 /**
  * Test helpers — a tiny WS client speaking the REAL wire protocol
- * (`ClientMessage`/`ServerMessage` from `@vsa/core`) over the pool-workers
+ * (`ClientMessage`/`ServerMessage` from `@vsa/core`) over the Cloudflare Vitest
  * environment, plus claim/login/pairing conveniences against `SELF`.
  */
 
@@ -12,10 +12,7 @@ import {
   type ServerMessage,
 } from '@vsa/core';
 
-// The pool-workers `env` is `ProvidedEnv`; bind it to this worker's bindings.
-declare module 'cloudflare:test' {
-  interface ProvidedEnv extends Env {} // eslint-disable-line @typescript-eslint/no-empty-object-type
-}
+// The plugin's `env` uses Cloudflare.Env from worker-configuration.d.ts.
 
 export const TEST_ORIGIN = 'http://vault.test';
 
@@ -155,8 +152,8 @@ export function setRoomTime(ms: number | null): Promise<void> {
 /**
  * Reset the vault to factory state (unclaimed, empty tables, empty bucket).
  *
- * Stands in for the pool's `isolatedStorage` (disabled on Windows — see
- * vitest.workers.config.ts): every test file calls this in `beforeEach`, so
+ * Provides cleanup for the shared runtime (see vitest.workers.config.ts):
+ * every test file calls this in `beforeEach`, so
  * each test starts as a freshly deployed worker. In-memory DO state that
  * outlives the tables (pinned clock, per-IP auth-failure counters) is reset
  * through the room's test seams — the single worker is shared by all files.

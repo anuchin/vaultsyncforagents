@@ -1,0 +1,15 @@
+[Unit]
+Description=Check ZeroKelvin sync health
+After=vaultsync-zerokelvin.service
+
+[Service]
+Type=oneshot
+User=rvp
+Group=rvp
+ExecStart=/usr/bin/node /opt/vaultsync-zerokelvin/monitor.mjs
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vaultsync-zerokelvin

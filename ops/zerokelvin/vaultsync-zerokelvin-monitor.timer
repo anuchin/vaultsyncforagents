@@ -1,0 +1,11 @@
+[Unit]
+Description=Check ZeroKelvin sync health every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=vaultsync-zerokelvin-monitor.service
+
+[Install]
+WantedBy=timers.target

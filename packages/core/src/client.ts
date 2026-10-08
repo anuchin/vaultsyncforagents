@@ -749,11 +749,9 @@ export class SyncClient {
   }
 
   private async storageExists(path: string): Promise<boolean> {
-    try {
-      return await this.options.storage.exists(path);
-    } catch {
-      return false;
-    }
+    // An unreadable path is not proof of absence. Let the change handler
+    // retry instead of bypassing its local-divergence guard.
+    return this.options.storage.exists(path);
   }
 
   private pullOpFromChange(change: ChangeMessage): PullOp {

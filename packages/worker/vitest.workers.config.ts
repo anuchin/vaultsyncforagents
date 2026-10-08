@@ -1,5 +1,5 @@
 /**
- * Worker test config — runs on @cloudflare/vitest-pool-workers (real
+ * Worker test config — runs on @cloudflare/vitest-plugin (real
  * workerd/Miniflare runtime: Durable Object + R2 + WebSockets), completely
  * separate from the root node-pool config that runs `@vsa/core`'s suites.
  *
@@ -9,18 +9,20 @@
  * registers this package's worker as the test isolate's main module so
  * `SELF` fetches and DO classes resolve against the real routing code.
  *
- * `isolatedStorage` is DISABLED on purpose: its per-test snapshot pop unlinks
- * the DO's sqlite file, and on Windows any test that performs concurrent DO
- * writes (the claim race!) deterministically hits EBUSY — workerd keeps a
- * second file handle that abortAllDurableObjects() does not release in time
- * (pool-workers 0.12.x). Instead every test file resets the DO tables and the
- * R2 bucket in `beforeEach` (`helpers.resetAll`), preserving fresh-worker
- * semantics without file juggling.
+ * One shared runtime avoids unlinking open SQLite files on Windows. Every
+ * test resets the DO tables and R2 bucket in `beforeEach` (`helpers.resetAll`),
+ * preserving fresh-worker semantics without file juggling.
  */
 import { fileURLToPath } from 'node:url';
-import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+import { cloudflareTest } from '@cloudflare/vitest-plugin';
+import { defineConfig } from 'vitest/config';
 
-export default defineWorkersConfig({
+export default defineConfig({
+  plugins: [cloudflareTest({
+    main: 'src/index.ts',
+    wrangler: { configPath: './wrangler.test.jsonc' },
+    miniflare: { compatibilityFlags: ['nodejs_compat'] },
+  })],
   resolve: {
     // Source aliases for workspace deps: node_modules junctions do not
     // resolve on some drives (network-mapped/OneDrive volumes), and tests
@@ -42,16 +44,10 @@ export default defineWorkersConfig({
     // blowing the 5 s default long before any logic is wrong.
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    poolOptions: {
-      workers: {
-        main: 'src/index.ts',
-        wrangler: { configPath: './wrangler.test.jsonc' },
-        miniflare: {
-          compatibilityFlags: ['nodejs_compat'],
-        },
-        isolatedStorage: false,
-        singleWorker: true,
-      },
-    },
+    // resetAll() provides per-test cleanup without unlinking open SQLite
+    // files on Windows. Keep one shared runtime, as in the previous pool.
+    maxWorkers: 1,
+    isolate: false,
+    fileParallelism: false,
   },
 });

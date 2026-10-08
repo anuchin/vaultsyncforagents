@@ -95,6 +95,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   private statusSetting: Setting | null = null;
   private storageSetting: Setting | null = null;
   private serverVersionSetting: Setting | null = null;
+  private fileWritesSetting: Setting | null = null;
   private refreshHandle: ReturnType<typeof setInterval> | null = null;
 
   constructor(app: App, plugin: VaultSyncPlugin) {
@@ -110,6 +111,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     this.statusSetting = null;
     this.storageSetting = null;
     this.serverVersionSetting = null;
+    this.fileWritesSetting = null;
     this.renameDraft = null;
 
     this.renderConnectionSection();
@@ -366,6 +368,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     const data = this.plugin.data;
     this.heading('Advanced');
 
+    this.fileWritesSetting = new Setting(containerEl)
+      .setName('File writes on this device')
+      .setDesc(this.fileWritesText());
+
     new Setting(containerEl)
       .setName('Status bar indicator')
       .setDesc(
@@ -525,7 +531,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
   private refreshStatus(): void {
     this.statusSetting?.setDesc(this.statusText());
+    this.fileWritesSetting?.setDesc(this.fileWritesText());
     this.refreshServerVersion();
+  }
+
+  private fileWritesText(): string {
+    return this.plugin.data.atomicWritesUnavailable
+      ? 'Direct writes with a size check. This device could not replace a file atomically; a crash during writing could leave a partial note. Sync continues.'
+      : 'No atomic-write limitation has been detected on this device.';
   }
 
   /**

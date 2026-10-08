@@ -14,7 +14,7 @@
     "build": "node esbuild.mjs",
     "build:production": "node esbuild.mjs --production",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@noble/hashes": "^2.3.0",
@@ -22,9 +22,10 @@
     "fflate": "^0.8.3"
   },
   "devDependencies": {
+    "@types/node": "^24.3.0",
     "esbuild": "^0.28.1",
     "obsidian": "^1.13.1",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

@@ -5,15 +5,17 @@
  * state conservatively copies, and the safety copy failure aborts the delete.
  */
 
-import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   applyCommit,
   serializeLocalIndex,
   sha256Hex,
   LOCAL_INDEX_STATE_PATH,
+  removeDirIfVacant,
+  scanVault,
   type LocalIndex,
 } from '@vsa/core';
 import { NodeStorageAdapter } from '@vsa/node-runtime';
@@ -67,6 +69,32 @@ function entry(hash: string): Parameters<typeof applyCommit>[1] {
 }
 
 describe('TrashGuardStorage.deleteFile (remote-delete path)', () => {
+  it('preserves existing bytes when the safety read fails with EACCES', async () => {
+    const { raw, trash } = await makeVault([{ path: '/keep.md', content: 'only copy' }]);
+    const read = vi.spyOn(raw, 'readFile').mockRejectedValueOnce(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
+    await expect(trash.deleteFile('/keep.md')).rejects.toThrow('permission denied');
+    read.mockRestore();
+    expect(new TextDecoder().decode(await raw.readFile('/keep.md'))).toBe('only copy');
+  });
+
+  it('removes a remote empty folder through the storage wrapper', async () => {
+    const { raw, trash } = await makeVault();
+    await raw.ensureDir('/empty');
+    expect(await removeDirIfVacant(trash, {}, '/empty')).toBe(true);
+    expect(await raw.exists('/empty')).toBe(false);
+  });
+
+  it('protects tracked files hidden by a junction through the daemon wrapper', async () => {
+    const { raw, trash } = await makeVault();
+    const outside = await mkdtemp(join(tmpdir(), 'vsa-trash-link-'));
+    await writeFile(join(outside, 'keep.md'), 'keep');
+    await symlink(outside, join(raw.root, 'linked'), 'junction');
+    const changes = await scanVault(trash, {
+      '/linked/keep.md': { hash: await hashOf('keep'), size: 4, versionId: 'v1', clock: {counter: 1, deviceId: 'other'} },
+    }, {obsidianSync: false}, FIXED_NOW);
+    expect(changes.deleted).toEqual([]);
+    expect(changes.symlinks).toEqual(['/linked']);
+  });
   it('rescues diverged local content to .trash/<timestamp>-<basename> before deleting', async () => {
     const synced = 'v1\n';
     const vault = await makeVault([{ path: '/note.md', content: synced }]);

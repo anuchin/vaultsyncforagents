@@ -9,7 +9,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -48,6 +48,8 @@ async function makeE2e(): Promise<{
   server: InMemorySyncServer;
   manager: DaemonManager;
   healthPath: string;
+  seed: SyncClient;
+  seedRoot: string;
 }> {
   const base = await mkdtemp(join(tmpdir(), 'vsa-daemon-e2e-'));
   const daemonRoot = join(base, 'vault');
@@ -98,7 +100,7 @@ async function makeE2e(): Promise<{
         blobStore: mapBlobStore(),
       }),
   });
-  return { daemonRoot, server, manager, healthPath };
+  return { daemonRoot, server, manager, healthPath, seed, seedRoot };
 }
 
 describe('daemon end-to-end (real stack, in-memory server)', () => {
@@ -138,10 +140,40 @@ describe('daemon end-to-end (real stack, in-memory server)', () => {
       'watcher cycle pushed the agent edit to the server',
     );
 
+    // Empty folders must sync without an accompanying file edit.
+    await mkdir(join(daemonRoot, 'agent-empty'));
+    await waitFor(() => server.snapshot().files.some(file => file.path === '/agent-empty' && file.isFolder && !file.deleted), 'empty folder pushed by watcher');
+    await rmdir(join(daemonRoot, 'agent-empty'));
+    await waitFor(() => server.snapshot().files.some(file => file.path === '/agent-empty' && file.deleted), 'empty folder deletion pushed by watcher');
     // Graceful shutdown: state settles, final snapshot records stopped.
     await manager.stop();
     const final = readDaemonHealthSnapshot(healthPath)!;
     expect(final.running).toBe(false);
     expect(final.vaults[0]?.state).toBe('stopped');
+  });
+
+  it('applies remote empty-folder deletions and prunes emptied parents through the real wrapper', async () => {
+    const { daemonRoot, manager, seed, seedRoot } = await makeE2e();
+    try {
+      await manager.start();
+      await seed.reconnect();
+      await mkdir(join(seedRoot, 'remote-empty'));
+      await seed.triggerSync();
+      await waitFor(() => existsSync(join(daemonRoot, 'remote-empty')), 'remote empty folder created');
+      await rmdir(join(seedRoot, 'remote-empty'));
+      await seed.triggerSync();
+      await waitFor(() => !existsSync(join(daemonRoot, 'remote-empty')), 'remote empty folder removed');
+
+      await mkdir(join(seedRoot, 'remote-parent'));
+      await writeFile(join(seedRoot, 'remote-parent', 'last.md'), 'last file');
+      await seed.triggerSync();
+      await waitFor(() => existsSync(join(daemonRoot, 'remote-parent', 'last.md')), 'remote child created');
+      await unlink(join(seedRoot, 'remote-parent', 'last.md'));
+      await seed.triggerSync();
+      await waitFor(() => !existsSync(join(daemonRoot, 'remote-parent')), 'empty parent pruned after remote file deletion');
+    } finally {
+      seed.close();
+      await manager.stop();
+    }
   });
 });

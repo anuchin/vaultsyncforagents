@@ -304,6 +304,36 @@ describe('planSnapshotRestore (planner units)', () => {
     return state;
   };
 
+  it.each([false, true])('restores a renamed-away snapshot head (folder: %s)', (isFolder) => {
+    const snap: SnapshotHeadRecord = {
+      version: 'v1', hash: isFolder ? '' : 'original', size: isFolder ? 0 : 8,
+      deleted: false, kind: 'edit', ...(isFolder ? { isFolder: true } : {}),
+    };
+    expect(planSnapshotRestore(emptyArbitrationState(), { '/old': snap })).toEqual([{
+      path: '/old', tombstone: false,
+      commit: {
+        path: '/old', parentVersion: null, hash: snap.hash, size: snap.size,
+        kind: 'restore', ...(isFolder ? { isFolder: true } : {}),
+      },
+    }]);
+  });
+
+  it('keeps a renamed-away tombstone absent', () => {
+    expect(planSnapshotRestore(emptyArbitrationState(), {
+      '/gone.md': { version: 'v1', hash: 'deleted', size: 7, deleted: true, kind: 'delete' },
+    })).toEqual([]);
+  });
+
+  it('restores folder metadata when an empty file replaced a snapshot folder', () => {
+    const state = stateOf('/folder', version('v2', '/folder', '', 0));
+    expect(planSnapshotRestore(state, {
+      '/folder': { version: 'v1', hash: '', size: 0, deleted: false, kind: 'edit', isFolder: true },
+    })).toEqual([{
+      path: '/folder', tombstone: false,
+      commit: { path: '/folder', parentVersion: 'v2', hash: '', size: 0, kind: 'restore', isFolder: true },
+    }]);
+  });
+
   it('a double tombstone with a different recorded hash is a no-op (delete→restore→re-delete)', () => {
     // Both deletes recorded different content (the re-delete tombstoned the
     // restored content, not the original), but the effective state — deleted,

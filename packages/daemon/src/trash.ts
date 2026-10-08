@@ -94,9 +94,9 @@ export class TrashGuardStorage implements StorageAdapter {
     let bytes: Uint8Array;
     try {
       bytes = await this.inner.readFile(path);
-    } catch {
-      await this.inner.deleteFile(path); // already gone: idempotent delete
-      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
+      throw error; // never destroy bytes whose safety read failed
     }
 
     const actual = await sha256Hex(bytes);
@@ -171,6 +171,14 @@ export class TrashGuardStorage implements StorageAdapter {
 
   listDirs(): Promise<readonly string[]> {
     return this.inner.listDirs();
+  }
+
+  listSymlinks(): Promise<readonly string[]> {
+    return this.inner.listSymlinks();
+  }
+
+  removeDir(path: string): Promise<void> {
+    return this.inner.removeDir(path);
   }
 
   ensureDir(path: string): Promise<void> {

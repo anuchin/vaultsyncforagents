@@ -8,10 +8,9 @@
  *   chokidar 'add'    → { kind: 'add' }
  *   chokidar 'change' → { kind: 'modify' }
  *   chokidar 'unlink' → { kind: 'delete' }
- *   'addDir'/'unlinkDir' → ignored: core discovers folder placeholders via
- *   `StorageAdapter.listDirs()` during the scan, and a removed directory
- *   always fires 'unlink' for every child file, which is what the engine
- *   needs. 'rename' is NOT synthesized: the engine's scan correlates
+ *   'addDir'/'unlinkDir' → add/delete scan triggers, including empty folders.
+ *   Core discovers the actual folder operations during reconciliation.
+ *   'rename' is NOT synthesized: the engine's scan correlates
  *   delete+add pairs by content hash into explicit rename ops (FR-9), which
  *   is more reliable than FS rename hints across platforms.
  *
@@ -100,6 +99,8 @@ export class NodeWatchAdapter implements WatchAdapter {
     this.watcher.on('add', (path: string) => this.record('add', path));
     this.watcher.on('change', (path: string) => this.record('modify', path));
     this.watcher.on('unlink', (path: string) => this.record('delete', path));
+    this.watcher.on('addDir', (path: string) => this.record('add', path));
+    this.watcher.on('unlinkDir', (path: string) => this.record('delete', path));
     this.watcher.on('error', (error: unknown) => this.onWatcherError(error));
   }
 

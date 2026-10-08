@@ -19,9 +19,9 @@ export default defineConfig({
       include: ['packages/core/src/**'],
       reporter: ['text'],
       // CI-enforced floor (run `npm run test:coverage`). Measured core
-      // coverage: statements 93.9 / branches 88.53 / functions 97.06 / lines
-      // 93.9 — thresholds sit a point or two below, rounded down, so the gate
-      // passes today without being sensitive to small code shifts.
+      // coverage with Vitest 4: statements 93.79 / branches 87.06 /
+      // functions 97.45 / lines 95.33. The established thresholds remain
+      // unchanged; failure-path regressions cover the upgraded instrumentation.
       thresholds: {
         statements: 92,
         branches: 87,

@@ -162,6 +162,8 @@ export interface DiagnosticsInput {
   serverVersion?: string | null;
   /** Client-side settings (none are secret — all fields render verbatim). */
   settings?: PluginSyncSettings;
+  /** Acknowledgement suppresses popups, never this diagnostic limitation. */
+  atomicWritesUnavailable?: boolean;
   /**
    * Conflict paths for the support bundle, derived from
    * `clientStatus.conflicts` — PATHS ONLY, never file content.
@@ -190,6 +192,9 @@ export function buildDiagnosticsBundle(input: DiagnosticsInput): string {
             status.lastSyncAt === null ? 'never' : `${Math.max(0, Date.now() - status.lastSyncAt)}ms ago`
           }, pending ${status.pending}, conflicts ${status.conflicts.length}`,
     `Platform: ${platformSummary()}`,
+    ...(input.atomicWritesUnavailable
+      ? ['File writes: non-atomic direct writes (size-verified); a crash during writing can leave a partial note.']
+      : []),
     `Recent log (last ${input.recentLogLines.length} lines):`,
   ];
   if (input.recentLogLines.length === 0) {
@@ -243,6 +248,9 @@ export function buildSupportBundle(input: DiagnosticsInput, now: number): string
     `- Device name: ${input.deviceName || '(default)'}`,
     `- Pairing: ${input.paired ? 'paired' : 'not paired'}`,
     `- Syncing: ${input.paused ? 'paused' : 'active'}`,
+    ...(input.atomicWritesUnavailable
+      ? ['- File writes: non-atomic direct writes (size-verified); a crash during writing can leave a partial note.']
+      : []),
   ];
 
   if (input.settings !== undefined) {

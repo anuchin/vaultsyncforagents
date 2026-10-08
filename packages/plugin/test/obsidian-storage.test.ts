@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { scanVault } from '@vsa/core';
 import { ObsidianStorageAdapter } from '../src/adapters/obsidian-storage.js';
 import { FakeDataAdapter, FakeVault } from './helpers/fake-vault.js';
 import type { DataAdapter } from 'obsidian';
@@ -10,6 +11,26 @@ function makeStorage(adapter: FakeDataAdapter): ObsidianStorageAdapter {
 const bytes = (...values: number[]) => new Uint8Array(values);
 
 describe('ObsidianStorageAdapter', () => {
+  it('aborts listing errors rather than converting an unreadable subtree into deletions', async () => {
+    const adapter = new FakeDataAdapter({ 'blocked/keep.md': 'keep' });
+    const list = adapter.list.bind(adapter);
+    vi.spyOn(adapter, 'list').mockImplementation(async path => {
+      if (path === 'blocked') throw new Error('permission denied');
+      return list(path);
+    });
+    await expect(scanVault(makeStorage(adapter), {
+      '/blocked/keep.md': { hash: 'a'.repeat(64), size: 4, versionId: 'v1', clock: {counter: 1, deviceId: 'other'} },
+    }, {obsidianSync: false}, 0)).rejects.toThrow('permission denied');
+  });
+
+  it('propagates stat and existence errors instead of treating files as missing', async () => {
+    const adapter = new FakeDataAdapter({ 'keep.md': 'keep' });
+    const storage = makeStorage(adapter);
+    vi.spyOn(adapter, 'stat').mockRejectedValueOnce(new Error('stat failed'));
+    await expect(storage.listFiles()).rejects.toThrow('stat failed');
+    vi.spyOn(adapter, 'exists').mockRejectedValueOnce(new Error('exists failed'));
+    await expect(storage.exists('/keep.md')).rejects.toThrow('exists failed');
+  });
   it('round-trips file content through vault paths (binary-safe)', async () => {
     const adapter = new FakeDataAdapter();
     const storage = makeStorage(adapter);

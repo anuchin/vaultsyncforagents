@@ -1,0 +1,42 @@
+{
+  "name": "vaultsync-zerokelvin-eb6b79",
+  "account_id": "982a44ac0b1594db267efc80e91975cd",
+  "main": "../../packages/worker/src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOM",
+        "class_name": "VaultRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "0001_initial",
+      "new_sqlite_classes": [
+        "VaultRoom"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "vaultsync-zerokelvin-eb6b79"
+    }
+  ],
+  "assets": {
+    "directory": "../../packages/dashboard/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "triggers": {
+    "crons": [
+      "0 3 * * 1"
+    ]
+  },
+  "define": {
+    "__VSA_SERVER_VERSION__": "\"0.1.6+audit.20261008\""
+  }
+}

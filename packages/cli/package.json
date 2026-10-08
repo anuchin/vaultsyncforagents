@@ -50,7 +50,7 @@
     "@vsa/daemon": "^0.1.0",
     "@vsa/node-runtime": "^0.1.0",
     "commander": "^14.0.0",
-    "esbuild": "^0.27.3",
+    "esbuild": "^0.28.2",
     "fflate": "^0.8.3",
     "picocolors": "^1.1.1"
   }

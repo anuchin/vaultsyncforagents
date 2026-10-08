@@ -51,6 +51,10 @@ export interface VaultSyncPluginData {
   deviceId: string;
   /** Human-readable device name shown in the dashboard's device list. */
   deviceName: string;
+  /** Local write limitation, retained for settings and support diagnostics. */
+  atomicWritesUnavailable: boolean;
+  /** Device whose owner dismissed the write warning; never shared between identities. */
+  atomicWriteWarningAcknowledgedFor: string | null;
   settings: PluginSyncSettings;
 }
 
@@ -71,6 +75,8 @@ export function defaultPluginData(): VaultSyncPluginData {
     token: '',
     deviceId: '',
     deviceName: '',
+    atomicWritesUnavailable: false,
+    atomicWriteWarningAcknowledgedFor: null,
     settings: {
       rescanIntervalSec: DEFAULT_RESCAN_INTERVAL_SEC,
       obsidianSync: false,
@@ -94,6 +100,11 @@ export function normalizePluginData(raw: unknown): VaultSyncPluginData {
     token: typeof source.token === 'string' ? source.token : '',
     deviceId: typeof source.deviceId === 'string' ? source.deviceId : '',
     deviceName: typeof source.deviceName === 'string' ? source.deviceName : '',
+    atomicWritesUnavailable: source.atomicWritesUnavailable === true,
+    atomicWriteWarningAcknowledgedFor:
+      typeof source.atomicWriteWarningAcknowledgedFor === 'string'
+        ? source.atomicWriteWarningAcknowledgedFor
+        : null,
     settings: {
       rescanIntervalSec:
         typeof source.settings?.rescanIntervalSec === 'number' && source.settings.rescanIntervalSec >= 0

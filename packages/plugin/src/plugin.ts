@@ -12,7 +12,7 @@
  * All timers are owned here and torn down in `stopSync()`/`onunload`.
  */
 
-import { Notice, Platform, Plugin } from 'obsidian';
+import { Notice, Platform, Plugin, Setting } from 'obsidian';
 import type { App, PluginManifest } from 'obsidian';
 import {
   checkServerCompatibility,
@@ -110,6 +110,9 @@ export class VaultSyncPlugin extends Plugin {
    */
   private serverCompat: CompatibilityVerdict | null = null;
   private serverCompatNotified = false;
+  private atomicWriteNotice: Notice | null = null;
+  private atomicWriteNoticeShown = false;
+  private unloaded = false;
   /** Pause-syncing state (runtime only — a reload starts per syncOnStartup). */
   private paused = false;
   /** The plugin's log: console mirror + bounded ring (Copy diagnostics). */
@@ -138,6 +141,7 @@ export class VaultSyncPlugin extends Plugin {
   }
 
   override async onload(): Promise<void> {
+    this.unloaded = false;
     this.data = normalizePluginData(await this.loadData());
     this.syncLog.setLevel(this.data.settings.logLevel);
     this.addSettingTab(new VaultSyncSettingTab(this.app, this));
@@ -200,6 +204,9 @@ export class VaultSyncPlugin extends Plugin {
   }
 
   override onunload(): void {
+    this.unloaded = true;
+    this.atomicWriteNotice?.hide();
+    this.atomicWriteNotice = null;
     this.stopSync();
     this.openNoteGuard?.stop();
     this.openNoteGuard = null;
@@ -304,11 +311,7 @@ export class VaultSyncPlugin extends Plugin {
         await this.app.fileManager.trashFile(folder);
       },
       onDegraded: (cause) => {
-        this.syncLog.error('atomic writes unavailable; falling back to verified direct writes', cause);
-        new Notice(
-          'VaultSync: this device cannot perform atomic file writes, so a crash mid-sync could leave a partially written note. Sync continues, but report this in a support bundle.',
-          0,
-        );
+        void this.handleWriteDegradation(cause);
       },
       // The editor race: a pull overwriting an open, dirty note becomes a
       // conflict copy instead (open-note-guard.ts). Lives on the adapter so
@@ -316,6 +319,52 @@ export class VaultSyncPlugin extends Plugin {
       openNoteRedirect: async (vaultPath) =>
         (await this.openNoteGuard?.conflictRedirectFor(vaultPath)) ?? null,
     });
+  }
+
+  private async handleWriteDegradation(cause: unknown): Promise<void> {
+    this.syncLog.warn('atomic writes unavailable; falling back to verified direct writes', cause);
+    const changed = !this.data.atomicWritesUnavailable;
+    this.data.atomicWritesUnavailable = true;
+    const showNotice =
+      !this.atomicWriteNoticeShown &&
+      this.data.atomicWriteWarningAcknowledgedFor !== this.data.deviceId;
+    if (showNotice) this.atomicWriteNoticeShown = true;
+    if (changed) {
+      try {
+        await this.savePluginData();
+      } catch (error) {
+        this.syncLog.warn('could not save the device write limitation', error);
+      }
+    }
+    if (!showNotice || this.unloaded) return;
+    const notice = new Notice(
+      'VaultSync: this device uses direct file writes and checks their size afterward. A crash during writing could leave a partial note. Sync continues. Choose Got it to remember this warning; the limitation stays visible in settings and diagnostics.',
+      0,
+    );
+    this.atomicWriteNotice = notice;
+    new Setting(notice.noticeEl).addButton((button) =>
+      button.setButtonText('Got it').onClick(async (event) => {
+        event?.stopPropagation();
+        button.setDisabled(true);
+        try {
+          const previous = this.data.atomicWriteWarningAcknowledgedFor;
+          this.data.atomicWriteWarningAcknowledgedFor = this.data.deviceId;
+          try {
+            await this.savePluginData();
+          } catch (error) {
+            this.data.atomicWriteWarningAcknowledgedFor = previous;
+            throw error;
+          }
+          notice.hide();
+          if (this.atomicWriteNotice === notice) this.atomicWriteNotice = null;
+        } catch (error) {
+          this.syncLog.error('could not remember the write warning acknowledgement', error);
+          new Notice('VaultSync: could not remember your choice. Please try Got it again.', 8000);
+        } finally {
+          button.setDisabled(false);
+        }
+      }),
+    );
   }
 
   /** Write the FR-44 marker the CLI/daemon read to detect double-clients. */
@@ -632,6 +681,7 @@ export class VaultSyncPlugin extends Plugin {
       recentLogLines: this.syncLog.recentLines(),
       serverVersion: status?.serverVersion ?? null,
       settings: this.data.settings,
+      atomicWritesUnavailable: this.data.atomicWritesUnavailable,
       recentConflicts: status === null ? [] : status.conflicts.map((conflict) => ({ path: conflict.path })),
     };
   }
